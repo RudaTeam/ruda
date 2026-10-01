@@ -35,6 +35,9 @@ pub struct Graphics {
     /// Shadows cast by the sun and moon; costly, so off by default.
     pub shadows: bool,
     pub clouds: bool,
+    /// Glow around bright light, and an exposure that adapts to the view
+    /// the way eyes do; without, the exposure follows the light around.
+    pub hdr: bool,
     /// Takes effect on the next start.
     pub gpu_api: GpuApi,
 }
@@ -49,6 +52,7 @@ impl Default for Graphics {
             fullscreen: false,
             shadows: false,
             clouds: true,
+            hdr: true,
             gpu_api: GpuApi::Auto,
         }
     }

@@ -220,6 +220,11 @@ impl Menu {
                                 ui.checkbox(&mut graphics.clouds, "");
                                 ui.end_row();
 
+                                ui.label(t("settings-hdr"));
+                                ui.checkbox(&mut graphics.hdr, "")
+                                    .on_hover_text(t("settings-hdr-note"));
+                                ui.end_row();
+
                                 ui.label(t("settings-shadows"));
                                 ui.checkbox(&mut graphics.shadows, "")
                                     .on_hover_text(t("settings-shadows-note"));

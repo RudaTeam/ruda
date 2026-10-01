@@ -1,4 +1,4 @@
-//! Draws the block world, the outline of the targeted block and the crosshair.
+//! Draws the block world and the outline of the targeted block.
 //!
 //! Chunk geometry lives in a few large shared buffers ("pages"). Every chunk
 //! gets a slot whose texel in a small texture holds the chunk's position, and
@@ -13,20 +13,23 @@ use ruda_core::{CHUNK_SIZE, ChunkPos, Face, WorldBounds};
 use tracing::warn;
 
 use crate::arena::{RangeAllocator, Slots};
+use crate::atmosphere::SkyTables;
 use crate::camera::Frustum;
 use crate::clouds::{
     CLOUD_BOTTOM, CLOUD_CELL, CLOUD_THICKNESS, CloudField, CloudMesh, KEYFRAME, MASK_SIZE, OPAQUE,
 };
 use crate::culling::visible_chunks;
-use crate::shadows::{Cascades, NEAR_CASCADE, SHADOW_MAP_SIZE, cascades};
+use crate::shadows::{CASCADES, Cascades, SHADOW_MAP_SIZE, cascades};
 use crate::sky::SkyLook;
 use crate::textures::{BlockTextures, MIP_LEVELS, TEXTURE_SIZE};
 use crate::{ChunkMesh, LodMesh, RenderStats, Scene, Visibility};
 use ruda_world::lod::{LOD_TILE_SIZE, LodTilePos};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+/// `world.wgsl`, after the functions of the air it uses.
+const SHADER: &str = concat!(include_str!("atmosphere.wgsl"), include_str!("world.wgsl"));
 /// Bytes of the `Globals` uniform in `world.wgsl`.
-const GLOBALS_SIZE: u64 = 544;
+const GLOBALS_SIZE: u64 = 528;
 const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Edge length of the sun and moon images; smaller ones are centred.
 const SKY_TEXTURE_SIZE: u32 = 32;
@@ -46,10 +49,11 @@ pub(crate) struct WorldPass {
     block_textures: wgpu::TextureView,
     /// The sun and the moon.
     sky_textures: wgpu::TextureView,
-    /// Whether the target takes linear colours and encodes them as sRGB.
-    linear_output: bool,
     shadows: ShadowMap,
     clouds: CloudLayer,
+    /// The air's light: the sky and what lights the world.
+    tables: SkyTables,
+    light_height: f32,
     /// Position of each slot's chunk, as `Rgba32Sint` texels.
     origins: wgpu::Texture,
     origins_view: wgpu::TextureView,
@@ -59,7 +63,6 @@ pub(crate) struct WorldPass {
     model_pipeline: wgpu::RenderPipeline,
     lod_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
-    crosshair_pipeline: wgpu::RenderPipeline,
     chunks: HashMap<ChunkPos, ChunkEntry>,
     lods: HashMap<LodTilePos, GpuLod>,
     pages: Vec<Page>,
@@ -127,12 +130,12 @@ struct ShadowMap {
     /// Sampled by the world pass, a layer per cascade.
     view: wgpu::TextureView,
     /// Drawn into, one per cascade.
-    layers: [wgpu::TextureView; 2],
+    layers: [wgpu::TextureView; CASCADES],
     sampler: wgpu::Sampler,
     pipeline: wgpu::RenderPipeline,
     /// The globals and chunk positions, without the shadow map itself.
     globals_group: wgpu::BindGroup,
-    cascades: [(wgpu::Buffer, wgpu::BindGroup); 2],
+    cascades: [(wgpu::Buffer, wgpu::BindGroup); CASCADES],
 }
 
 /// A tile of far-away terrain on the GPU.
@@ -159,7 +162,10 @@ impl WorldPass {
         width: u32,
         height: u32,
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::include_wgsl!("world.wgsl"));
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("world"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
 
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("world globals"),
@@ -167,6 +173,16 @@ impl WorldPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let table = |binding, visibility| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("world globals"),
             entries: &[
@@ -244,10 +260,13 @@ impl WorldPass {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 8,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                table(9, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                table(10, wgpu::ShaderStages::FRAGMENT),
+                table(11, wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -284,6 +303,7 @@ impl WorldPass {
             immediate_size: 0,
         });
         let clouds = CloudLayer::new(device, &shader, &layout, color_format);
+        let tables = SkyTables::new(device, color_format);
         let globals_group = Self::globals_group(
             device,
             &globals_layout,
@@ -294,6 +314,9 @@ impl WorldPass {
                 &sky_textures,
                 &shadows.view,
                 &clouds.mask_view,
+                &tables.transmittance,
+                &tables.sky,
+                &tables.ambient,
             ],
             [&sampler, &shadows.sampler, &clouds.sampler],
         );
@@ -427,17 +450,6 @@ impl WorldPass {
             (false, wgpu::CompareFunction::LessEqual),
             None,
         );
-        let crosshair_pipeline = pipeline(
-            "crosshair",
-            &layout,
-            "crosshair_vertex",
-            "crosshair_fragment",
-            &[],
-            wgpu::PrimitiveTopology::TriangleList,
-            None,
-            (false, wgpu::CompareFunction::Always),
-            None,
-        );
 
         Self {
             globals,
@@ -448,7 +460,8 @@ impl WorldPass {
             sky_textures,
             shadows,
             clouds,
-            linear_output: color_format.is_srgb(),
+            tables,
+            light_height: 1.0,
             origins,
             origins_view,
             sky_pipeline,
@@ -457,7 +470,6 @@ impl WorldPass {
             model_pipeline,
             lod_pipeline,
             outline_pipeline,
-            crosshair_pipeline,
             chunks: HashMap::new(),
             lods: HashMap::new(),
             pages: Vec::new(),
@@ -510,6 +522,9 @@ impl WorldPass {
                 &self.sky_textures,
                 &self.shadows.view,
                 &self.clouds.mask_view,
+                &self.tables.transmittance,
+                &self.tables.sky,
+                &self.tables.ambient,
             ],
             [&self.sampler, &self.shadows.sampler, &self.clouds.sampler],
         );
@@ -710,6 +725,17 @@ impl WorldPass {
         self.stats
     }
 
+    /// The light at the camera; see `SkyTables::ambient`.
+    pub(crate) fn ambient(&self) -> &wgpu::TextureView {
+        &self.tables.ambient
+    }
+
+    /// How high the sun or moon, whichever lights the world, stood in the
+    /// last frame drawn, from -1 to 1.
+    pub(crate) fn light_height(&self) -> f32 {
+        self.light_height
+    }
+
     /// Builds clouds right away rather than on the worker pool, so every
     /// picture has them as they are now.
     pub(crate) fn wait_for_clouds(&mut self, wait: bool) {
@@ -802,7 +828,8 @@ impl WorldPass {
         let camera_fract = (camera - camera_block).as_vec3();
         let camera_block = camera_block.as_ivec3();
         let cover = scene.clouds.map_or(0.0, |clouds| clouds.cover);
-        let mut sky = SkyLook::at(scene.time_of_day, scene.eye_light, cover);
+        let sky = SkyLook::at(scene.time_of_day, scene.eye_light);
+        self.tables.update(queue, encoder, sky.sun, camera.y as f32);
         // Clouds reach as far as the view, but no farther than their mask.
         let cloud_reach = far.min(((MASK_SIZE as i32 - 1) / 2 - 1) as f32 * CLOUD_CELL as f32);
         if let Some(clouds) = &scene.clouds
@@ -813,14 +840,10 @@ impl WorldPass {
         {
             self.clouds.upload(device, queue, &mesh);
         }
-        if self.linear_output {
-            sky = sky.to_linear();
-        }
         let selection = selection.unwrap_or(Vec3::ZERO);
         let mut globals = Std140::default();
         globals.matrix(view_proj);
         globals.matrix(view_proj.inverse());
-        globals.floats([sky.fog.x, sky.fog.y, sky.fog.z, 1.0]);
         // Far-away terrain gives way to the chunks a chunk inside their edge.
         let lod_start = if scene.lod_distance > 0.0 {
             scene.view_distance - CHUNK_SIZE as f32
@@ -832,16 +855,12 @@ impl WorldPass {
         globals.floats([width as f32, height as f32, 0.0, 0.0]);
         globals.ints(camera_block.extend(0).to_array());
         globals.floats(camera_fract.extend(0.0).to_array());
-        globals.floats(sky.sky_light.extend(sky.ambient).to_array());
         globals.floats(sky.sun.extend(sky.day).to_array());
-        globals.floats(sky.zenith.extend(sky.stars).to_array());
-        // The horizon's w is how visible the sun and moon are: not from caves.
-        let eye = scene.eye_light.sky() as f32 / 15.0;
-        globals.floats(sky.horizon.extend(eye).to_array());
-        globals.floats(sky.glow.extend(0.0).to_array());
+        globals.floats([sky.stars, sky.eye, sky.least, cover]);
         // Shadows come from the sun by day and the moon by night, fading out
         // while either is near the horizon.
         let toward_light = if sky.sun.y >= 0.0 { sky.sun } else { -sky.sun };
+        self.light_height = toward_light.y;
         let strength = smoothstep(0.03, 0.25, toward_light.y);
         let shadow_cascades = (self.shadows.enabled && strength > 0.0).then(|| {
             cascades(
@@ -851,7 +870,7 @@ impl WorldPass {
                 toward_light,
             )
         });
-        let matrices = shadow_cascades.map_or([glam::Mat4::IDENTITY; 2], |c| c.view_proj);
+        let matrices = shadow_cascades.map_or([glam::Mat4::IDENTITY; CASCADES], |c| c.view_proj);
         for matrix in matrices {
             globals.matrix(matrix);
         }
@@ -861,12 +880,15 @@ impl WorldPass {
             0.0
         };
         globals.floats(toward_light.extend(strength).to_array());
+        let splits = shadow_cascades.map_or([0.0; 2], |c| c.splits);
         globals.floats([
-            NEAR_CASCADE,
+            splits[0],
+            splits[1],
             shadow_cascades.map_or(0.0, |c| c.end),
             0.0,
-            1.0 / SHADOW_MAP_SIZE as f32,
         ]);
+        let texel = shadow_cascades.map_or([0.0; CASCADES], |c| c.texel);
+        globals.floats([texel[0], texel[1], texel[2], 0.0]);
         let cloud_origin = scene.clouds.map_or(DVec3::ZERO, |clouds| {
             let drift = clouds.drift();
             let cell = f64::from(CLOUD_CELL);
@@ -883,20 +905,14 @@ impl WorldPass {
             cloud_reach * 0.7,
             cloud_reach * 0.95,
         ]);
-        globals.floats(sky.cloud.extend(sky.cloud_shadow).to_array());
-        globals.floats(sky.cloud_shade.extend(sky.cloud_under).to_array());
         let blend = scene.clouds.map_or(0.0, |clouds| {
             ((clouds.time - self.clouds.keyframe) / KEYFRAME).clamp(0.0, 1.0) as f32
         });
         globals.floats([blend, OPAQUE, 0.0, 0.0]);
         debug_assert_eq!(globals.0.len() as u64, GLOBALS_SIZE);
         queue.write_buffer(&self.globals, 0, &globals.0);
-        let clear = wgpu::Color {
-            r: f64::from(sky.fog.x),
-            g: f64::from(sky.fog.y),
-            b: f64::from(sky.fog.z),
-            a: 1.0,
-        };
+        // The sky is drawn over all of it.
+        let clear = wgpu::Color::BLACK;
 
         if let Some(cascades) = shadow_cascades {
             self.draw_shadows(queue, encoder, camera, &cascades);
@@ -1012,8 +1028,6 @@ impl WorldPass {
             pass.set_pipeline(&self.outline_pipeline);
             pass.draw(0..24, 0..1);
         }
-        pass.set_pipeline(&self.crosshair_pipeline);
-        pass.draw(0..12, 0..1);
     }
 
     /// Draws every chunk the light sees into each cascade of the shadow map.
@@ -1080,7 +1094,16 @@ impl WorldPass {
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         globals: &wgpu::Buffer,
-        [textures, origins, sky, shadows, clouds]: [&wgpu::TextureView; 5],
+        [
+            textures,
+            origins,
+            sky,
+            shadows,
+            clouds,
+            transmittance,
+            sky_view,
+            ambient,
+        ]: [&wgpu::TextureView; 8],
         [sampler, shadow_sampler, smooth_sampler]: [&wgpu::Sampler; 3],
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1122,6 +1145,18 @@ impl WorldPass {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::Sampler(smooth_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(transmittance),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(sky_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(ambient),
                 },
             ],
         })
@@ -1416,7 +1451,7 @@ impl ShadowMap {
                 },
             ],
         });
-        let cascades = [0, 1].map(|_| {
+        let cascades = [0, 1, 2].map(|_| {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("shadow cascade"),
                 size: 64,
@@ -1505,13 +1540,16 @@ impl ShadowMap {
 
 /// A depth texture with a layer per cascade, as one view to sample and one
 /// per layer to draw into.
-fn shadow_texture(device: &wgpu::Device, size: u32) -> (wgpu::TextureView, [wgpu::TextureView; 2]) {
+fn shadow_texture(
+    device: &wgpu::Device,
+    size: u32,
+) -> (wgpu::TextureView, [wgpu::TextureView; CASCADES]) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("shadow map"),
         size: wgpu::Extent3d {
             width: size,
             height: size,
-            depth_or_array_layers: 2,
+            depth_or_array_layers: CASCADES as u32,
         },
         mip_level_count: 1,
         sample_count: 1,
@@ -1524,7 +1562,7 @@ fn shadow_texture(device: &wgpu::Device, size: u32) -> (wgpu::TextureView, [wgpu
         dimension: Some(wgpu::TextureViewDimension::D2Array),
         ..Default::default()
     });
-    let layers = [0, 1].map(|layer| {
+    let layers = [0, 1, 2].map(|layer| {
         texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2),
             base_array_layer: layer,
@@ -1621,7 +1659,7 @@ mod tests {
     /// Catches shader mistakes without a GPU, with the same compiler wgpu uses.
     #[test]
     fn shader_is_valid_on_the_baseline_tier() {
-        let module = naga::front::wgsl::parse_str(include_str!("world.wgsl")).unwrap();
+        let module = naga::front::wgsl::parse_str(super::SHADER).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),

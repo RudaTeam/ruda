@@ -1,5 +1,6 @@
-//! Sun shadows: the two cascades of the shadow map, each looking from the
-//! sun (or the moon) at the part of the view it covers.
+//! Sun shadows: the three cascades of the shadow map, each looking from the
+//! sun (or the moon) at the part of the view it covers, from sharp near the
+//! camera to coarse far away.
 
 use glam::camera::rh::{proj::directx, view::look_to_mat4};
 use glam::{DVec3, Mat4, Vec3};
@@ -8,8 +9,11 @@ use crate::Camera;
 
 /// Edge length of each cascade of the shadow map, in texels.
 pub(crate) const SHADOW_MAP_SIZE: u32 = 2048;
-/// Distance where the near, sharper cascade ends.
-pub(crate) const NEAR_CASCADE: f32 = 24.0;
+/// How many cascades there are.
+pub(crate) const CASCADES: usize = 3;
+/// Distances where the first two cascades end. Each next one starts a
+/// fifth before, and the two blend over that stretch.
+const SPLITS: [f32; 2] = [16.0, 56.0];
 /// Shadows end here, or at the view distance if that is shorter.
 const SHADOW_DISTANCE: f32 = 160.0;
 /// Room above and below a cascade for things outside the view that still
@@ -19,9 +23,13 @@ const CASTER_MARGIN: f32 = 256.0;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Cascades {
     /// Camera-relative position to shadow map space, near cascade first.
-    pub view_proj: [Mat4; 2],
+    pub view_proj: [Mat4; CASCADES],
+    /// Where the first two cascades end.
+    pub splits: [f32; 2],
     /// Where shadows end.
     pub end: f32,
+    /// How wide a texel of each cascade is, in blocks.
+    pub texel: [f32; CASCADES],
 }
 
 /// Fits the cascades around the view of `camera`, lit from `toward_light`.
@@ -32,20 +40,26 @@ pub(crate) fn cascades(
     toward_light: Vec3,
 ) -> Cascades {
     let end = view_distance.min(SHADOW_DISTANCE);
-    let split = NEAR_CASCADE.min(end);
+    let splits = SPLITS.map(|split| split.min(end));
+    let ranges = [
+        (0.05, splits[0]),
+        (splits[0] * 0.8, splits[1]),
+        (splits[1] * 0.8, end),
+    ];
+    let fits = ranges.map(|(near, far)| fit(camera, aspect, near, far, toward_light));
     Cascades {
-        view_proj: [
-            fit(camera, aspect, 0.05, split, toward_light),
-            fit(camera, aspect, split * 0.8, end, toward_light),
-        ],
+        view_proj: fits.map(|(view_proj, _)| view_proj),
+        splits,
         end,
+        texel: fits.map(|(_, radius)| 2.0 * radius / SHADOW_MAP_SIZE as f32),
     }
 }
 
 /// A light view of the slice of the view from `near` to `far`: a cube around
 /// the sphere that holds the slice, so its size doesn't change as the camera
-/// turns, and moved in whole texels, so shadow edges don't shimmer.
-fn fit(camera: &Camera, aspect: f32, near: f32, far: f32, toward_light: Vec3) -> Mat4 {
+/// turns, and moved in whole texels, so shadow edges don't shimmer. With
+/// the sphere's radius.
+fn fit(camera: &Camera, aspect: f32, near: f32, far: f32, toward_light: Vec3) -> (Mat4, f32) {
     let forward = camera.forward();
     let right = camera.right();
     let up = right.cross(forward);
@@ -96,7 +110,7 @@ fn fit(camera: &Camera, aspect: f32, near: f32, far: f32, toward_light: Vec3) ->
         0.0,
         2.0 * (radius + CASTER_MARGIN),
     );
-    projection * view
+    (projection * view, radius)
 }
 
 #[cfg(test)]
@@ -110,8 +124,10 @@ mod tests {
         let sun = Vec3::new(0.4, 0.8, 0.2).normalize();
         let cascades = cascades(&camera, 16.0 / 9.0, 128.0, sun);
         assert_eq!(cascades.end, 128.0);
+        // Farther cascades are coarser.
+        assert!(cascades.texel[0] < cascades.texel[1] && cascades.texel[1] < cascades.texel[2]);
         // Points straight ahead land inside the map, in front of the light.
-        for (cascade, distance) in [(0, 10.0), (1, 100.0)] {
+        for (cascade, distance) in [(0, 10.0), (1, 40.0), (2, 100.0)] {
             let point = camera.forward() * distance;
             let p = cascades.view_proj[cascade].project_point3(point);
             assert!(p.x.abs() < 1.0 && p.y.abs() < 1.0, "{p}");

@@ -16,7 +16,9 @@ What we're aiming for:
 It's very early. You can fly around a generated world with hills, rocky
 mountains, caves and ore, break and place blocks, and light caves with lamps and torches. Days and nights pass
 every 20 minutes, light spreads from the sky and from glowing blocks in colour,
-and corners are softly shaded. Blocky clouds drift with the wind at the height
+and corners are softly shaded. The sky, sunsets and the haze over distant land
+come from how air scatters sunlight; the sun lights faces turned to it, and
+bright light blooms while the exposure adapts the way eyes do. Blocky clouds drift with the wind at the height
 of the mountain tops, slowly form and fade away, thin out around the peaks
 and shade the ground. The world is endless sideways and 256 blocks
 tall, from −128 to +127, with sea level at 0 and unbreakable bedrock at the
@@ -35,8 +37,9 @@ cargo run -p ruda-server   # dedicated server (a stub until network play lands)
 
 The game opens on the main menu. Settings has the view distance, how far
 simplified far terrain reaches beyond it, field of view, vertical sync,
-fullscreen, clouds, sun shadows (off by default: they cost a
-second drawing of the world), graphics API and language (English or
+fullscreen, clouds, HDR (glow around bright light and brightness that adapts
+like eyes do), sun shadows (off by default: they cost a second drawing of the
+world), graphics API and language (English or
 Russian; the system language by default). They are saved to `settings.toml`
 in `~/.config/ruda` on Linux, `~/Library/Application Support/Ruda` on macOS
 and `%APPDATA%\Ruda` on Windows.
@@ -73,7 +76,7 @@ The client takes a few options:
 - `--benchmark <SECONDS>` starts a world, waits until it has loaded, then
   measures frame times for that long and prints them. Add `--no-vsync` to
   draw as fast as possible, `--shadows` to turn sun shadows on, `--no-clouds`
-  to turn clouds off, and `--seed` and `--camera` to measure the same view
+  to turn clouds off, `--no-hdr` to turn HDR off, and `--seed` and `--camera` to measure the same view
   every time.
 
 Logging is controlled with `RUST_LOG`, for example `RUST_LOG=debug`. To profile

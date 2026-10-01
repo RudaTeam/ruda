@@ -4,12 +4,14 @@
 //! [`Renderer`], the [`Camera`] and the meshing helpers.
 
 mod arena;
+mod atmosphere;
 mod camera;
 mod clouds;
 mod culling;
 mod lod;
 mod mesh;
 mod mesher;
+mod post;
 mod shadows;
 mod sky;
 mod textures;
@@ -148,6 +150,8 @@ pub struct Renderer {
     /// `None` while suspended: mobile platforms destroy the native window.
     surface: Option<wgpu::Surface<'static>>,
     world: WorldPass,
+    /// Bloom, exposure and mapping the world's light to the screen.
+    post: post::PostPass,
     /// How long the last frame waited for the window to hand out an image.
     surface_wait: std::time::Duration,
     ui: egui_wgpu::Renderer,
@@ -315,10 +319,19 @@ impl Renderer {
             "GPU ready"
         );
 
-        let mut world = WorldPass::new(&device, &queue, config.format, width, height);
+        let frame_format = post::frame_format(&adapter);
+        let mut world = WorldPass::new(&device, &queue, frame_format, width, height);
+        let mut post = post::PostPass::new(
+            &device,
+            frame_format,
+            config.format,
+            world.ambient(),
+            (width, height),
+        );
         // Without a window, every picture is final: it can't wait for clouds
-        // built in the background.
+        // built in the background, nor for eyes to adapt.
         world.wait_for_clouds(surface.is_none());
+        post.adapt_at_once(surface.is_none());
         let ui = egui_wgpu::Renderer::new(
             &device,
             ui_format,
@@ -336,6 +349,7 @@ impl Renderer {
             config,
             surface,
             world,
+            post,
             surface_wait: std::time::Duration::ZERO,
             ui,
             ui_format,
@@ -356,6 +370,8 @@ impl Renderer {
         self.configure_surface();
         if self.config.width > 0 && self.config.height > 0 {
             self.world
+                .resize(&self.device, self.config.width, self.config.height);
+            self.post
                 .resize(&self.device, self.config.width, self.config.height);
         }
     }
@@ -430,6 +446,19 @@ impl Renderer {
     /// system composites them.
     pub fn surface_wait(&self) -> std::time::Duration {
         self.surface_wait
+    }
+
+    /// Turns HDR on or off: glow around bright light and an exposure that
+    /// adapts to the view; without, the exposure follows the light around.
+    pub fn set_hdr(&mut self, hdr: bool) {
+        self.post.set_hdr(hdr);
+    }
+
+    /// Keeps the exposure at `exposure` instead of following how bright the
+    /// view is, or with `None` follows it again: for pictures compared with
+    /// each other.
+    pub fn fix_exposure(&mut self, exposure: Option<f32>) {
+        self.post.fix_exposure(exposure);
     }
 
     /// Turns sun shadows on or off. They draw the world once more for each
@@ -640,14 +669,24 @@ impl Renderer {
         let format = self.config.format;
         let view = &target.create_view(&wgpu::TextureViewDescriptor::default());
         match backdrop {
-            Backdrop::World(scene) => self.world.draw(
-                &self.device,
-                &self.queue,
-                encoder,
-                view,
-                scene,
-                (width, height),
-            ),
+            Backdrop::World(scene) => {
+                self.world.draw(
+                    &self.device,
+                    &self.queue,
+                    encoder,
+                    self.post.frame(),
+                    scene,
+                    (width, height),
+                );
+                self.post.draw(
+                    &self.queue,
+                    encoder,
+                    view,
+                    (width, height),
+                    true,
+                    self.world.light_height(),
+                );
+            }
             Backdrop::Color(rgb) => {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("backdrop"),

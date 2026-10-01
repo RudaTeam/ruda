@@ -88,6 +88,11 @@ struct Args {
     /// Draw no clouds, whatever the settings say.
     #[arg(long)]
     no_clouds: bool,
+
+    /// Turn off HDR (glow and adapting brightness), whatever the settings
+    /// say.
+    #[arg(long)]
+    no_hdr: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -311,6 +316,7 @@ impl App {
             renderer.set_vsync(false);
         }
         renderer.set_shadows(graphics.shadows || self.args.shadows);
+        renderer.set_hdr(graphics.hdr && !self.args.no_hdr);
 
         self.interface = Some(Interface::new(&window, renderer.max_texture_side()));
         window.request_redraw();
@@ -408,6 +414,11 @@ impl App {
             && let Some(renderer) = &mut self.renderer
         {
             renderer.set_shadows(new.shadows);
+        }
+        if new.hdr != old.hdr
+            && let Some(renderer) = &mut self.renderer
+        {
+            renderer.set_hdr(new.hdr);
         }
         if let Some(game) = &mut self.game {
             if new.view_distance != old.view_distance {
