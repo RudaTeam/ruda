@@ -75,6 +75,10 @@ struct Args {
     /// Don't wait for the display's refresh, whatever the settings say.
     #[arg(long)]
     no_vsync: bool,
+
+    /// Turn on sun shadows, whatever the settings say.
+    #[arg(long)]
+    shadows: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -297,6 +301,7 @@ impl App {
         if !graphics.vsync || self.args.no_vsync {
             renderer.set_vsync(false);
         }
+        renderer.set_shadows(graphics.shadows || self.args.shadows);
 
         self.interface = Some(Interface::new(&window, renderer.max_texture_side()));
         window.request_redraw();
@@ -387,6 +392,11 @@ impl App {
             && let Some(window) = &self.window
         {
             window.set_fullscreen(fullscreen(new.fullscreen));
+        }
+        if new.shadows != old.shadows
+            && let Some(renderer) = &mut self.renderer
+        {
+            renderer.set_shadows(new.shadows);
         }
         if let Some(game) = &mut self.game {
             if new.view_distance != old.view_distance {

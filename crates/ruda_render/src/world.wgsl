@@ -31,6 +31,14 @@ struct Globals {
     horizon: vec4<f32>,
     // rgb: glow around a low sun.
     glow: vec4<f32>,
+    // Light space of each shadow cascade, near then far.
+    shadow_view_proj: array<mat4x4<f32>, 2>,
+    // xyz: towards the sun or moon, whichever casts shadows; w: how strong
+    // its direct light is, 0 without shadows.
+    shadow_light: vec4<f32>,
+    // x: distance where the far cascade takes over; y: where shadows end;
+    // z: unused; w: size of a shadow map texel in texture coordinates.
+    shadow: vec4<f32>,
 }
 
 // Width of `chunk_origins`, whose texels are chunk slots.
@@ -43,6 +51,11 @@ const ORIGINS_WIDTH = 128u;
 @group(0) @binding(3) var chunk_origins: texture_2d<i32>;
 // Layer 0 is the sun, layer 1 the moon.
 @group(0) @binding(4) var sky_textures: texture_2d_array<f32>;
+// Depth from the light, a layer per cascade.
+@group(0) @binding(5) var shadow_map: texture_depth_2d_array;
+@group(0) @binding(6) var shadow_sampler: sampler_comparison;
+// The light space of the cascade being drawn into the shadow map.
+@group(1) @binding(0) var<uniform> shadow_pass: mat4x4<f32>;
 
 // How bright a light level from 0 to 1 looks: steep near full light, like
 // light falling off around a torch.
@@ -52,6 +65,9 @@ fn brightness(level: vec4<f32>) -> vec4<f32> {
 
 struct ChunkVertex {
     @builtin(position) clip: vec4<f32>,
+    // Relative to the camera.
+    @location(7) position: vec3<f32>,
+    @location(8) @interpolate(flat) normal: vec3<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) layer: u32,
     @location(2) shade: f32,
@@ -67,8 +83,17 @@ fn unit(axis: u32) -> vec3<f32> {
     return vec3<f32>(f32(axis == 0u), f32(axis == 1u), f32(axis == 2u));
 }
 
-@vertex
-fn chunk_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) -> ChunkVertex {
+// One corner of a packed quad.
+struct Corner {
+    // Relative to the chunk.
+    local: vec3<f32>,
+    // Which corner: u + 2v.
+    index: u32,
+    uv: vec2<f32>,
+    face: u32,
+}
+
+fn quad_corner(quad: vec4<u32>, vertex: u32) -> Corner {
     let block = vec3<f32>(
         f32(quad.x & 31u),
         f32((quad.x >> 5u) & 31u),
@@ -106,23 +131,17 @@ fn chunk_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>
         cu = cv;
         cv = swap;
     }
-    let corner = cu + 2u * cv;
 
+    var out: Corner;
     // Each quad reaches a hair past its edges: where a corner of one quad
     // lies on the edge of another, rounding could otherwise leave pixel-wide
     // cracks.
     let overlap = 0.001;
-    let local = block
+    out.local = block
         + unit(axis) * select(0.0, 1.0, positive)
         + unit(u_axis) * (f32(cu) * width + (f32(cu) * 2.0 - 1.0) * overlap)
         + unit(v_axis) * (f32(cv) * height + (f32(cv) * 2.0 - 1.0) * overlap);
-    let slot = quad.y >> 18u;
-    let texel = vec2<i32>(i32(slot % ORIGINS_WIDTH), i32(slot / ORIGINS_WIDTH));
-    let origin = textureLoad(chunk_origins, texel, 0).xyz;
-    let position = vec3<f32>(origin - globals.camera_block.xyz) + local - globals.camera_fract.xyz;
-
-    var out: ChunkVertex;
-    out.clip = globals.view_proj * vec4<f32>(position, 1.0);
+    out.index = cu + 2u * cv;
     // Image rows run downwards, so side faces flip v to keep textures upright.
     // Texture coordinates beyond 1 repeat the texture across merged faces.
     out.uv = select(
@@ -130,23 +149,61 @@ fn chunk_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>
         vec2<f32>(f32(cu) * width, (1.0 - f32(cv)) * height),
         axis != 1u,
     );
-    out.layer = quad.y & 0x3ffu;
-    // Fixed shading per side, so the shape of the terrain reads.
-    var shades = array<f32, 6>(0.8, 0.8, 1.0, 0.55, 0.7, 0.7);
-    out.shade = shades[face];
-    out.distance = length(position);
+    out.face = face;
+    return out;
+}
 
-    let lights = select(quad.z, quad.w, corner >= 2u) >> (16u * (corner & 1u));
-    out.light = vec4<f32>(
-        f32(lights & 15u),
-        f32((lights >> 4u) & 15u),
-        f32((lights >> 8u) & 15u),
-        f32((lights >> 12u) & 15u),
+// A position in the chunk in `slot`, relative to the camera.
+fn camera_relative(slot: u32, local: vec3<f32>) -> vec3<f32> {
+    let texel = vec2<i32>(i32(slot % ORIGINS_WIDTH), i32(slot / ORIGINS_WIDTH));
+    let origin = textureLoad(chunk_origins, texel, 0).xyz;
+    return vec3<f32>(origin - globals.camera_block.xyz) + local - globals.camera_fract.xyz;
+}
+
+fn face_normal(face: u32) -> vec3<f32> {
+    return unit(face / 2u) * select(-1.0, 1.0, face % 2u == 0u);
+}
+
+fn unpack_light(bits: u32) -> vec4<f32> {
+    return vec4<f32>(
+        f32(bits & 15u),
+        f32((bits >> 4u) & 15u),
+        f32((bits >> 8u) & 15u),
+        f32((bits >> 12u) & 15u),
     ) / 15.0;
-    let occlusion = (quad.y >> (10u + 2u * corner)) & 3u;
-    out.occlusion = f32(occlusion) / 3.0;
+}
+
+// Fixed shading per side, so the shape of the terrain reads.
+fn face_shade(face: u32) -> f32 {
+    var shades = array<f32, 6>(0.8, 0.8, 1.0, 0.55, 0.7, 0.7);
+    return shades[face];
+}
+
+@vertex
+fn chunk_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) -> ChunkVertex {
+    let corner = quad_corner(quad, vertex);
+    let position = camera_relative(quad.y >> 18u, corner.local);
+
+    var out: ChunkVertex;
+    out.clip = globals.view_proj * vec4<f32>(position, 1.0);
+    out.position = position;
+    out.normal = face_normal(corner.face);
+    out.uv = corner.uv;
+    out.layer = quad.y & 0x3ffu;
+    out.shade = face_shade(corner.face);
+    out.distance = length(position);
+    let lights = select(quad.z, quad.w, corner.index >= 2u) >> (16u * (corner.index & 1u));
+    out.light = unpack_light(lights);
+    out.occlusion = f32((quad.y >> (10u + 2u * corner.index)) & 3u) / 3.0;
     out.glows = (quad.x >> 29u) & 1u;
     return out;
+}
+
+// Chunk quads seen from the sun, into the shadow map.
+@vertex
+fn shadow_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) -> @builtin(position) vec4<f32> {
+    let corner = quad_corner(quad, vertex);
+    return shadow_pass * vec4<f32>(camera_relative(quad.y >> 18u, corner.local), 1.0);
 }
 
 // Blocks that aren't cubes, as triangles; see `ModelVertex` in `mesh.rs`.
@@ -157,37 +214,60 @@ fn model_vertex(@location(0) vertex: vec4<u32>) -> ChunkVertex {
         f32((vertex.x >> 10u) & 1023u),
         f32((vertex.x >> 20u) & 1023u),
     ) / 16.0 - 16.0;
-    let slot = vertex.y >> 18u;
-    let texel = vec2<i32>(i32(slot % ORIGINS_WIDTH), i32(slot / ORIGINS_WIDTH));
-    let origin = textureLoad(chunk_origins, texel, 0).xyz;
-    let position = vec3<f32>(origin - globals.camera_block.xyz) + local - globals.camera_fract.xyz;
+    let position = camera_relative(vertex.y >> 18u, local);
+    let face = (vertex.z >> 16u) & 7u;
 
     var out: ChunkVertex;
     out.clip = globals.view_proj * vec4<f32>(position, 1.0);
+    out.position = position;
+    out.normal = face_normal(face);
     out.uv = vec2<f32>(f32(vertex.y & 31u), f32((vertex.y >> 5u) & 31u)) / 16.0;
     out.layer = (vertex.y >> 10u) & 255u;
-    var shades = array<f32, 6>(0.8, 0.8, 1.0, 0.55, 0.7, 0.7);
-    out.shade = shades[(vertex.z >> 16u) & 7u];
+    out.shade = face_shade(face);
     out.distance = length(position);
-    let light = vertex.z & 0xffffu;
-    out.light = vec4<f32>(
-        f32(light & 15u),
-        f32((light >> 4u) & 15u),
-        f32((light >> 8u) & 15u),
-        f32((light >> 12u) & 15u),
-    ) / 15.0;
+    out.light = unpack_light(vertex.z & 0xffffu);
     out.occlusion = 1.0;
     out.glows = (vertex.x >> 30u) & 1u;
     return out;
+}
+
+// How much of the sun's (or moon's) direct light reaches a point: 0 in full
+// shadow, 1 in full light.
+fn sunlit(position: vec3<f32>, normal: vec3<f32>, distance: f32) -> f32 {
+    let cascade = select(1, 0, distance < globals.shadow.x);
+    // Nudged out along the normal so faces don't shade themselves.
+    let lifted = position + normal * select(0.15, 0.05, cascade == 0);
+    let light = globals.shadow_view_proj[cascade] * vec4<f32>(lifted, 1.0);
+    let uv = vec2<f32>(light.x * 0.5 + 0.5, 0.5 - light.y * 0.5);
+    if any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) || light.z >= 1.0 {
+        return 1.0;
+    }
+    // Four filtered taps around the point soften the edge.
+    var lit = 0.0;
+    for (var i = 0u; i < 4u; i++) {
+        let offset = (vec2<f32>(f32(i & 1u), f32(i >> 1u)) - 0.5) * globals.shadow.w;
+        lit += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + offset, cascade, light.z);
+    }
+    // Shadows fade out where the shadow map ends.
+    let fade = smoothstep(globals.shadow.y * 0.85, globals.shadow.y, distance);
+    return mix(lit * 0.25, 1.0, fade);
 }
 
 @fragment
 fn chunk_fragment(in: ChunkVertex) -> @location(0) vec4<f32> {
     let texel = textureSample(block_textures, block_sampler, in.uv, in.layer).rgb;
     let level = brightness(in.light);
-    let sky = globals.sky_light.rgb * level.x;
-    let light = max(max(sky, level.yzw), vec3<f32>(globals.sky_light.w));
-    var color = texel * light * mix(0.45, 1.0, in.occlusion) * in.shade;
+    // With shadows, part of sky light comes straight from the sun or moon
+    // and the rest from the whole sky; without, a fixed shade per side.
+    var direction = in.shade;
+    if globals.shadow_light.w > 0.0 {
+        let facing = max(dot(in.normal, globals.shadow_light.xyz), 0.0);
+        let direct = facing * sunlit(in.position, in.normal, in.distance);
+        direction = mix(in.shade, 0.5 * in.shade + 0.65 * direct, globals.shadow_light.w);
+    }
+    let sky = globals.sky_light.rgb * level.x * direction;
+    let light = max(max(sky, level.yzw * in.shade), vec3<f32>(globals.sky_light.w * in.shade));
+    var color = texel * light * mix(0.45, 1.0, in.occlusion);
     if in.glows == 1u {
         color = texel;
     }

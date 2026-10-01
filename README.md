@@ -32,7 +32,8 @@ cargo run -p ruda-server   # dedicated server (a stub until network play lands)
 ```
 
 The game opens on the main menu. Settings has the view distance, field of
-view, vertical sync, fullscreen, graphics API and language (English or
+view, vertical sync, fullscreen, sun shadows (off by default: they cost a
+second drawing of the world), graphics API and language (English or
 Russian; the system language by default). They are saved to `settings.toml`
 in `~/.config/ruda` on Linux, `~/Library/Application Support/Ruda` on macOS
 and `%APPDATA%\Ruda` on Windows.
@@ -66,7 +67,7 @@ The client takes a few options:
   `--screenshot <PATH>` saves the last one. CI uses them as a smoke test.
 - `--benchmark <SECONDS>` starts a world, waits until it has loaded, then
   measures frame times for that long and prints them. Add `--no-vsync` to
-  draw as fast as possible, and `--seed` and `--camera` to measure the same
+  draw as fast as possible, `--shadows` to turn sun shadows on, and `--seed` and `--camera` to measure the same
   view every time.
 
 Logging is controlled with `RUST_LOG`, for example `RUST_LOG=debug`. To profile

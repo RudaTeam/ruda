@@ -27,6 +27,8 @@ pub struct Graphics {
     pub fov: u8,
     pub vsync: bool,
     pub fullscreen: bool,
+    /// Shadows cast by the sun and moon; costly, so off by default.
+    pub shadows: bool,
     /// Takes effect on the next start.
     pub gpu_api: GpuApi,
 }
@@ -38,6 +40,7 @@ impl Default for Graphics {
             fov: 70,
             vsync: true,
             fullscreen: false,
+            shadows: false,
             gpu_api: GpuApi::Auto,
         }
     }

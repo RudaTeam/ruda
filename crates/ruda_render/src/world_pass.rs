@@ -15,13 +15,15 @@ use tracing::warn;
 use crate::arena::{RangeAllocator, Slots};
 use crate::camera::Frustum;
 use crate::culling::visible_chunks;
+use crate::shadows::{Cascades, NEAR_CASCADE, SHADOW_MAP_SIZE, cascades};
 use crate::sky::SkyLook;
 use crate::textures::{BlockTextures, MIP_LEVELS, TEXTURE_SIZE};
 use crate::{ChunkMesh, RenderStats, Scene, Visibility};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 /// Bytes of the `Globals` uniform in `world.wgsl`.
-const GLOBALS_SIZE: u64 = 304;
+const GLOBALS_SIZE: u64 = 464;
+const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Edge length of the sun and moon images; smaller ones are centred.
 const SKY_TEXTURE_SIZE: u32 = 32;
 const QUAD_BYTES: u64 = 16;
@@ -42,6 +44,7 @@ pub(crate) struct WorldPass {
     sky_textures: wgpu::TextureView,
     /// Whether the target takes linear colours and encodes them as sRGB.
     linear_output: bool,
+    shadows: ShadowMap,
     /// Position of each slot's chunk, as `Rgba32Sint` texels.
     origins: wgpu::Texture,
     origins_view: wgpu::TextureView,
@@ -60,6 +63,7 @@ pub(crate) struct WorldPass {
     /// Scratch space reused every frame.
     visible: Vec<ChunkPos>,
     draws: Vec<Draw>,
+    shadow_draws: Vec<Draw>,
 }
 
 /// What the renderer knows about a loaded chunk.
@@ -83,6 +87,20 @@ struct GpuChunk {
 struct Page {
     buffer: wgpu::Buffer,
     space: RangeAllocator,
+}
+
+/// Sun shadows: off by default, as they draw the world once more per cascade.
+struct ShadowMap {
+    enabled: bool,
+    /// Sampled by the world pass, a layer per cascade.
+    view: wgpu::TextureView,
+    /// Drawn into, one per cascade.
+    layers: [wgpu::TextureView; 2],
+    sampler: wgpu::Sampler,
+    pipeline: wgpu::RenderPipeline,
+    /// The globals and chunk positions, without the shadow map itself.
+    globals_group: wgpu::BindGroup,
+    cascades: [(wgpu::Buffer, wgpu::BindGroup); 2],
 }
 
 /// A run of quads in one page.
@@ -157,6 +175,22 @@ impl WorldPass {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -186,12 +220,14 @@ impl WorldPass {
         });
         let origins_view = origins.create_view(&Default::default());
         let sky_textures = upload_sky_textures(device, queue, [None, None]);
+        let shadows = ShadowMap::new(device, &shader, &globals, &origins_view);
         let globals_group = Self::globals_group(
             device,
             &globals_layout,
             &globals,
             &sampler,
-            [&block_textures, &origins_view, &sky_textures],
+            [&block_textures, &origins_view, &sky_textures, &shadows.view],
+            &shadows.sampler,
         );
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -337,6 +373,7 @@ impl WorldPass {
             sampler,
             block_textures,
             sky_textures,
+            shadows,
             linear_output: color_format.is_srgb(),
             origins,
             origins_view,
@@ -354,6 +391,7 @@ impl WorldPass {
             culling: true,
             visible: Vec::new(),
             draws: Vec::new(),
+            shadow_draws: Vec::new(),
         }
     }
 
@@ -391,8 +429,22 @@ impl WorldPass {
             &self.globals_layout,
             &self.globals,
             &self.sampler,
-            [&self.block_textures, &self.origins_view, &self.sky_textures],
+            [
+                &self.block_textures,
+                &self.origins_view,
+                &self.sky_textures,
+                &self.shadows.view,
+            ],
+            &self.shadows.sampler,
         );
+    }
+
+    /// Turns sun shadows on or off.
+    pub(crate) fn set_shadows(&mut self, device: &wgpu::Device, enabled: bool) {
+        if enabled != self.shadows.enabled {
+            self.shadows.set_enabled(device, enabled);
+            self.rebuild_globals_group(device);
+        }
     }
 
     pub(crate) fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
@@ -630,6 +682,34 @@ impl WorldPass {
         let eye = scene.eye_light.sky() as f32 / 15.0;
         globals.floats(sky.horizon.extend(eye).to_array());
         globals.floats(sky.glow.extend(0.0).to_array());
+        // Shadows come from the sun by day and the moon by night, fading out
+        // while either is near the horizon.
+        let toward_light = if sky.sun.y >= 0.0 { sky.sun } else { -sky.sun };
+        let strength = smoothstep(0.03, 0.25, toward_light.y);
+        let shadow_cascades = (self.shadows.enabled && strength > 0.0).then(|| {
+            cascades(
+                &scene.camera,
+                width as f32 / height as f32,
+                scene.view_distance,
+                toward_light,
+            )
+        });
+        let matrices = shadow_cascades.map_or([glam::Mat4::IDENTITY; 2], |c| c.view_proj);
+        for matrix in matrices {
+            globals.matrix(matrix);
+        }
+        let strength = if shadow_cascades.is_some() {
+            strength
+        } else {
+            0.0
+        };
+        globals.floats(toward_light.extend(strength).to_array());
+        globals.floats([
+            NEAR_CASCADE,
+            shadow_cascades.map_or(0.0, |c| c.end),
+            0.0,
+            1.0 / SHADOW_MAP_SIZE as f32,
+        ]);
         debug_assert_eq!(globals.0.len() as u64, GLOBALS_SIZE);
         queue.write_buffer(&self.globals, 0, &globals.0);
         let clear = wgpu::Color {
@@ -638,6 +718,10 @@ impl WorldPass {
             b: f64::from(sky.fog.z),
             a: 1.0,
         };
+
+        if let Some(cascades) = shadow_cascades {
+            self.draw_shadows(queue, encoder, camera, &cascades);
+        }
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("world"),
@@ -701,12 +785,73 @@ impl WorldPass {
         pass.draw(0..12, 0..1);
     }
 
+    /// Draws every chunk the light sees into each cascade of the shadow map.
+    /// Cave culling doesn't apply: what the camera can't see may still cast
+    /// a shadow into view.
+    fn draw_shadows(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: DVec3,
+        cascades: &Cascades,
+    ) {
+        for (cascade, view_proj) in cascades.view_proj.iter().enumerate() {
+            let (buffer, group) = &self.shadows.cascades[cascade];
+            let mut matrix = Std140::default();
+            matrix.matrix(*view_proj);
+            queue.write_buffer(buffer, 0, &matrix.0);
+            let frustum = Frustum::new(*view_proj);
+            let mut casters: Vec<&GpuChunk> = self
+                .chunks
+                .iter()
+                .filter_map(|(pos, entry)| {
+                    let min = (pos.origin().0.as_dvec3() - camera).as_vec3();
+                    let seen = frustum.intersects_box(min, min + Vec3::splat(CHUNK_SIZE as f32));
+                    entry.gpu.as_ref().filter(|_| seen)
+                })
+                .collect();
+            // In buffer order, so neighbours merge into one draw.
+            casters.sort_by_key(|gpu| (gpu.page, gpu.quads.start));
+            self.shadow_draws.clear();
+            for gpu in casters {
+                push_draw(&mut self.shadow_draws, gpu.page, gpu.quads.clone());
+            }
+            self.stats.shadow_draw_calls += self.shadow_draws.len();
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow map"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadows.layers[cascade],
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.shadows.pipeline);
+            pass.set_bind_group(0, &self.shadows.globals_group, &[]);
+            pass.set_bind_group(1, group, &[]);
+            let mut bound = None;
+            for draw in &self.shadow_draws {
+                if bound != Some(draw.page) {
+                    pass.set_vertex_buffer(0, self.pages[draw.page].buffer.slice(..));
+                    bound = Some(draw.page);
+                }
+                pass.draw(0..4, draw.quads.clone());
+            }
+        }
+    }
+
     fn globals_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         globals: &wgpu::Buffer,
         sampler: &wgpu::Sampler,
-        [textures, origins, sky]: [&wgpu::TextureView; 3],
+        [textures, origins, sky, shadows]: [&wgpu::TextureView; 4],
+        shadow_sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("world globals"),
@@ -731,6 +876,14 @@ impl WorldPass {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(sky),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(shadows),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(shadow_sampler),
                 },
             ],
         })
@@ -828,6 +981,189 @@ fn push_draw(draws: &mut Vec<Draw>, page: usize, quads: Range<u32>) {
         return;
     }
     draws.push(Draw { page, quads });
+}
+
+impl ShadowMap {
+    fn new(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        globals: &wgpu::Buffer,
+        origins: &wgpu::TextureView,
+    ) -> Self {
+        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow map globals"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(GLOBALS_SIZE),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Sint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let cascade_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow cascade"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(64),
+                },
+                count: None,
+            }],
+        });
+        let globals_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow map globals"),
+            layout: &globals_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(origins),
+                },
+            ],
+        });
+        let cascades = [0, 1].map(|_| {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("shadow cascade"),
+                size: 64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shadow cascade"),
+                layout: &cascade_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            (buffer, group)
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow map"),
+            bind_group_layouts: &[Some(&globals_layout), Some(&cascade_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow map"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("shadow_vertex"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: QUAD_BYTES,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Uint32x4,
+                        offset: 0,
+                        shader_location: 0,
+                    }],
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: SHADOW_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                // Keeps lit faces from shading themselves.
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: Default::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow map"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let (view, layers) = shadow_texture(device, 1);
+        Self {
+            enabled: false,
+            view,
+            layers,
+            sampler,
+            pipeline,
+            globals_group,
+            cascades,
+        }
+    }
+
+    /// Off, the map shrinks to a texel per cascade.
+    fn set_enabled(&mut self, device: &wgpu::Device, enabled: bool) {
+        let size = if enabled { SHADOW_MAP_SIZE } else { 1 };
+        (self.view, self.layers) = shadow_texture(device, size);
+        self.enabled = enabled;
+    }
+}
+
+/// A depth texture with a layer per cascade, as one view to sample and one
+/// per layer to draw into.
+fn shadow_texture(device: &wgpu::Device, size: u32) -> (wgpu::TextureView, [wgpu::TextureView; 2]) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shadow map"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 2,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: SHADOW_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    let layers = [0, 1].map(|layer| {
+        texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_array_layer: layer,
+            array_layer_count: Some(1),
+            ..Default::default()
+        })
+    });
+    (view, layers)
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Uniform data laid out in 16-byte rows, as WGSL expects it.

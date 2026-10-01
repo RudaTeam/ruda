@@ -216,6 +216,11 @@ impl Menu {
                                 ui.checkbox(&mut graphics.fullscreen, "");
                                 ui.end_row();
 
+                                ui.label(t("settings-shadows"));
+                                ui.checkbox(&mut graphics.shadows, "")
+                                    .on_hover_text(t("settings-shadows-note"));
+                                ui.end_row();
+
                                 ui.label(t("settings-gpu-api"));
                                 let api_name = |api: GpuApi| {
                                     api.name()

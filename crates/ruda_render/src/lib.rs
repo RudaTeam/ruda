@@ -8,6 +8,7 @@ mod camera;
 mod culling;
 mod mesh;
 mod mesher;
+mod shadows;
 mod sky;
 mod textures;
 mod visibility;
@@ -80,6 +81,8 @@ pub struct RenderStats {
     pub drawn_chunks: usize,
     pub draw_calls: usize,
     pub quads: u64,
+    /// Draw calls into the shadow map.
+    pub shadow_draw_calls: usize,
 }
 
 impl fmt::Display for RenderStats {
@@ -88,7 +91,11 @@ impl fmt::Display for RenderStats {
             f,
             "{} of {} chunks drawn in {} draw calls, {} quads",
             self.drawn_chunks, self.chunks, self.draw_calls, self.quads
-        )
+        )?;
+        if self.shadow_draw_calls > 0 {
+            write!(f, "; {} draw calls for shadows", self.shadow_draw_calls)?;
+        }
+        Ok(())
     }
 }
 
@@ -383,6 +390,12 @@ impl Renderer {
     /// system composites them.
     pub fn surface_wait(&self) -> std::time::Duration {
         self.surface_wait
+    }
+
+    /// Turns sun shadows on or off. They draw the world once more for each
+    /// of the shadow map's two cascades, so they are for stronger GPUs.
+    pub fn set_shadows(&mut self, enabled: bool) {
+        self.world.set_shadows(&self.device, enabled);
     }
 
     /// Turns skipping chunks hidden behind solid ground and faces turned away
