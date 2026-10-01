@@ -14,7 +14,9 @@ use tracing::warn;
 
 use crate::arena::{RangeAllocator, Slots};
 use crate::camera::Frustum;
-use crate::clouds::{CLOUD_BOTTOM, CLOUD_CELL, CLOUD_THICKNESS, CloudField, CloudMesh, MASK_SIZE};
+use crate::clouds::{
+    CLOUD_BOTTOM, CLOUD_CELL, CLOUD_THICKNESS, CloudField, CloudMesh, KEYFRAME, MASK_SIZE, OPAQUE,
+};
 use crate::culling::visible_chunks;
 use crate::shadows::{Cascades, NEAR_CASCADE, SHADOW_MAP_SIZE, cascades};
 use crate::sky::SkyLook;
@@ -24,7 +26,7 @@ use ruda_world::lod::{LOD_TILE_SIZE, LodTilePos};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 /// Bytes of the `Globals` uniform in `world.wgsl`.
-const GLOBALS_SIZE: u64 = 512;
+const GLOBALS_SIZE: u64 = 544;
 const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Edge length of the sun and moon images; smaller ones are centred.
 const SKY_TEXTURE_SIZE: u32 = 32;
@@ -97,15 +99,22 @@ struct Page {
 /// The clouds near the camera.
 struct CloudLayer {
     field: CloudField,
-    /// Box faces, as `CloudMesh::quads`; `None` before the first mesh.
+    /// Box faces, the solid ones then the faint ones (see `CloudMesh`);
+    /// `None` before the first mesh.
     buffer: Option<wgpu::Buffer>,
-    count: u32,
-    /// Where clouds are, for their shadows on the ground.
+    solid: u32,
+    faint: u32,
+    /// How dense each cell is at two keyframes, for the clouds themselves
+    /// and their shadows on the ground.
     mask: wgpu::Texture,
     mask_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     /// Cloud-space cell of the first cell.
     origin: glam::IVec2,
+    /// When the first of the two keyframes is, in seconds.
+    keyframe: f64,
+    /// Whether to build clouds right away rather than on the worker pool.
+    wait: bool,
     /// Fills the depth buffer, so the colour pass only draws the cloud
     /// surface nearest the camera and clouds don't show through each other.
     depth_pipeline: wgpu::RenderPipeline,
@@ -701,6 +710,12 @@ impl WorldPass {
         self.stats
     }
 
+    /// Builds clouds right away rather than on the worker pool, so every
+    /// picture has them as they are now.
+    pub(crate) fn wait_for_clouds(&mut self, wait: bool) {
+        self.clouds.wait = wait;
+    }
+
     /// Where blocks of `chunk` reach the clouds; see `CloudField`.
     pub(crate) fn set_cloud_obstacles(&mut self, chunk: ChunkPos, columns: u64) {
         self.clouds.field.set_chunk(chunk, columns);
@@ -791,7 +806,10 @@ impl WorldPass {
         // Clouds reach as far as the view, but no farther than their mask.
         let cloud_reach = far.min(((MASK_SIZE as i32 - 1) / 2 - 1) as f32 * CLOUD_CELL as f32);
         if let Some(clouds) = &scene.clouds
-            && let Some(mesh) = self.clouds.field.update(camera, clouds, cloud_reach)
+            && let Some(mesh) =
+                self.clouds
+                    .field
+                    .update(camera, clouds, cloud_reach, self.clouds.wait)
         {
             self.clouds.upload(device, queue, &mesh);
         }
@@ -866,6 +884,11 @@ impl WorldPass {
             cloud_reach * 0.95,
         ]);
         globals.floats(sky.cloud.extend(sky.cloud_shadow).to_array());
+        globals.floats(sky.cloud_shade.extend(sky.cloud_under).to_array());
+        let blend = scene.clouds.map_or(0.0, |clouds| {
+            ((clouds.time - self.clouds.keyframe) / KEYFRAME).clamp(0.0, 1.0) as f32
+        });
+        globals.floats([blend, OPAQUE, 0.0, 0.0]);
         debug_assert_eq!(globals.0.len() as u64, GLOBALS_SIZE);
         queue.write_buffer(&self.globals, 0, &globals.0);
         let clear = wgpu::Color {
@@ -971,13 +994,18 @@ impl WorldPass {
 
         if scene.clouds.is_some()
             && let Some(buffer) = &self.clouds.buffer
-            && self.clouds.count > 0
         {
             pass.set_vertex_buffer(0, buffer.slice(..));
-            pass.set_pipeline(&self.clouds.depth_pipeline);
-            pass.draw(0..4, 0..self.clouds.count);
-            pass.set_pipeline(&self.clouds.color_pipeline);
-            pass.draw(0..4, 0..self.clouds.count);
+            // The solid clouds first, so they show through the faint ones.
+            let (solid, faint) = (self.clouds.solid, self.clouds.faint);
+            for quads in [0..solid, solid..solid + faint] {
+                if !quads.is_empty() {
+                    pass.set_pipeline(&self.clouds.depth_pipeline);
+                    pass.draw(0..4, quads.clone());
+                    pass.set_pipeline(&self.clouds.color_pipeline);
+                    pass.draw(0..4, quads);
+                }
+            }
         }
 
         if scene.target.is_some() {
@@ -1210,7 +1238,7 @@ impl CloudLayer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format: wgpu::TextureFormat::Rg8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -1270,11 +1298,14 @@ impl CloudLayer {
         Self {
             field: CloudField::default(),
             buffer: None,
-            count: 0,
+            solid: 0,
+            faint: 0,
             mask,
             mask_view,
             sampler,
             origin: glam::IVec2::ZERO,
+            keyframe: 0.0,
+            wait: false,
             depth_pipeline: pipeline("cloud depth", true, wgpu::ColorWrites::empty()),
             color_pipeline: pipeline("clouds", false, wgpu::ColorWrites::ALL),
         }
@@ -1282,8 +1313,9 @@ impl CloudLayer {
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &CloudMesh) {
         let bytes: Vec<u8> = mesh
-            .quads
+            .solid
             .iter()
+            .chain(&mesh.faint)
             .flatten()
             .flat_map(|word| word.to_le_bytes())
             .collect();
@@ -1304,14 +1336,16 @@ impl CloudLayer {
         {
             queue.write_buffer(buffer, 0, &bytes);
         }
-        self.count = mesh.quads.len() as u32;
+        self.solid = mesh.solid.len() as u32;
+        self.faint = mesh.faint.len() as u32;
         self.origin = mesh.origin;
+        self.keyframe = mesh.keyframe as f64 * KEYFRAME;
         queue.write_texture(
             self.mask.as_image_copy(),
-            &mesh.mask,
+            &mesh.density,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(MASK_SIZE),
+                bytes_per_row: Some(MASK_SIZE * 2),
                 rows_per_image: Some(MASK_SIZE),
             },
             wgpu::Extent3d {

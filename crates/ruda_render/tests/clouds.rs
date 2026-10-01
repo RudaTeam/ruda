@@ -1,4 +1,4 @@
-//! Clouds over flat sand: they shade the ground, and they part around a
+//! Clouds over flat dirt: they shade the ground, and they thin out around a
 //! pillar that reaches up into them.
 //!
 //! Needs a GPU; without one the test only says so and passes. With
@@ -7,8 +7,8 @@
 use glam::{DVec3, Vec3};
 use ruda_core::{BlockId, BlockPos, ChunkPos, ContentBuilder, Light, WorldBounds};
 use ruda_render::{
-    Backdrop, CLOUD_CELL, Camera, CloudSky, PaddedChunk, Renderer, Scene, cloud_at,
-    cloud_obstacles, mesh_chunk,
+    Backdrop, CLOUD_CELL, Camera, CloudSky, PaddedChunk, Renderer, Scene, cloud_density,
+    cloud_obstacles, cloud_opacity, mesh_chunk,
 };
 use ruda_world::light::LightEngine;
 use ruda_world::{Chunk, World};
@@ -35,9 +35,9 @@ fn clouds_shade_the_ground_and_part_around_a_pillar() {
     ruda_base::register(&mut content).unwrap();
     let content = content.build();
     let block = |name| content.blocks().id(&ruda_base::id(name).unwrap()).unwrap();
-    let (stone, sand) = (block("stone"), block("sand"));
+    let (stone, dirt) = (block("stone"), block("dirt"));
 
-    // Sand with its top at y = 0, and a 3×3 pillar from there up to 110,
+    // Dirt with its top at y = 0, and a 3×3 pillar from there up to 110,
     // through the clouds at 96 to 100.
     let bounds = WorldBounds {
         min_y: -32,
@@ -47,7 +47,7 @@ fn clouds_shade_the_ground_and_part_around_a_pillar() {
     for y in -1..=3 {
         for z in -2..=2 {
             for x in -2..=2 {
-                let fill = if y < 0 { sand } else { BlockId::AIR };
+                let fill = if y < 0 { dirt } else { BlockId::AIR };
                 world.insert_chunk(ChunkPos::new(x, y, z), Chunk::filled(fill));
             }
         }
@@ -73,8 +73,8 @@ fn clouds_shade_the_ground_and_part_around_a_pillar() {
         let chunk = PaddedChunk::gather(&world, pos).unwrap();
         renderer.upload_chunk(pos, &mesh_chunk(&chunk, &faces));
     }
-    // Whether there's a cloud over block (x, z) of cloud space, and the
-    // blocks around it.
+    // Whether there's a solid cloud over block (x, z) of cloud space, and
+    // the blocks around it, for the first few seconds.
     let cloudy = |x: i32, z: i32| {
         [(-4, -4), (4, -4), (-4, 4), (4, 4)]
             .iter()
@@ -83,21 +83,24 @@ fn clouds_shade_the_ground_and_part_around_a_pillar() {
                     (x + dx).div_euclid(CLOUD_CELL),
                     (z + dz).div_euclid(CLOUD_CELL),
                 );
-                cloud_at(SKY.seed, SKY.cover, x, z)
+                [0.0, 4.0].iter().all(|&time| {
+                    cloud_opacity(cloud_density(SKY.seed, SKY.cover, x, z, time)) > 0.99
+                })
             })
     };
 
     let scene = |camera: Camera, clouds: Option<CloudSky>| Scene {
         camera,
         target: None,
-        view_distance: 160.0,
+        view_distance: 256.0,
         bounds: Some(bounds),
         time_of_day: 0.25,
         eye_light: Light::SKY,
         lod_distance: 0.0,
         clouds,
     };
-    let pixel = |renderer: &mut Renderer, scene: &Scene, point: Vec3, name: &str| {
+    // The colour of the picture at each point.
+    let pixels = |renderer: &mut Renderer, scene: &Scene, points: &[Vec3], name: &str| {
         let (width, height, pixels) = renderer.capture(Backdrop::World(scene), None).unwrap();
         if let Some(dir) = std::env::var_os("RUDA_TEST_IMAGES") {
             save(
@@ -109,49 +112,55 @@ fn clouds_shade_the_ground_and_part_around_a_pillar() {
         }
         let camera = scene.camera;
         let view_proj = camera.view_proj(width as f32 / height as f32, 320.0);
-        let clip = view_proj.project_point3((point.as_dvec3() - camera.position).as_vec3());
-        let x = ((clip.x * 0.5 + 0.5) * width as f32) as u32;
-        let y = ((0.5 - clip.y * 0.5) * height as f32) as u32;
-        assert!(x < width && y < height, "{point} is off screen");
-        let at = ((y * width + x) * 4) as usize;
-        [pixels[at], pixels[at + 1], pixels[at + 2]].map(f32::from)
+        points
+            .iter()
+            .map(|&point| {
+                let clip = view_proj.project_point3((point.as_dvec3() - camera.position).as_vec3());
+                let x = ((clip.x * 0.5 + 0.5) * width as f32) as u32;
+                let y = ((0.5 - clip.y * 0.5) * height as f32) as u32;
+                assert!(x < width && y < height, "{point} is off screen");
+                let at = ((y * width + x) * 4) as usize;
+                [pixels[at], pixels[at + 1], pixels[at + 2]].map(f32::from)
+            })
+            .collect::<Vec<_>>()
     };
     let brightness = |rgb: [f32; 3]| rgb.iter().sum::<f32>() / 3.0;
 
-    // Under the clouds, looking down at the sand away from the pillar.
+    // Under the clouds, looking down at the ground away from the pillar.
     let mut below = Camera::new(DVec3::new(-30.0, 30.0, -30.0));
     below.rotate(0.0, -1.5);
     let ground = Vec3::new(-30.0, 0.0, -35.0);
     // The noon sun is a little south of overhead: the cloud that shades the
     // ground is that far north of it.
     assert!(cloudy(-30, -35 + 24));
-    let clear = pixel(
+    let clear = pixels(
         &mut renderer,
         &scene(below, None),
-        ground,
+        &[ground],
         "clouds-none.png",
-    );
-    let shaded = pixel(
+    )[0];
+    let shaded = pixels(
         &mut renderer,
         &scene(below, Some(SKY)),
-        ground,
+        &[ground],
         "clouds-shade.png",
-    );
+    )[0];
     assert!(
         brightness(shaded) < brightness(clear) * 0.85,
         "clouds darken the ground: {shaded:?} against {clear:?}"
     );
 
-    // Above the clouds, looking down next to the pillar.
-    let mut above = Camera::new(DVec3::new(12.0, 140.0, 12.0));
+    // Above the clouds, looking down next to the pillar, and at a cloud well
+    // away from it.
+    let mut above = Camera::new(DVec3::new(12.0, 160.0, 12.0));
     above.rotate(0.0, -1.5);
     let beside = Vec3::new(10.0, 100.0, 10.0);
-    let far = Vec3::new(44.0, 100.0, 12.0);
-    assert!(cloudy(10, 10) && cloudy(43, 12));
-    let unparted = pixel(
+    let far = Vec3::new(64.0, 100.0, 12.0);
+    assert!(cloudy(10, 10) && cloudy(63, 12));
+    let before = pixels(
         &mut renderer,
         &scene(above, Some(SKY)),
-        beside,
+        &[beside, far],
         "clouds-unparted.png",
     );
     for &pos in &positions {
@@ -161,26 +170,24 @@ fn clouds_shade_the_ground_and_part_around_a_pillar() {
     }
     // Obstacles count once some time has passed; nudge the clock.
     let later = CloudSky { time: 1.0, ..SKY };
-    let parted = pixel(
+    let after = pixels(
         &mut renderer,
         &scene(above, Some(later)),
-        beside,
-        "clouds-parted.png",
-    );
-    let still_far = pixel(
-        &mut renderer,
-        &scene(above, Some(later)),
-        far,
+        &[beside, far],
         "clouds-parted.png",
     );
     let difference = |a: [f32; 3], b: [f32; 3]| (0..3).map(|i| (a[i] - b[i]).abs()).sum::<f32>();
     assert!(
-        difference(parted, unparted) > 60.0,
-        "clouds part beside the pillar: {parted:?} against {unparted:?}"
+        difference(after[0], before[0]) > 60.0,
+        "clouds clear beside the pillar: {:?} against {:?}",
+        after[0],
+        before[0]
     );
     assert!(
-        difference(still_far, unparted) < 30.0,
-        "and stay away from it: {still_far:?} against {unparted:?}"
+        difference(after[1], before[1]) < 20.0,
+        "and stay away from it: {:?} against {:?}",
+        after[1],
+        before[1]
     );
 }
 

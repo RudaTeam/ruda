@@ -45,9 +45,15 @@ struct Globals {
     // x: how thick clouds are; y: 1 with clouds, 0 without; z, w: where
     // they start and finish fading out with distance.
     cloud: vec4<f32>,
-    // rgb: colour of a cloud's lit top; w: how much a cloud dims the
-    // sunlight under it.
+    // rgb: colour of a cloud where the sun or the moon lights it; w: how
+    // much a cloud dims the sunlight under it.
     cloud_color: vec4<f32>,
+    // rgb: colour of a cloud in its own shade; w: how much the undersides
+    // of clouds catch a low sun.
+    cloud_shade: vec4<f32>,
+    // x: how far it is from one keyframe of `cloud_density` to the next,
+    // 0 to 1; y: the density from which a cell is fully opaque.
+    cloud_shape: vec4<f32>,
 }
 
 // Width of `chunk_origins`, whose texels are chunk slots.
@@ -63,11 +69,17 @@ const ORIGINS_WIDTH = 128u;
 // Depth from the light, a layer per cascade.
 @group(0) @binding(5) var shadow_map: texture_depth_2d_array;
 @group(0) @binding(6) var shadow_sampler: sampler_comparison;
-// Where clouds are, a cell per texel from the first cell; see `clouds.rs`.
-@group(0) @binding(7) var cloud_mask: texture_2d<f32>;
+// How dense the clouds are, a cell per texel from the first cell: r at one
+// keyframe, g at the next; see `clouds.rs`.
+@group(0) @binding(7) var cloud_density: texture_2d<f32>;
 @group(0) @binding(8) var smooth_sampler: sampler;
-// Width of `cloud_mask`, in cells.
+// Width of `cloud_density`, in cells.
 const CLOUD_MASK_SIZE = 256.0;
+
+// How opaque a cloud of some density is, and how much it shades.
+fn cloud_opacity(density: f32) -> f32 {
+    return smoothstep(0.0, globals.cloud_shape.y, density);
+}
 // The light space of the cascade being drawn into the shadow map.
 @group(1) @binding(0) var<uniform> shadow_pass: mat4x4<f32>;
 
@@ -309,7 +321,9 @@ struct CloudVertex {
     // Relative to the camera. Distances are taken per pixel: a cloud can be
     // hundreds of blocks across, and its corners say little about its middle.
     @location(0) position: vec3<f32>,
-    @location(1) @interpolate(flat) shade: f32,
+    @location(1) @interpolate(flat) normal: vec3<f32>,
+    // 0 at the bottom of the cloud, 1 at the top.
+    @location(2) height: f32,
 }
 
 // Cloud boxes; see `CloudMesh` in `clouds.rs`.
@@ -323,23 +337,54 @@ fn cloud_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>
         f32(((quad.y >> 10u) & 1023u) + 1u) * cell,
     );
     let face = (quad.x >> 20u) & 7u;
-    let position = globals.cloud_origin.xyz + box_corner(start, size, face, vertex).local;
+    let local = box_corner(start, size, face, vertex).local;
+    let position = globals.cloud_origin.xyz + local;
 
     var out: CloudVertex;
     out.clip = globals.view_proj * vec4<f32>(position, 1.0);
     out.position = position;
-    // Lit from above, darker underneath.
-    var shades = array<f32, 6>(0.86, 0.86, 1.0, 0.7, 0.86, 0.86);
-    out.shade = shades[face];
+    out.normal = face_normal(face);
+    out.height = local.y / globals.cloud.x;
     return out;
 }
 
 @fragment
 fn cloud_fragment(in: CloudVertex) -> @location(0) vec4<f32> {
+    // The cell this face belongs to: a little inside it, off the edge it
+    // shares with the next cell.
+    let inside = in.position - in.normal * 0.5;
+    let cell = vec2<i32>(floor((inside.xz - globals.cloud_origin.xz) / globals.cloud_origin.w));
+    let keyframes = textureLoad(cloud_density, clamp(cell, vec2<i32>(0), vec2<i32>(255)), 0).rg;
+    let density = mix(keyframes.x, keyframes.y, globals.cloud_shape.x);
+    let opacity = cloud_opacity(density);
+
+    // Lit by the sun (or the moon) where a face turns to it, by the sky
+    // elsewhere. Undersides are in shade, the more so the denser the
+    // cloud, except for a low sun shining under them.
+    let toward = globals.shadow_light.xyz;
+    let facing = max(dot(in.normal, toward), 0.0);
+    let dense = min(density * 2.0, 1.0);
+    var lit: f32;
+    var shade = 1.0;
+    if in.normal.y > 0.5 {
+        lit = 0.55 + 0.45 * facing;
+    } else if in.normal.y < -0.5 {
+        lit = 0.8 * globals.cloud_shade.w;
+        shade = 1.0 - 0.35 * dense;
+    } else {
+        lit = facing;
+        shade = mix(0.85, 1.0, in.height);
+    }
+    var color = mix(globals.cloud_shade.rgb, globals.cloud_color.rgb, lit) * shade;
+    // Thin clouds between the camera and the sun glow.
+    let view = normalize(in.position);
+    let behind = pow(max(dot(view, toward), 0.0), 8.0) * globals.sun.w;
+    color += globals.cloud_color.rgb * behind * (1.0 - opacity * 0.6) * 0.5;
+
     let fog = smoothstep(globals.fog.x, globals.fog.y, length(in.position));
-    let color = mix(globals.cloud_color.rgb * in.shade, globals.fog_color.rgb, fog);
+    color = mix(color, globals.fog_color.rgb, fog);
     let fade = 1.0 - smoothstep(globals.cloud.z, globals.cloud.w, length(in.position.xz));
-    return vec4<f32>(color, 0.8 * fade);
+    return vec4<f32>(color, 0.92 * opacity * fade);
 }
 
 // Far-away terrain; see `LodQuad` in `lod.rs`. A tile's position comes from
@@ -409,8 +454,11 @@ fn shade(in: ChunkVertex) -> vec4<f32> {
     if globals.cloud.y > 0.0 && toward.y > 0.02 && height > 0.0 {
         let through = in.position + toward * (height / toward.y);
         let cell = (through.xz - globals.cloud_origin.xz) / globals.cloud_origin.w;
-        let cover = textureSampleLevel(cloud_mask, smooth_sampler, cell / CLOUD_MASK_SIZE, 0.0).r;
-        sky *= 1.0 - globals.cloud_color.w * cover * smoothstep(0.02, 0.2, toward.y);
+        let keyframes = textureSampleLevel(cloud_density, smooth_sampler, cell / CLOUD_MASK_SIZE, 0.0).rg;
+        let density = mix(keyframes.x, keyframes.y, globals.cloud_shape.x);
+        // Denser clouds cast darker shadows.
+        let shadow = cloud_opacity(density) * mix(0.8, 1.25, min(density * 2.0, 1.0));
+        sky *= 1.0 - globals.cloud_color.w * shadow * smoothstep(0.02, 0.2, toward.y);
     }
     let light = max(max(sky, level.yzw * in.shade), vec3<f32>(globals.sky_light.w * in.shade));
     var color = texel * light * mix(0.45, 1.0, in.occlusion);

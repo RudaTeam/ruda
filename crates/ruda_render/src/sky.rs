@@ -20,10 +20,15 @@ const SUN_GLOW: Vec3 = Vec3::new(1.0, 0.52, 0.24);
 const DAYLIGHT: Vec3 = Vec3::new(1.0, 1.0, 1.0);
 const DUSK_LIGHT: Vec3 = Vec3::new(1.0, 0.78, 0.62);
 const MOONLIGHT: Vec3 = Vec3::new(0.16, 0.19, 0.30);
-/// Clouds: white by day, dark grey-blue by night, lit warm at dusk.
+/// Clouds where the sun (or the moon) lights them: white by day, warm at
+/// dusk, grey-blue by night.
 const DAY_CLOUD: Vec3 = Vec3::new(1.0, 1.0, 1.0);
-const NIGHT_CLOUD: Vec3 = Vec3::new(0.07, 0.08, 0.12);
+const NIGHT_CLOUD: Vec3 = Vec3::new(0.14, 0.16, 0.24);
 const DUSK_CLOUD: Vec3 = Vec3::new(1.0, 0.62, 0.42);
+/// And in their own shade, lit only by the sky.
+const DAY_CLOUD_SHADE: Vec3 = Vec3::new(0.74, 0.77, 0.84);
+const NIGHT_CLOUD_SHADE: Vec3 = Vec3::new(0.05, 0.06, 0.10);
+const DUSK_CLOUD_SHADE: Vec3 = Vec3::new(0.42, 0.38, 0.50);
 /// How much a cloud dims the sunlight under it.
 const CLOUD_SHADOW: f32 = 0.4;
 /// The least light anything gets, so caves aren't pitch black.
@@ -47,8 +52,12 @@ pub(crate) struct SkyLook {
     /// Colour and strength of full sky light, linear.
     pub sky_light: Vec3,
     pub ambient: f32,
-    /// Colour of a cloud's lit top.
+    /// Colour of a cloud where the sun or the moon lights it.
     pub cloud: Vec3,
+    /// Colour of a cloud in its own shade.
+    pub cloud_shade: Vec3,
+    /// How much the undersides of clouds catch a low sun, 0 to 1.
+    pub cloud_under: f32,
     pub cloud_shadow: f32,
 }
 
@@ -73,9 +82,13 @@ impl SkyLook {
         let sky_light = MOONLIGHT
             .lerp(DAYLIGHT, day)
             .lerp(DUSK_LIGHT, dusk * 0.5 * day);
+        let sunset = dusk * smoothstep(-0.25, 0.0, sun.y);
         let cloud = NIGHT_CLOUD
             .lerp(DAY_CLOUD, day)
-            .lerp(DUSK_CLOUD, dusk * 0.6 * smoothstep(-0.25, 0.0, sun.y));
+            .lerp(DUSK_CLOUD, sunset * 0.85);
+        let cloud_shade = NIGHT_CLOUD_SHADE
+            .lerp(DAY_CLOUD_SHADE, day)
+            .lerp(DUSK_CLOUD_SHADE, sunset * 0.7);
 
         // An overcast sky is greyer and its light weaker.
         let cover = cover.clamp(0.0, 1.0);
@@ -85,6 +98,7 @@ impl SkyLook {
         let horizon = grey(horizon);
         let sky_light = sky_light * (1.0 - 0.3 * cover);
         let cloud = grey(cloud) * (1.0 - 0.35 * cover * cover);
+        let cloud_shade = grey(cloud_shade) * (1.0 - 0.35 * cover * cover);
 
         // Seen from a cave, the sky and fog go dark.
         let eye = 0.06 + 0.94 * brightness(f32::from(eye.sky()) / f32::from(Light::MAX));
@@ -101,6 +115,8 @@ impl SkyLook {
             sky_light,
             ambient: AMBIENT,
             cloud: cloud * eye,
+            cloud_shade: cloud_shade * eye,
+            cloud_under: sunset,
             cloud_shadow: CLOUD_SHADOW,
         }
     }
@@ -113,6 +129,7 @@ impl SkyLook {
         self.glow = linear(self.glow);
         self.fog = linear(self.fog);
         self.cloud = linear(self.cloud);
+        self.cloud_shade = linear(self.cloud_shade);
         self
     }
 }
@@ -152,7 +169,11 @@ mod tests {
             sunset.cloud.x > sunset.cloud.z,
             "clouds glow warm at sunset"
         );
-        assert!(midnight.cloud.max_element() < 0.2);
+        assert!(sunset.cloud_under > 0.8 && noon.cloud_under < 0.01);
+        assert!(midnight.cloud.max_element() < 0.3);
+        for look in [noon, sunset, midnight] {
+            assert!(look.cloud_shade.element_sum() < look.cloud.element_sum());
+        }
     }
 
     #[test]

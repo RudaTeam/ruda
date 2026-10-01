@@ -26,8 +26,8 @@ use wgpu::rwh::{HasDisplayHandle, HasWindowHandle};
 
 pub use camera::{Camera, Frustum};
 pub use clouds::{
-    CLOUD_BOTTOM, CLOUD_CELL, CLOUD_THICKNESS, CloudSky, WIND, cloud_at, cloud_obstacles,
-    far_cloud_obstacles,
+    CLOUD_BOTTOM, CLOUD_CELL, CLOUD_THICKNESS, CloudSky, WIND, cloud_density, cloud_obstacles,
+    cloud_opacity, far_cloud_obstacles,
 };
 pub use lod::{LodMesh, LodQuad, mesh_lod};
 pub use mesh::{BlockFaces, ChunkMesh, ModelVertex, PaddedChunk, Quad, mesh_chunk};
@@ -315,7 +315,10 @@ impl Renderer {
             "GPU ready"
         );
 
-        let world = WorldPass::new(&device, &queue, config.format, width, height);
+        let mut world = WorldPass::new(&device, &queue, config.format, width, height);
+        // Without a window, every picture is final: it can't wait for clouds
+        // built in the background.
+        world.wait_for_clouds(surface.is_none());
         let ui = egui_wgpu::Renderer::new(
             &device,
             ui_format,

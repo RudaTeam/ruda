@@ -17,7 +17,8 @@ It's very early. You can fly around a generated world with hills, rocky
 mountains, caves and ore, break and place blocks, and light caves with lamps and torches. Days and nights pass
 every 20 minutes, light spreads from the sky and from glowing blocks in colour,
 and corners are softly shaded. Blocky clouds drift with the wind at the height
-of the mountain tops, shade the ground and part around the peaks. The world is endless sideways and 256 blocks
+of the mountain tops, slowly form and fade away, thin out around the peaks
+and shade the ground. The world is endless sideways and 256 blocks
 tall, from −128 to +127, with sea level at 0 and unbreakable bedrock at the
 bottom. Single-player already runs on a local server
 inside the game; there's no survival, saving or network play yet.
