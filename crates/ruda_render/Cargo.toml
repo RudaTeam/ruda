@@ -19,7 +19,13 @@ tracing.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 naga = { version = "30.0.0", features = ["wgsl-in"] }
+ruda_base.workspace = true
+
+[[bench]]
+name = "meshing"
+harness = false
 
 [lints]
 workspace = true

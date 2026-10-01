@@ -152,45 +152,69 @@ impl ChunkMesh {
 
 /// Builds the chunk's visible faces, merging neighbouring faces with the
 /// same texture into larger rectangles (greedy meshing).
+///
+/// Visibility is found a whole column at a time: every column of the padded
+/// chunk along each axis becomes a 64-bit mask of solid blocks, and
+/// `column & !(column >> 1)` marks the blocks whose next neighbour is open.
 pub fn mesh_chunk(chunk: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
+    // columns[axis][v * PADDED + u]: bit i is set if the block at padded
+    // coordinate i along `axis` is solid.
+    let mut columns = vec![[0u64; PADDED * PADDED]; 3];
+    for (index, &block) in chunk.blocks.iter().enumerate() {
+        if !faces.is_solid(block) {
+            continue;
+        }
+        let p = [
+            index % PADDED,
+            index / (PADDED * PADDED),
+            index / PADDED % PADDED,
+        ];
+        for (axis, columns) in columns.iter_mut().enumerate() {
+            let (u_axis, v_axis) = plane_axes(axis);
+            columns[p[v_axis] * PADDED + p[u_axis]] |= 1 << p[axis];
+        }
+    }
+
     let mut quads = Vec::new();
-    // Texture layer + 1 of each visible face in a slice; 0 where there is none.
-    let mut cells = [[0u32; SIZE]; SIZE];
+    // Per slice, texture layer + 1 of each visible face; 0 where there is none.
+    let mut planes = vec![[[0u16; SIZE]; SIZE]; SIZE];
     for face in Face::ALL {
         let axis = face.axis();
         let (u_axis, v_axis) = plane_axes(axis);
-        let normal = face.normal();
-        for slice in 0..SIZE {
-            let mut any = false;
-            for (v, row) in cells.iter_mut().enumerate() {
-                for (u, cell) in row.iter_mut().enumerate() {
-                    let mut block = [0; 3];
-                    block[axis] = slice;
-                    block[u_axis] = u;
-                    block[v_axis] = v;
-                    let padded = block.map(|c| c + 1);
-                    *cell = 0;
-                    let Some(layers) = faces.get(chunk.get(padded)) else {
-                        continue;
-                    };
-                    let neighbour =
-                        std::array::from_fn(|i| (padded[i] as i32 + normal[i]) as usize);
-                    if faces.is_solid(chunk.get(neighbour)) {
-                        continue;
-                    }
-                    *cell = u32::from(layers[face.index()]) + 1;
-                    any = true;
+        let mut slices_used = 0u32;
+        for v in 0..SIZE {
+            for u in 0..SIZE {
+                let column = columns[axis][(v + 1) * PADDED + u + 1];
+                let open = if face.is_positive() {
+                    column & !(column >> 1)
+                } else {
+                    column & !(column << 1)
+                };
+                // Padded coordinates 1..=32 are the chunk's own slices 0..32.
+                let mut visible = (open >> 1) as u32;
+                while visible != 0 {
+                    let slice = visible.trailing_zeros() as usize;
+                    visible &= visible - 1;
+                    let mut padded = [0; 3];
+                    padded[axis] = slice + 1;
+                    padded[u_axis] = u + 1;
+                    padded[v_axis] = v + 1;
+                    let layers = faces.get(chunk.get(padded)).unwrap_or_default();
+                    planes[slice][v][u] = layers[face.index()] + 1;
+                    slices_used |= 1 << slice;
                 }
             }
-            if any {
-                merge(&mut cells, |u, v, width, height, cell| {
-                    let mut block = [0; 3];
-                    block[axis] = slice;
-                    block[u_axis] = u;
-                    block[v_axis] = v;
-                    quads.push(pack(block, width, height, face, (cell - 1) as u16));
-                });
-            }
+        }
+        while slices_used != 0 {
+            let slice = slices_used.trailing_zeros() as usize;
+            slices_used &= slices_used - 1;
+            merge(&mut planes[slice], |u, v, width, height, cell| {
+                let mut block = [0; 3];
+                block[axis] = slice;
+                block[u_axis] = u;
+                block[v_axis] = v;
+                quads.push(pack(block, width, height, face, cell - 1));
+            });
         }
     }
     ChunkMesh { quads }
@@ -198,7 +222,7 @@ pub fn mesh_chunk(chunk: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
 
 /// Covers the non-zero cells with rectangles of equal cells, widest rows
 /// first, and clears them.
-fn merge(cells: &mut [[u32; SIZE]; SIZE], mut emit: impl FnMut(usize, usize, usize, usize, u32)) {
+fn merge(cells: &mut [[u16; SIZE]; SIZE], mut emit: impl FnMut(usize, usize, usize, usize, u16)) {
     for v in 0..SIZE {
         let mut u = 0;
         while u < SIZE {
@@ -330,6 +354,50 @@ mod tests {
             .filter(|q| q.3 == Face::PosY)
             .collect();
         assert_eq!(tops.len(), 2);
+    }
+
+    #[test]
+    fn covers_exactly_the_open_faces() {
+        let f = fixture();
+        let mut chunk = Chunk::filled(BlockId::AIR);
+        // A deterministic jumble of two block types and air.
+        let mut state = 12345u32;
+        for pos in LocalPos::all() {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            match state >> 29 {
+                0..=2 => {}
+                3..=5 => drop(chunk.set(pos, f.stone)),
+                _ => drop(chunk.set(pos, f.dirt)),
+            }
+        }
+        let world = world_with(chunk.clone());
+        let padded = PaddedChunk::gather(&world, ChunkPos::new(0, 0, 0)).unwrap();
+
+        let solid = |pos: glam::IVec3| {
+            let inside =
+                pos.cmpge(glam::IVec3::ZERO).all() && pos.cmplt(glam::IVec3::splat(32)).all();
+            inside
+                && chunk.get(LocalPos::new(pos.x as u32, pos.y as u32, pos.z as u32))
+                    != BlockId::AIR
+        };
+        let mut expected = [0u32; 6];
+        for pos in LocalPos::all() {
+            if !solid(pos.vec()) {
+                continue;
+            }
+            for face in Face::ALL {
+                if !solid(pos.vec() + face.normal()) {
+                    expected[face.index()] += 1;
+                }
+            }
+        }
+
+        let mut covered = [0u32; 6];
+        for quad in mesh_chunk(&padded, &f.faces).quads {
+            let (_, width, height, face, _) = unpack(quad);
+            covered[face.index()] += width * height;
+        }
+        assert_eq!(covered, expected);
     }
 
     #[test]
