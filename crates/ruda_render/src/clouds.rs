@@ -1,35 +1,61 @@
-//! Clouds: a layer of blocky cells drifting with the wind, parting around
-//! mountains and tall buildings, and shading the ground below.
+//! Clouds: soft clouds in a layer over the world, drifting with the wind,
+//! parting around mountains and buildings, lit through the air like
+//! everything else.
 //!
-//! The pattern is fixed in "cloud space", which the wind slides over the
-//! world, so every player sees the same clouds. Their geometry is rebuilt
-//! only when the camera or the wind has moved a cell; in between, the
-//! renderer just slides it along.
+//! A cloud isn't geometry. The shader works out how much cloud there is at
+//! a point (`cloud_density` in `world.wgsl`) from three textures:
+//! - patches of cloud, made from the sky's seed and slid along by the wind;
+//! - finer, puffy detail for their edges, also from the seed;
+//! - how high obstacles reach into the layer around the camera, so clouds
+//!   thin out and part before they touch them.
+//!
+//! The patches depend only on the seed, the cover and how far the wind has
+//! carried the air, so every player sees the same clouds without the server
+//! sending them. Nothing is rebuilt as clouds move, so they can't pop in or
+//! out.
 
 use std::collections::HashMap;
 
 use glam::{DVec2, DVec3, IVec2};
+use rayon::prelude::*;
 use ruda_core::{BlockId, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos};
 use ruda_world::Chunk;
 use ruda_world::lod::{LOD_CELL, LOD_TILE_CELLS, LodTile, LodTilePos};
 
-/// Edge length of a cloud cell, in blocks.
-pub const CLOUD_CELL: i32 = 12;
-/// Height of the bottom of the clouds, about as high as the tallest
-/// mountains.
-pub const CLOUD_BOTTOM: i32 = 96;
-pub const CLOUD_THICKNESS: i32 = 4;
-/// Blocks per second the wind moves the clouds, mostly east.
-pub const WIND: DVec2 = DVec2::new(1.0, 0.35);
-/// Edge length of the texture that tells the terrain where clouds are.
-pub(crate) const MASK_SIZE: u32 = 256;
-/// Clouds reach at most this many cells from the camera.
-const MAX_RADIUS: i32 = (MASK_SIZE as i32 - 1) / 2;
+/// The bottom of the clouds: the tallest mountains rise through them.
+pub const CLOUD_BOTTOM: f32 = 204.0;
+/// The top of the tallest clouds.
+pub const CLOUD_TOP: f32 = 244.0;
+/// Blocky clouds, as in classic block games: cells of this many blocks a
+/// side, in a layer this thick, around the middle of the soft clouds.
+pub const BLOCKY_CELL: f32 = 12.0;
+pub const BLOCKY_THICKNESS: f32 = 4.0;
+pub const BLOCKY_BOTTOM: f32 = (CLOUD_BOTTOM + CLOUD_TOP - BLOCKY_THICKNESS) / 2.0;
+
+/// Edge length of the patch texture, in texels, and how many blocks it
+/// spans before it repeats.
+pub(crate) const PATCH_SIZE: u32 = 512;
+pub(crate) const PATCH_PERIOD: f64 = 4096.0;
+/// The same for the detail texture, in all three directions.
+pub(crate) const DETAIL_SIZE: u32 = 32;
+pub(crate) const DETAIL_PERIOD: f64 = 96.0;
+
+/// Edge length of the obstacle map around the camera, in cells of
+/// `OBSTACLE_CELL` blocks: about 4 km across.
+pub(crate) const OBSTACLE_SIZE: u32 = 1024;
+pub(crate) const OBSTACLE_CELL: i32 = LOD_CELL;
+/// Heights in the obstacle map start here; lower ones don't matter.
+pub(crate) const OBSTACLE_BASE: i32 = CLOUD_BOTTOM as i32 - 32;
+/// Clouds keep this many cells (of 4 blocks) clear of an obstacle's sides
+/// before they start thinning out.
+const CLEARANCE: usize = 1;
+/// Then thin out over about twice this many cells.
+const SOFTNESS: usize = 2;
 /// While the world loads, obstacles change all the time: take them into
 /// account at most this often, in seconds.
 const OBSTACLE_UPDATES: f64 = 0.5;
-/// Obstacles are kept as cells of this many blocks.
-const OBSTACLE_CELL: i32 = LOD_CELL;
+/// The obstacle map moves in steps of this many cells as the camera does.
+const OBSTACLE_STEP: i32 = 64;
 
 /// What the clouds look like at a moment; the same for every player.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -38,40 +64,137 @@ pub struct CloudSky {
     pub seed: u64,
     /// How much of the sky clouds cover, 0 to 1.
     pub cover: f32,
-    /// Seconds since the world began: how far the wind has moved them.
-    pub time: f64,
+    /// How far the wind has carried the air since the world began, in
+    /// blocks along x and z; see [`ruda_core::WindMap::drift`].
+    pub drift: DVec2,
 }
 
-impl CloudSky {
-    /// How far the wind has moved cloud space over the world, in blocks.
-    pub fn drift(&self) -> DVec2 {
-        WIND * self.time
+/// The patch and detail textures for a seed.
+pub(crate) struct CloudNoise {
+    /// `PATCH_SIZE`² bytes. Every value is as common as every other, so
+    /// the patches above 1 − cover cover exactly that much of the sky.
+    pub patches: Vec<u8>,
+    /// `DETAIL_SIZE`³ bytes: puffs, high in their middles.
+    pub detail: Vec<u8>,
+}
+
+impl CloudNoise {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self {
+            patches: patches(seed),
+            detail: detail(seed ^ 0x2545_f491_4f6c_dd1d),
+        }
     }
 }
 
-/// Whether cell (x, z) of cloud space holds a cloud: two layers of smooth
-/// noise, big blobs and smaller detail, over a threshold set by the cover.
-pub fn cloud_at(seed: u64, cover: f32, x: i32, z: i32) -> bool {
-    let noise = 0.65 * value_noise(seed, x, z, 7) + 0.35 * value_noise(seed ^ 0x5bd1_e995, x, z, 3);
-    noise > 0.5 + (0.5 - cover.clamp(0.0, 1.0)) * 0.55
+/// Smooth, repeating noise: big patches with smaller ones on their edges.
+fn patches(seed: u64) -> Vec<u8> {
+    let size = PATCH_SIZE as usize;
+    // Lattice spacing in texels (of 8 blocks; each divides the texture, so
+    // it repeats seamlessly) and weight of each layer: clouds a hundred or
+    // two blocks across, about as wide as the layer is tall.
+    let octaves = [(32, 0.45), (16, 0.3), (8, 0.15), (4, 0.1)];
+    let values: Vec<f32> = (0..size * size)
+        .into_par_iter()
+        .map(|i| {
+            let (x, z) = ((i % size) as f32, (i / size) as f32);
+            octaves
+                .iter()
+                .enumerate()
+                .map(|(octave, &(spacing, weight))| {
+                    let period = (size / spacing) as i32;
+                    let seed =
+                        seed.wrapping_add((octave as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                    weight * gradient_noise(seed, x / spacing as f32, z / spacing as f32, period)
+                })
+                .sum()
+        })
+        .collect();
+    equalize(&values)
 }
 
-fn value_noise(seed: u64, x: i32, z: i32, scale: i32) -> f32 {
-    let (lx, lz) = (x.div_euclid(scale), z.div_euclid(scale));
-    let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
-    let fx = smooth(x.rem_euclid(scale) as f32 / scale as f32);
-    let fz = smooth(z.rem_euclid(scale) as f32 / scale as f32);
-    let at = |dx: i32, dz: i32| hash(seed, lx + dx, lz + dz);
-    let near = at(0, 0) + (at(1, 0) - at(0, 0)) * fx;
-    let far = at(0, 1) + (at(1, 1) - at(0, 1)) * fx;
-    near + (far - near) * fz
+/// Turns values into their ranks: the result has every byte about equally
+/// often, in the same order as the values.
+fn equalize(values: &[f32]) -> Vec<u8> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_unstable_by(|&a, &b| values[a].total_cmp(&values[b]));
+    let mut ranks = vec![0u8; values.len()];
+    for (rank, &index) in order.iter().enumerate() {
+        ranks[index] = (rank * 256 / values.len()) as u8;
+    }
+    ranks
+}
+
+/// Perlin's gradient noise at `(x, z)` on a lattice that repeats every
+/// `period` cells, from −1 to 1 roughly.
+fn gradient_noise(seed: u64, x: f32, z: f32, period: i32) -> f32 {
+    let (x0, z0) = (x.floor(), z.floor());
+    let (fx, fz) = (x - x0, z - z0);
+    let corner = |dx: i32, dz: i32| {
+        let cx = (x0 as i32 + dx).rem_euclid(period);
+        let cz = (z0 as i32 + dz).rem_euclid(period);
+        let angle = hash(seed, cx, cz, 0) * std::f32::consts::TAU;
+        let (sin, cos) = angle.sin_cos();
+        cos * (fx - dx as f32) + sin * (fz - dz as f32)
+    };
+    let fade = |t: f32| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+    let (u, v) = (fade(fx), fade(fz));
+    let near = corner(0, 0) + (corner(1, 0) - corner(0, 0)) * u;
+    let far = corner(0, 1) + (corner(1, 1) - corner(0, 1)) * u;
+    (near + (far - near) * v) * std::f32::consts::SQRT_2
+}
+
+/// Puffy, repeating 3-D noise: one minus the distance to the nearest of
+/// scattered points (Worley noise), in three sizes.
+fn detail(seed: u64) -> Vec<u8> {
+    let size = DETAIL_SIZE as usize;
+    // Points per edge of the texture, and weight.
+    let octaves = [(4, 0.6), (8, 0.27), (16, 0.13)];
+    (0..size * size * size)
+        .into_par_iter()
+        .map(|i| {
+            let p = [i % size, i / size % size, i / (size * size)].map(|c| c as f32 / size as f32);
+            let value: f32 = octaves
+                .iter()
+                .enumerate()
+                .map(|(octave, &(cells, weight))| {
+                    let seed =
+                        seed.wrapping_add((octave as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f));
+                    weight * (1.0 - worley(seed, p, cells))
+                })
+                .sum();
+            (value.clamp(0.0, 1.0) * 255.0) as u8
+        })
+        .collect()
+}
+
+/// Distance from `p` (in the unit cube, repeating) to the nearest of one
+/// random point per cell of a `cells`³ grid, in cell widths, at most 1.
+fn worley(seed: u64, p: [f32; 3], cells: i32) -> f32 {
+    let at = p.map(|c| c * cells as f32);
+    let cell = at.map(|c| c.floor() as i32);
+    let mut nearest = f32::MAX;
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let c = [cell[0] + dx, cell[1] + dy, cell[2] + dz];
+                let wrapped = c.map(|c| c.rem_euclid(cells));
+                let key = (wrapped[2] * cells + wrapped[1]) * cells + wrapped[0];
+                let point = [0, 1, 2].map(|axis| c[axis] as f32 + hash(seed, key, axis as i32, 1));
+                let distance: f32 = (0..3).map(|axis| (point[axis] - at[axis]).powi(2)).sum();
+                nearest = nearest.min(distance);
+            }
+        }
+    }
+    nearest.sqrt().min(1.0)
 }
 
 /// A number from 0 to 1 for every lattice point.
-fn hash(seed: u64, x: i32, z: i32) -> f32 {
+fn hash(seed: u64, x: i32, z: i32, salt: i32) -> f32 {
     let mut h = seed
         ^ u64::from(x as u32).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        ^ u64::from(z as u32).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+        ^ u64::from(z as u32).wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
+        ^ u64::from(salt as u32).wrapping_mul(0x1656_67b1_9e37_79f9);
     h ^= h >> 31;
     h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     h ^= h >> 27;
@@ -80,294 +203,198 @@ fn hash(seed: u64, x: i32, z: i32) -> f32 {
     (h >> 40) as f32 / (1u64 << 24) as f32
 }
 
-/// Where the solid blocks of a chunk reach the bottom of the clouds: bit
-/// `z * 8 + x` is set for each 4×4-block column `(x, z)` with one.
-pub fn cloud_obstacles(pos: ChunkPos, chunk: &Chunk, solid: impl Fn(BlockId) -> bool) -> u64 {
+/// How high a chunk's solid blocks reach in each 4×4-block column: the top
+/// of the highest one, or `None` if none of its columns gets near the clouds.
+/// Entry `z * 8 + x` is column `(x, z)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnTops([i16; 64]);
+
+impl ColumnTops {
+    const NONE: i16 = i16::MIN;
+}
+
+/// Where the solid blocks of a chunk reach up towards the clouds, if they do.
+pub fn cloud_obstacles(
+    pos: ChunkPos,
+    chunk: &Chunk,
+    solid: impl Fn(BlockId) -> bool,
+) -> Option<ColumnTops> {
     let bottom = pos.origin().0.y;
-    // Touching the bottom of a cloud counts.
-    let from = CLOUD_BOTTOM - 1 - bottom;
-    if from >= CHUNK_SIZE || chunk.palette().iter().all(|&block| !solid(block)) {
-        return 0;
+    if bottom + CHUNK_SIZE <= OBSTACLE_BASE || chunk.palette().iter().all(|&block| !solid(block)) {
+        return None;
     }
     let mut blocks = vec![BlockId::AIR; CHUNK_VOLUME];
     chunk.copy_to(&mut blocks);
-    let mut columns = 0u64;
-    for y in from.max(0)..CHUNK_SIZE {
-        for z in 0..CHUNK_SIZE {
-            for x in 0..CHUNK_SIZE {
+    let cells = (CHUNK_SIZE / OBSTACLE_CELL) as usize;
+    let mut tops = [ColumnTops::NONE; 64];
+    for z in 0..CHUNK_SIZE {
+        for x in 0..CHUNK_SIZE {
+            let top = (0..CHUNK_SIZE).rev().find(|&y| {
                 let local = LocalPos::new(x as u32, y as u32, z as u32);
-                if solid(blocks[local.index()]) {
-                    columns |= 1 << ((z / OBSTACLE_CELL) * 8 + x / OBSTACLE_CELL);
-                }
+                solid(blocks[local.index()])
+            });
+            if let Some(y) = top {
+                let cell = (z / OBSTACLE_CELL) as usize * cells + (x / OBSTACLE_CELL) as usize;
+                tops[cell] = tops[cell].max((bottom + y + 1) as i16);
             }
         }
     }
-    columns
+    tops.iter()
+        .any(|&top| i32::from(top) > OBSTACLE_BASE)
+        .then_some(ColumnTops(tops))
 }
 
-/// The same for far-away terrain: a word per row of cells, bit `x` set
-/// where the surface reaches the clouds.
-pub fn far_cloud_obstacles(tile: &LodTile) -> [u64; LOD_TILE_CELLS] {
-    let mut rows = [0u64; LOD_TILE_CELLS];
-    for (z, row) in rows.iter_mut().enumerate() {
-        for x in 0..LOD_TILE_CELLS {
-            if i32::from(tile.cell(x, z).0) >= CLOUD_BOTTOM - 1 {
-                *row |= 1 << x;
-            }
-        }
-    }
-    rows
+/// The same for far-away terrain: the surface of each cell, or `None` if
+/// none gets near the clouds.
+pub fn far_cloud_obstacles(tile: &LodTile) -> Option<Box<[i16]>> {
+    let tops: Box<[i16]> = (0..LOD_TILE_CELLS * LOD_TILE_CELLS)
+        .map(|i| tile.cell(i % LOD_TILE_CELLS, i / LOD_TILE_CELLS).0 + 1)
+        .collect();
+    tops.iter()
+        .any(|&top| i32::from(top) > OBSTACLE_BASE)
+        .then_some(tops)
 }
 
-/// The clouds near the camera, ready to draw.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CloudMesh {
-    /// Box faces, packed like this: word 0 is x and z of the first cell
-    /// relative to `origin` (10 bits each) and the face (3 bits); word 1 is
-    /// width and depth in cells, minus one (10 bits each).
-    pub quads: Vec<[u32; 4]>,
-    /// One byte per cell, 255 under cloud, `MASK_SIZE` cells to a row.
-    pub mask: Vec<u8>,
-    /// Cloud-space cell of the first cell.
+/// How high obstacles reach into the clouds around the camera, as a texture.
+#[derive(Debug, Default)]
+pub(crate) struct ObstacleMap {
+    chunks: HashMap<ChunkPos, ColumnTops>,
+    tiles: HashMap<LodTilePos, Box<[i16]>>,
+    changed: bool,
+    built: Option<(IVec2, f64)>,
+}
+
+/// The obstacle map, ready for the GPU.
+pub(crate) struct ObstacleImage {
+    /// `OBSTACLE_SIZE`² bytes, a row after another: how high obstacles reach
+    /// above `OBSTACLE_BASE`, widened and softened so clouds keep clear.
+    pub texels: Vec<u8>,
+    /// The cell (of `OBSTACLE_CELL` blocks) the first texel covers.
     pub origin: IVec2,
 }
 
-/// Where clouds may not go, and when the mesh needs building again.
-#[derive(Debug, Default)]
-pub(crate) struct CloudField {
-    /// Per chunk, bit `z * 8 + x` set where blocks of a 4×4-block column
-    /// reach the clouds.
-    chunks: HashMap<ChunkPos, u64>,
-    /// The same for far-away tiles, a word per row of cells.
-    tiles: HashMap<LodTilePos, Box<[u64; LOD_TILE_CELLS]>>,
-    obstacles_changed: bool,
-    built: Option<Built>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Built {
-    center: IVec2,
-    radius: i32,
-    seed: u64,
-    cover: f32,
-    drift: DVec2,
-    time: f64,
-}
-
-impl CloudField {
-    pub(crate) fn set_chunk(&mut self, pos: ChunkPos, columns: u64) {
-        let changed = if columns == 0 {
-            self.chunks.remove(&pos).is_some()
-        } else {
-            self.chunks.insert(pos, columns) != Some(columns)
+impl ObstacleMap {
+    pub(crate) fn set_chunk(&mut self, pos: ChunkPos, tops: Option<ColumnTops>) {
+        self.changed |= match tops {
+            Some(tops) => self.chunks.insert(pos, tops) != Some(tops),
+            None => self.chunks.remove(&pos).is_some(),
         };
-        self.obstacles_changed |= changed;
     }
 
-    pub(crate) fn set_tile(&mut self, pos: LodTilePos, rows: Option<[u64; LOD_TILE_CELLS]>) {
-        let changed = match rows {
-            Some(rows) if rows.iter().any(|&row| row != 0) => {
-                self.tiles.insert(pos, Box::new(rows)).as_deref() != Some(&rows)
-            }
-            _ => self.tiles.remove(&pos).is_some(),
+    pub(crate) fn set_tile(&mut self, pos: LodTilePos, tops: Option<Box<[i16]>>) {
+        self.changed |= match tops {
+            Some(tops) => self.tiles.insert(pos, tops.clone()).as_ref() != Some(&tops),
+            None => self.tiles.remove(&pos).is_some(),
         };
-        self.obstacles_changed |= changed;
     }
 
-    /// A new mesh if the camera or the wind moved a cell since the last one,
-    /// obstacles changed, or the sky did.
-    pub(crate) fn update(
-        &mut self,
-        camera: DVec3,
-        sky: &CloudSky,
-        reach: f32,
-    ) -> Option<CloudMesh> {
-        let drift = sky.drift();
-        let cell = f64::from(CLOUD_CELL);
-        let center = IVec2::new(
-            ((camera.x - drift.x) / cell).floor() as i32,
-            ((camera.z - drift.y) / cell).floor() as i32,
+    /// A new map if the camera has moved far enough, or if obstacles have
+    /// changed and the last map is old enough. `time` is in seconds.
+    pub(crate) fn update(&mut self, camera: DVec3, time: f64) -> Option<ObstacleImage> {
+        let cell = IVec2::new(
+            (camera.x / f64::from(OBSTACLE_CELL)).floor() as i32,
+            (camera.z / f64::from(OBSTACLE_CELL)).floor() as i32,
         );
-        let radius = ((reach / CLOUD_CELL as f32).ceil() as i32 + 1).min(MAX_RADIUS);
-        let stale = match self.built {
-            None => true,
-            Some(built) => {
-                built.center != center
-                    || built.radius != radius
-                    || built.seed != sky.seed
-                    || built.cover != sky.cover
-                    // Obstacles were kept clear only this far ahead.
-                    || built.drift.distance(drift) >= cell * 0.9
-                    || (self.obstacles_changed && sky.time - built.time >= OBSTACLE_UPDATES)
+        let half = OBSTACLE_SIZE as i32 / 2;
+        // Moved only once the camera nears its edge.
+        let near_edge =
+            |origin: IVec2| (cell - origin - IVec2::splat(half)).abs().max_element() > half / 2;
+        let (origin, due) = match self.built {
+            Some((built, at)) if !near_edge(built) => {
+                (built, self.changed && time - at >= OBSTACLE_UPDATES)
             }
+            _ => (
+                cell.div_euclid(IVec2::splat(OBSTACLE_STEP)) * OBSTACLE_STEP - IVec2::splat(half),
+                true,
+            ),
         };
-        if !stale {
+        if !due {
             return None;
         }
-        self.obstacles_changed = false;
-        self.built = Some(Built {
-            center,
-            radius,
-            seed: sky.seed,
-            cover: sky.cover,
-            drift,
-            time: sky.time,
-        });
-        Some(self.build(center, radius, sky, drift))
-    }
-
-    fn build(&self, center: IVec2, radius: i32, sky: &CloudSky, drift: DVec2) -> CloudMesh {
-        let size = (2 * radius + 1) as usize;
-        let origin = center - IVec2::splat(radius);
-        let mut cells = vec![false; size * size];
-        for z in 0..size {
-            for x in 0..size {
-                cells[z * size + x] = cloud_at(
-                    sky.seed,
-                    sky.cover,
-                    origin.x + x as i32,
-                    origin.y + z as i32,
-                );
-            }
-        }
-        // Clear the cells that blocks reach into, now or before the wind has
-        // carried the clouds another cell.
-        let ahead = WIND.normalize_or_zero() * f64::from(CLOUD_CELL);
-        let mut clear = |block_x: i32, block_z: i32| {
-            let start = DVec2::new(f64::from(block_x), f64::from(block_z)) - drift;
-            let end = start + f64::from(OBSTACLE_CELL);
-            let min = start.min(start - ahead);
-            let max = end.max(end - ahead);
-            let first = (min / f64::from(CLOUD_CELL)).floor().as_ivec2() - origin;
-            let last = ((max - 1e-6) / f64::from(CLOUD_CELL)).floor().as_ivec2() - origin;
-            for z in first.y.max(0)..=last.y.min(size as i32 - 1) {
-                for x in first.x.max(0)..=last.x.min(size as i32 - 1) {
-                    cells[z as usize * size + x as usize] = false;
-                }
-            }
-        };
-        for (pos, &columns) in &self.chunks {
-            for bit in Bits(columns) {
-                let (x, z) = (bit % 8, bit / 8);
-                clear(
-                    pos.0.x * CHUNK_SIZE + x as i32 * OBSTACLE_CELL,
-                    pos.0.z * CHUNK_SIZE + z as i32 * OBSTACLE_CELL,
-                );
-            }
-        }
-        for (pos, rows) in &self.tiles {
-            let (tile_x, tile_z) = pos.origin();
-            for (z, &row) in rows.iter().enumerate() {
-                for x in Bits(row) {
-                    clear(
-                        tile_x + x as i32 * OBSTACLE_CELL,
-                        tile_z + z as i32 * OBSTACLE_CELL,
-                    );
-                }
-            }
-        }
-
-        let mut mask = vec![0u8; (MASK_SIZE * MASK_SIZE) as usize];
-        for z in 0..size {
-            for x in 0..size {
-                if cells[z * size + x] {
-                    mask[z * MASK_SIZE as usize + x] = 255;
-                }
-            }
-        }
-        CloudMesh {
-            quads: mesh(&cells, size),
-            mask,
+        self.changed = false;
+        self.built = Some((origin, time));
+        Some(ObstacleImage {
+            texels: self.build(origin),
             origin,
-        }
-    }
-}
-
-/// The set bits of a word, lowest first.
-struct Bits(u64);
-
-impl Iterator for Bits {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<usize> {
-        (self.0 != 0).then(|| {
-            let bit = self.0.trailing_zeros() as usize;
-            self.0 &= self.0 - 1;
-            bit
         })
     }
-}
 
-/// Faces 2 and 3 are the top and bottom (see `ruda_core::Face`); the others
-/// the sides.
-fn pack(x: usize, z: usize, width: usize, depth: usize, face: usize) -> [u32; 4] {
-    [
-        x as u32 | (z as u32) << 10 | (face as u32) << 20,
-        (width as u32 - 1) | (depth as u32 - 1) << 10,
-        0,
-        0,
-    ]
-}
-
-/// Tops and bottoms merged into rectangles, and the walls along the edges
-/// of clouds merged into runs.
-fn mesh(cells: &[bool], size: usize) -> Vec<[u32; 4]> {
-    let at = |x: usize, z: usize| cells[z * size + x];
-    let mut quads = Vec::new();
-    let mut left = cells.to_vec();
-    for z in 0..size {
-        let mut x = 0;
-        while x < size {
-            if !left[z * size + x] {
-                x += 1;
-                continue;
+    fn build(&self, origin: IVec2) -> Vec<u8> {
+        let size = OBSTACLE_SIZE as usize;
+        let mut heights = vec![0u8; size * size];
+        let mut raise = |cell: IVec2, top: i16| {
+            let texel = cell - origin;
+            if texel.min_element() >= 0 && texel.max_element() < size as i32 {
+                let height = (i32::from(top) - OBSTACLE_BASE).clamp(0, 255) as u8;
+                let at = &mut heights[texel.y as usize * size + texel.x as usize];
+                *at = (*at).max(height);
             }
-            let mut width = 1;
-            while x + width < size && left[z * size + x + width] {
-                width += 1;
+        };
+        for (pos, tops) in &self.tiles {
+            let (x, z) = pos.origin();
+            let first = IVec2::new(x, z) / OBSTACLE_CELL;
+            for (i, &top) in tops.iter().enumerate() {
+                let offset = IVec2::new((i % LOD_TILE_CELLS) as i32, (i / LOD_TILE_CELLS) as i32);
+                raise(first + offset, top);
             }
-            let mut depth = 1;
-            while z + depth < size && (x..x + width).all(|x| left[(z + depth) * size + x]) {
-                depth += 1;
-            }
-            for row in z..z + depth {
-                left[row * size + x..row * size + x + width].fill(false);
-            }
-            quads.push(pack(x, z, width, depth, 2));
-            quads.push(pack(x, z, width, depth, 3));
-            x += width;
         }
-    }
-    // Walls facing +x, −x along z, and +z, −z along x.
-    for (face, dx, dz) in [(0, 1, 0), (1, -1, 0), (4, 0, 1), (5, 0, -1)] {
-        for line in 0..size {
-            let mut start = None;
-            for step in 0..=size {
-                let wall = step < size && {
-                    let (x, z) = if dz == 0 { (line, step) } else { (step, line) };
-                    let (nx, nz) = (x as i32 + dx, z as i32 + dz);
-                    let open = !(0..size as i32).contains(&nx)
-                        || !(0..size as i32).contains(&nz)
-                        || !at(nx as usize, nz as usize);
-                    at(x, z) && open
-                };
-                match (start, wall) {
-                    (None, true) => start = Some(step),
-                    (Some(first), false) => {
-                        let length = step - first;
-                        quads.push(if dz == 0 {
-                            pack(line, first, 1, length, face)
-                        } else {
-                            pack(first, line, length, 1, face)
-                        });
-                        start = None;
-                    }
-                    _ => {}
+        let cells = CHUNK_SIZE / OBSTACLE_CELL;
+        for (pos, tops) in &self.chunks {
+            let first = IVec2::new(pos.0.x, pos.0.z) * cells;
+            for (i, &top) in tops.0.iter().enumerate() {
+                if top != ColumnTops::NONE {
+                    raise(first + IVec2::new(i as i32 % cells, i as i32 / cells), top);
                 }
             }
         }
+        // Clouds keep clear of the sides of obstacles, then thin out
+        // towards them: the highest obstacle nearby, then smoothed.
+        let filter = |image: &mut Vec<u8>, pass: &(dyn Fn(&[u8], &mut [u8]) + Sync)| {
+            let mut out = vec![0u8; size * size];
+            out.par_chunks_mut(size)
+                .zip(image.par_chunks(size))
+                .for_each(|(out, row)| pass(row, out));
+            *image = out;
+        };
+        let widen = |row: &[u8], out: &mut [u8]| {
+            for (x, out) in out.iter_mut().enumerate() {
+                let range = x.saturating_sub(CLEARANCE)..(x + CLEARANCE + 1).min(size);
+                *out = row[range].iter().copied().max().unwrap_or(0);
+            }
+        };
+        let soften = |row: &[u8], out: &mut [u8]| {
+            for (x, out) in out.iter_mut().enumerate() {
+                let (sum, count) = (x as isize - SOFTNESS as isize..=(x + SOFTNESS) as isize)
+                    .map(|x| row[x.clamp(0, size as isize - 1) as usize])
+                    .fold((0u32, 0u32), |(sum, count), v| {
+                        (sum + u32::from(v), count + 1)
+                    });
+                *out = (sum / count) as u8;
+            }
+        };
+        filter(&mut heights, &widen);
+        heights = transpose(&heights, size);
+        filter(&mut heights, &widen);
+        // Around that, a slope down, smoothed twice so it rounds off.
+        let mut slope = heights.clone();
+        filter(&mut slope, &soften);
+        filter(&mut slope, &soften);
+        slope = transpose(&slope, size);
+        filter(&mut slope, &soften);
+        filter(&mut slope, &soften);
+        let heights = transpose(&heights, size);
+        heights.iter().zip(slope).map(|(&h, s)| h.max(s)).collect()
     }
-    quads
+}
+
+fn transpose(image: &[u8], size: usize) -> Vec<u8> {
+    let mut out = vec![0u8; size * size];
+    for (y, row) in image.chunks(size).enumerate() {
+        for (x, &value) in row.iter().enumerate() {
+            out[x * size + y] = value;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -376,60 +403,79 @@ mod tests {
 
     #[test]
     fn cover_sets_how_much_of_the_sky_is_cloud() {
-        for cover in [0.2, 0.35, 0.6] {
-            let mut clouds = 0;
-            for z in -200..200 {
-                for x in -200..200 {
-                    clouds += usize::from(cloud_at(42, cover, x, z));
-                }
-            }
-            let share = clouds as f32 / (400.0 * 400.0);
-            assert!((share - cover).abs() < 0.08, "cover {cover} gives {share}");
+        let noise = CloudNoise::new(42);
+        for cover in [0.2f32, 0.35, 0.6] {
+            let threshold = ((1.0 - cover) * 256.0) as u8;
+            let clouds = noise.patches.iter().filter(|&&v| v >= threshold).count();
+            let share = clouds as f32 / noise.patches.len() as f32;
+            assert!((share - cover).abs() < 0.01, "cover {cover} gives {share}");
         }
-        assert!(!cloud_at(42, 0.0, 3, 4) || cloud_at(42, 1.0, 3, 4));
     }
 
     #[test]
-    fn a_lone_cell_is_a_box_and_neighbours_share_their_tops() {
-        assert_eq!(mesh(&[true], 1).len(), 6);
-        // Two cells side by side: one top, one bottom, and four walls.
-        let quads = mesh(&[true, true, false, false], 2);
-        assert_eq!(quads.len(), 6);
-        assert!(
-            quads
-                .iter()
-                .any(|q| (q[0] >> 20) & 7 == 2 && q[1] & 1023 == 1)
+    fn noise_depends_only_on_the_seed() {
+        let (a, b) = (CloudNoise::new(7), CloudNoise::new(7));
+        assert_eq!(a.patches, b.patches);
+        assert_eq!(a.detail, b.detail);
+        assert_ne!(a.patches, CloudNoise::new(8).patches);
+        assert_eq!(
+            a.detail.len(),
+            (DETAIL_SIZE * DETAIL_SIZE * DETAIL_SIZE) as usize
         );
+        // Puffy: a fair spread of values.
+        let (low, high) = a
+            .detail
+            .iter()
+            .fold((255, 0), |(low, high), &v| (v.min(low), v.max(high)));
+        assert!(low < 100 && high > 180, "{low} {high}");
     }
 
     #[test]
-    fn clouds_part_around_what_reaches_them() {
-        let sky = CloudSky {
-            seed: 7,
-            cover: 1.0,
-            time: 0.0,
+    fn the_patches_repeat_seamlessly() {
+        // Opposite edges of the texture continue each other about as
+        // smoothly as neighbouring rows inside it.
+        let noise = CloudNoise::new(3);
+        let size = PATCH_SIZE as usize;
+        let row = |z: usize| &noise.patches[z * size..(z + 1) * size];
+        let step = |a: &[u8], b: &[u8]| {
+            a.iter()
+                .zip(b)
+                .map(|(&a, &b)| (i32::from(a) - i32::from(b)).abs())
+                .sum::<i32>()
         };
-        let mut field = CloudField::default();
-        let first = field.update(DVec3::ZERO, &sky, 120.0).unwrap();
-        let cell_of = |mesh: &CloudMesh, block_x: i32, block_z: i32| {
-            let cell = IVec2::new(
-                block_x.div_euclid(CLOUD_CELL),
-                block_z.div_euclid(CLOUD_CELL),
-            ) - mesh.origin;
-            mesh.mask[(cell.y as u32 * MASK_SIZE + cell.x as u32) as usize]
-        };
-        assert_eq!(cell_of(&first, 40, 40), 255);
-        // Nothing changed: no new mesh.
-        assert!(field.update(DVec3::ZERO, &sky, 120.0).is_none());
+        let inside = step(row(100), row(101));
+        let across = step(row(size - 1), row(0));
+        assert!(across < inside * 3, "{across} vs {inside}");
+    }
 
-        // A peak at blocks 40..44 of chunk (1, 3, 1), x and z.
-        field.set_chunk(ChunkPos::new(1, 3, 1), 1 << (2 * 8 + 2));
-        assert!(field.update(DVec3::ZERO, &sky, 120.0).is_none(), "too soon");
-        let later = CloudSky { time: 1.0, ..sky };
-        let parted = field.update(DVec3::ZERO, &later, 120.0).unwrap();
-        assert_eq!(cell_of(&parted, 40, 40), 0);
-        // Upwind, where the wind is about to bring clouds, is clear too.
-        assert_eq!(cell_of(&parted, 30, 40), 0);
-        assert_eq!(cell_of(&parted, 80, 80), 255);
+    #[test]
+    fn clouds_keep_clear_of_a_tower() {
+        let mut map = ObstacleMap::default();
+        // A tower to y = 250 over blocks 40..44 of chunk (1, 7, 1).
+        let mut tops = [ColumnTops::NONE; 64];
+        tops[2 * 8 + 2] = 250;
+        map.set_chunk(ChunkPos::new(1, 7, 1), Some(ColumnTops(tops)));
+        let image = map.update(DVec3::new(40.0, 120.0, 40.0), 0.0).unwrap();
+        let at = |x: i32, z: i32| {
+            let texel = IVec2::new(x, z) / OBSTACLE_CELL - image.origin;
+            image.texels[texel.y as usize * OBSTACLE_SIZE as usize + texel.x as usize]
+        };
+        let top = (250 - OBSTACLE_BASE) as u8;
+        // Over the tower and right next to it, the full height.
+        assert_eq!(at(41, 41), top);
+        assert_eq!(at(45, 41), top);
+        // Further out, lower and lower, then nothing.
+        assert!(at(53, 41) < at(45, 41) && at(53, 41) > top / 16);
+        assert!(at(61, 41) < at(53, 41));
+        assert_eq!(at(120, 41), 0);
+
+        // Nothing changed: no new map until the camera nears the edge.
+        assert!(map.update(DVec3::new(300.0, 120.0, 40.0), 10.0).is_none());
+        assert!(map.update(DVec3::new(1800.0, 120.0, 40.0), 10.0).is_some());
+        // Changes wait a moment.
+        map.set_chunk(ChunkPos::new(1, 7, 1), None);
+        assert!(map.update(DVec3::new(1800.0, 120.0, 40.0), 10.1).is_none());
+        let cleared = map.update(DVec3::new(1800.0, 120.0, 40.0), 11.0).unwrap();
+        assert!(cleared.texels.iter().all(|&v| v == 0));
     }
 }

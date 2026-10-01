@@ -11,8 +11,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, ValueEnum};
-use ruda_render::{Backdrop, GpuBackend, Renderer};
-use ruda_ui::{GpuApi, I18n, Language, Menu, MenuAction, MenuContext, Screen, Settings};
+use ruda_render::{Backdrop, CloudQuality, GpuBackend, Renderer};
+use ruda_ui::{
+    Clouds, FpsLimit, GpuApi, I18n, Language, Menu, MenuAction, MenuContext, Screen, Settings,
+};
+use ruda_ui::{Lighting, Preset};
 use tracing::{info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -77,7 +80,7 @@ struct Args {
     #[arg(long, value_name = "SECONDS", conflicts_with = "exit_after_frames")]
     benchmark: Option<f64>,
 
-    /// Don't wait for the display's refresh, whatever the settings say.
+    /// Draw as many frames as possible, whatever the settings say.
     #[arg(long)]
     no_vsync: bool,
 
@@ -88,6 +91,80 @@ struct Args {
     /// Draw no clouds, whatever the settings say.
     #[arg(long)]
     no_clouds: bool,
+
+    /// How to draw clouds, whatever the settings say.
+    #[arg(long, value_enum)]
+    clouds: Option<CloudsArg>,
+
+    /// Start from this graphics preset for this run; the saved settings
+    /// stay as they are unless changed in the menu.
+    #[arg(long, value_enum)]
+    preset: Option<PresetArg>,
+
+    /// With --benchmark, draw off-screen instead of in a window: nothing can
+    /// hide or pause it, and no display is needed.
+    #[arg(long, requires = "benchmark")]
+    headless: bool,
+
+    /// Size of the off-screen frame for --headless, as WIDTHxHEIGHT.
+    #[arg(long, default_value = "2560x1440", value_parser = parse_size)]
+    size: (u32, u32),
+}
+
+fn parse_size(text: &str) -> Result<(u32, u32), String> {
+    let (width, height) = text
+        .split_once('x')
+        .ok_or_else(|| format!("expected WIDTHxHEIGHT, got {text:?}"))?;
+    let number = |text: &str| {
+        text.parse::<u32>()
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| format!("{text:?} is not a size in pixels"))
+    };
+    Ok((number(width)?, number(height)?))
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PresetArg {
+    Standard,
+    High,
+    Ultra,
+}
+
+impl From<PresetArg> for Preset {
+    fn from(arg: PresetArg) -> Self {
+        match arg {
+            PresetArg::Standard => Preset::Standard,
+            PresetArg::High => Preset::High,
+            PresetArg::Ultra => Preset::Ultra,
+        }
+    }
+}
+
+/// The saved settings, with the preset of the command line applied.
+fn load_settings(path: Option<&Path>, args: &Args) -> Settings {
+    let mut settings: Settings = path.map(settings::load).unwrap_or_default();
+    if let Some(preset) = args.preset {
+        Preset::from(preset).apply(&mut settings.graphics);
+    }
+    settings
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CloudsArg {
+    Off,
+    Standard,
+    Volumetric,
+}
+
+impl From<CloudsArg> for Clouds {
+    fn from(arg: CloudsArg) -> Self {
+        match arg {
+            CloudsArg::Off => Clouds::Off,
+            CloudsArg::Standard => Clouds::Standard,
+            CloudsArg::Volumetric => Clouds::Volumetric,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -126,6 +203,9 @@ fn main() -> Result<()> {
     init_tracing();
     info!(version = env!("CARGO_PKG_VERSION"), "starting ruda");
 
+    if args.headless {
+        return run_headless(&args);
+    }
     let event_loop = EventLoop::new().context("failed to create the event loop")?;
     let mut app = App::new(args, event_loop.owned_display_handle());
     event_loop.run_app(&mut app).context("event loop failed")?;
@@ -235,10 +315,7 @@ struct App {
 impl App {
     fn new(args: Args, display: OwnedDisplayHandle) -> Self {
         let settings_path = settings::path();
-        let settings = settings_path
-            .as_deref()
-            .map(settings::load)
-            .unwrap_or_default();
+        let settings = load_settings(settings_path.as_deref(), &args);
         let system_language = sys_locale::get_locale()
             .map_or(Language::English, |locale| Language::from_locale(&locale));
         Self {
@@ -307,10 +384,10 @@ impl App {
                 renderer => renderer?,
             },
         };
-        if !graphics.vsync || self.args.no_vsync {
-            renderer.set_vsync(false);
-        }
+        renderer.set_vsync(self.vsync());
         renderer.set_shadows(graphics.shadows || self.args.shadows);
+        renderer.set_cloud_quality(cloud_quality(self.clouds()));
+        renderer.set_lighting(lighting(graphics.lighting));
 
         self.interface = Some(Interface::new(&window, renderer.max_texture_side()));
         window.request_redraw();
@@ -324,7 +401,29 @@ impl App {
         Ok(())
     }
 
+    /// Whether frames wait for the display's refresh.
+    fn vsync(&self) -> bool {
+        self.settings.graphics.fps_limit == FpsLimit::Display && !self.args.no_vsync
+    }
+
+    /// The least time from one frame to the next, if frames are limited to
+    /// a number a second.
+    fn frame_interval(&self) -> Option<Duration> {
+        if self.args.no_vsync {
+            return None;
+        }
+        let fps = self.settings.graphics.fps_limit.fps()?;
+        Some(Duration::from_secs_f64(1.0 / f64::from(fps)))
+    }
+
+    /// How clouds are drawn: as the settings say, unless the command line
+    /// says otherwise.
+    fn clouds(&self) -> Clouds {
+        clouds(&self.args, self.settings.graphics.clouds)
+    }
+
     fn start_game(&mut self) -> Result<()> {
+        let clouds = self.clouds();
         let Some(renderer) = &mut self.renderer else {
             return Ok(());
         };
@@ -336,7 +435,7 @@ impl App {
             camera: self.args.camera,
             time: self.args.time,
             lod_distance: self.args.lod_distance.unwrap_or(graphics.lod_distance),
-            clouds: graphics.clouds && !self.args.no_clouds,
+            clouds: clouds != Clouds::Off,
         };
         self.game = Some(Game::start(config, renderer)?);
         self.resume();
@@ -394,10 +493,11 @@ impl App {
             return;
         }
         let (new, old) = (&self.settings.graphics, &self.applied.graphics);
-        if new.vsync != old.vsync
+        let vsync = self.vsync();
+        if new.fps_limit != old.fps_limit
             && let Some(renderer) = &mut self.renderer
         {
-            renderer.set_vsync(new.vsync);
+            renderer.set_vsync(vsync);
         }
         if new.fullscreen != old.fullscreen
             && let Some(window) = &self.window
@@ -408,6 +508,17 @@ impl App {
             && let Some(renderer) = &mut self.renderer
         {
             renderer.set_shadows(new.shadows);
+        }
+        let clouds = self.clouds();
+        if new.clouds != old.clouds
+            && let Some(renderer) = &mut self.renderer
+        {
+            renderer.set_cloud_quality(cloud_quality(clouds));
+        }
+        if new.lighting != old.lighting
+            && let Some(renderer) = &mut self.renderer
+        {
+            renderer.set_lighting(lighting(new.lighting));
         }
         if let Some(game) = &mut self.game {
             if new.view_distance != old.view_distance {
@@ -420,7 +531,7 @@ impl App {
                 game.set_lod_distance(new.lod_distance);
             }
             if new.clouds != old.clouds {
-                game.set_clouds(new.clouds);
+                game.set_clouds(clouds != Clouds::Off);
             }
         }
         self.i18n
@@ -503,8 +614,9 @@ impl App {
             #[cfg(feature = "tracy")]
             tracing_tracy::client::frame_mark();
             let busy = now.elapsed().saturating_sub(renderer.surface_wait());
+            let gpu = renderer.take_gpu_times();
             if let (Some(benchmark), Some(game)) = (&mut self.benchmark, &self.game)
-                && let Some(report) = benchmark.frame(now, busy, game.is_loaded())
+                && let Some(report) = benchmark.frame(now, busy, game.is_loaded(), gpu)
             {
                 let stats = renderer.stats();
                 info!("benchmark: {report}; {stats}");
@@ -561,7 +673,13 @@ impl App {
             // screen is locked: try again a little later instead of spinning.
             self.repaint_at = Some(now + Duration::from_millis(16));
         } else if repaint_after.is_zero() {
-            window.request_redraw();
+            // With a limit, the next frame waits for its turn.
+            match self.frame_interval() {
+                Some(interval) if now + interval > Instant::now() => {
+                    self.repaint_at = Some(now + interval);
+                }
+                _ => window.request_redraw(),
+            }
         } else {
             self.repaint_at = now.checked_add(repaint_after);
         }
@@ -730,6 +848,77 @@ fn random_seed() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |time| time.as_nanos() as u64)
+}
+
+/// How clouds are drawn: as `saved` in the settings, unless the command line
+/// says otherwise.
+fn clouds(args: &Args, saved: Clouds) -> Clouds {
+    if args.no_clouds {
+        Clouds::Off
+    } else {
+        args.clouds.map_or(saved, Clouds::from)
+    }
+}
+
+/// `--benchmark --headless`: the game without a window, each frame drawn
+/// off-screen and waited for, then the results printed.
+fn run_headless(args: &Args) -> Result<()> {
+    let settings = load_settings(settings::path().as_deref(), args);
+    let graphics = &settings.graphics;
+    let (width, height) = args.size;
+    let mut renderer = pollster::block_on(Renderer::headless(width, height))?;
+    info!(adapter = %renderer.adapter_summary(), width, height, "drawing off-screen");
+    renderer.set_shadows(graphics.shadows || args.shadows);
+    let clouds = clouds(args, graphics.clouds);
+    renderer.set_cloud_quality(cloud_quality(clouds));
+    renderer.set_lighting(lighting(graphics.lighting));
+    let config = GameConfig {
+        seed: args.seed.unwrap_or_else(random_seed),
+        view_distance: args.view_distance.unwrap_or(graphics.view_distance),
+        fov: f32::from(graphics.fov),
+        camera: args.camera,
+        time: args.time,
+        lod_distance: args.lod_distance.unwrap_or(graphics.lod_distance),
+        clouds: clouds != Clouds::Off,
+    };
+    let mut game = Game::start(config, &mut renderer)?;
+    let seconds = args.benchmark.context("--headless needs --benchmark")?;
+    let mut benchmark = Benchmark::new(Duration::from_secs_f64(seconds));
+    let mut last = Instant::now();
+    loop {
+        let now = Instant::now();
+        game.update((now - last).as_secs_f64(), false, &mut renderer)?;
+        last = now;
+        let scene = game.scene();
+        renderer.render_offscreen(Backdrop::World(&scene))?;
+        let gpu = renderer.take_gpu_times();
+        if let Some(report) = benchmark.frame(now, now.elapsed(), game.is_loaded(), gpu) {
+            println!("{report}\n{}", renderer.stats());
+            if let Some(path) = &args.screenshot {
+                let (width, height, pixels) = renderer.capture(Backdrop::World(&scene), None)?;
+                save_png(path, width, height, &pixels)?;
+            }
+            break;
+        }
+    }
+    game.shutdown();
+    Ok(())
+}
+
+/// How the renderer lights the world.
+fn lighting(lighting: Lighting) -> ruda_render::Lighting {
+    match lighting {
+        Lighting::Classic => ruda_render::Lighting::Classic,
+        Lighting::Atmospheric => ruda_render::Lighting::Atmospheric,
+    }
+}
+
+/// How the renderer draws clouds that are on.
+fn cloud_quality(clouds: Clouds) -> CloudQuality {
+    match clouds {
+        Clouds::Standard => CloudQuality::Blocky,
+        Clouds::Off | Clouds::Volumetric => CloudQuality::Volumetric,
+    }
 }
 
 #[cfg(test)]

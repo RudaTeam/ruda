@@ -67,10 +67,11 @@ const ORE_FREQUENCY: f64 = 1.0 / 4.0;
 /// height.
 const RANGE_START: f64 = 0.15;
 const RANGE_FULL: f64 = 0.6;
-/// Height of the highest crests above the land around them.
-const MOUNTAIN_HEIGHT: f64 = 92.0;
+/// Height of the highest crests above the land around them: the tallest
+/// peaks rise through the clouds, up to near the top of the world.
+const MOUNTAIN_HEIGHT: f64 = 215.0;
 /// Above about this height mountains are bare rock.
-const ROCK_LINE: i32 = 80;
+const ROCK_LINE: i32 = 150;
 
 /// Where rock starts in a column: a few blocks up or down, so its edge
 /// isn't drawn with a ruler.
@@ -92,9 +93,11 @@ impl TerrainGenerator {
             hills: Fbm::new(seeds.next())
                 .set_octaves(4)
                 .set_frequency(1.0 / 140.0),
+            // Wide enough that mountains this tall still have slopes, not
+            // walls.
             ridges: Fbm::new(seeds.next())
                 .set_octaves(3)
-                .set_frequency(1.0 / 320.0),
+                .set_frequency(1.0 / 560.0),
             caves: Fbm::new(seeds.next())
                 .set_octaves(2)
                 .set_frequency(1.0 / 56.0),

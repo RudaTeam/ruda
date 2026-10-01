@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow};
 use glam::{DVec3, IVec3, Vec3};
 use ruda_client::{Client, Event};
-use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ChunkPos, ContentBuilder, Light, WorldBounds};
+use ruda_core::{
+    BlockId, BlockPos, CHUNK_SIZE, ChunkPos, ContentBuilder, Light, WindMap, WorldBounds,
+};
 use ruda_input::{Action, Input};
 use ruda_protocol::{DAY_LENGTH, REACH, TICK_RATE};
 use ruda_render::{
@@ -107,6 +109,8 @@ pub struct Game {
     /// Far-away tiles that arrived and still need geometry, oldest first.
     lod_waiting: VecDeque<LodTilePos>,
     clouds: bool,
+    /// Until weather decides it, a steady breeze.
+    wind: WindMap,
     joined: bool,
     start: Option<CameraStart>,
     /// When chunks last arrived, left or got new geometry.
@@ -158,6 +162,7 @@ impl Game {
             lod_distance: f32::from(config.lod_distance),
             lod_waiting: VecDeque::new(),
             clouds: config.clouds,
+            wind: WindMap::BREEZE,
             input: Input::default(),
             camera,
             hotbar,
@@ -208,7 +213,7 @@ impl Game {
                 Event::ChunkUnloaded(pos) => {
                     self.mesher.forget(pos);
                     renderer.remove_chunk(pos);
-                    renderer.set_cloud_obstacles(pos, 0);
+                    renderer.set_cloud_obstacles(pos, None);
                 }
                 Event::BlockChanged(pos) => {
                     reaching.push(pos.chunk());
@@ -299,7 +304,7 @@ impl Game {
             };
             if let Some(tile) = self.client.lod(pos) {
                 renderer.upload_lod(pos, &mesh_lod(tile, &self.faces));
-                renderer.set_far_cloud_obstacles(pos, Some(far_cloud_obstacles(tile)));
+                renderer.set_far_cloud_obstacles(pos, far_cloud_obstacles(tile));
                 self.last_change = Instant::now();
             }
         }
@@ -359,8 +364,8 @@ impl Game {
     fn update_cloud_obstacles(&self, pos: ChunkPos, renderer: &mut Renderer) {
         if let Some(chunk) = self.client.world().chunk(pos) {
             let blocks = self.client.content().blocks();
-            let columns = cloud_obstacles(pos, chunk, |block| blocks.is_solid(block));
-            renderer.set_cloud_obstacles(pos, columns);
+            let tops = cloud_obstacles(pos, chunk, |block| blocks.is_solid(block));
+            renderer.set_cloud_obstacles(pos, tops);
         }
     }
 
@@ -392,7 +397,9 @@ impl Game {
             clouds: self.clouds.then(|| CloudSky {
                 seed: self.client.sky_seed(),
                 cover: CLOUD_COVER,
-                time: self.client.time().unwrap_or(0.0) / f64::from(TICK_RATE),
+                drift: self
+                    .wind
+                    .drift(self.client.time().unwrap_or(0.0) / f64::from(TICK_RATE)),
             }),
         }
     }

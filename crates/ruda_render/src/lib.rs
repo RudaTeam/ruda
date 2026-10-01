@@ -4,9 +4,11 @@
 //! [`Renderer`], the [`Camera`] and the meshing helpers.
 
 mod arena;
+mod atmosphere;
 mod camera;
 mod clouds;
 mod culling;
+mod gpu_timer;
 mod lod;
 mod mesh;
 mod mesher;
@@ -26,8 +28,7 @@ use wgpu::rwh::{HasDisplayHandle, HasWindowHandle};
 
 pub use camera::{Camera, Frustum};
 pub use clouds::{
-    CLOUD_BOTTOM, CLOUD_CELL, CLOUD_THICKNESS, CloudSky, WIND, cloud_at, cloud_obstacles,
-    far_cloud_obstacles,
+    CLOUD_BOTTOM, CLOUD_TOP, CloudSky, ColumnTops, cloud_obstacles, far_cloud_obstacles,
 };
 pub use lod::{LodMesh, LodQuad, mesh_lod};
 pub use mesh::{BlockFaces, ChunkMesh, ModelVertex, PaddedChunk, Quad, mesh_chunk};
@@ -35,7 +36,9 @@ pub use mesher::ChunkMesher;
 pub use textures::BlockTextures;
 pub use visibility::Visibility;
 
+use gpu_timer::GpuTimer;
 use world_pass::WorldPass;
+pub use world_pass::{CloudQuality, Lighting};
 
 /// What fills the screen behind the interface.
 #[derive(Clone, Copy, Debug)]
@@ -154,6 +157,10 @@ pub struct Renderer {
     /// egui blends in gamma space, so where the GPU allows it the interface
     /// draws through a non-sRGB view of the frame.
     ui_format: wgpu::TextureFormat,
+    /// Measures the GPU's time per pass, where it can.
+    timer: Option<GpuTimer>,
+    /// What [`Renderer::render_offscreen`] draws into.
+    offscreen: Option<wgpu::Texture>,
 }
 
 impl Renderer {
@@ -221,6 +228,8 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ruda"),
                 required_limits,
+                // For measuring passes, where the GPU can.
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 ..Default::default()
             })
             .await
@@ -260,6 +269,8 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ruda"),
                 required_limits,
+                // For measuring passes, where the GPU can.
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 ..Default::default()
             })
             .await
@@ -315,7 +326,23 @@ impl Renderer {
             "GPU ready"
         );
 
-        let world = WorldPass::new(&device, &queue, config.format, width, height);
+        // Volumetric clouds draw into floating-point textures.
+        let renders = |format| {
+            adapter
+                .get_texture_format_features(format)
+                .allowed_usages
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        };
+        let volumetric_clouds =
+            renders(wgpu::TextureFormat::Rgba16Float) && renders(wgpu::TextureFormat::R32Float);
+        let timer = GpuTimer::new(&device, &queue);
+        let world = WorldPass::new(
+            &device,
+            &queue,
+            config.format,
+            (width, height),
+            volumetric_clouds,
+        );
         let ui = egui_wgpu::Renderer::new(
             &device,
             ui_format,
@@ -336,6 +363,8 @@ impl Renderer {
             surface_wait: std::time::Duration::ZERO,
             ui,
             ui_format,
+            timer,
+            offscreen: None,
         }
     }
 
@@ -391,20 +420,36 @@ impl Renderer {
         self.world.remove_lod(pos);
     }
 
-    /// Where the blocks of a chunk reach up into the clouds, which part
-    /// around them; see [`cloud_obstacles`].
-    pub fn set_cloud_obstacles(&mut self, chunk: ChunkPos, columns: u64) {
-        self.world.set_cloud_obstacles(chunk, columns);
+    /// Where the blocks of a chunk reach up towards the clouds, which part
+    /// around them; see [`cloud_obstacles`]. `None` once the chunk is gone
+    /// or reaches nowhere near them.
+    pub fn set_cloud_obstacles(&mut self, chunk: ChunkPos, tops: Option<ColumnTops>) {
+        self.world.set_cloud_obstacles(chunk, tops);
     }
 
-    /// The same for far-away terrain, see [`far_cloud_obstacles`]; `None`
-    /// once the tile is gone.
+    /// The same for far-away terrain, see [`far_cloud_obstacles`].
     pub fn set_far_cloud_obstacles(
         &mut self,
         tile: ruda_world::lod::LodTilePos,
-        rows: Option<[u64; ruda_world::lod::LOD_TILE_CELLS]>,
+        tops: Option<Box<[i16]>>,
     ) {
-        self.world.set_far_cloud_obstacles(tile, rows);
+        self.world.set_far_cloud_obstacles(tile, tops);
+    }
+
+    /// How the world is lit.
+    pub fn set_lighting(&mut self, lighting: Lighting) {
+        self.world.set_lighting(lighting);
+    }
+
+    /// How clouds are drawn. Volumetric clouds need a graphics card that
+    /// can draw into floating-point textures; without one, they are drawn
+    /// blocky. Returns what was chosen.
+    pub fn set_cloud_quality(&mut self, quality: CloudQuality) -> CloudQuality {
+        let chosen = self.world.set_cloud_quality(quality);
+        if chosen != quality {
+            warn!("volumetric clouds need floating-point render targets; drawing blocky clouds");
+        }
+        chosen
     }
 
     /// Forgets every chunk, for leaving a world.
@@ -449,6 +494,60 @@ impl Renderer {
 
     /// Draws a frame into an off-screen image instead of the window and
     /// returns its width, height and RGBA pixels.
+    /// Draws a frame as [`Renderer::render`] would, but into a texture of
+    /// the renderer's size, and waits for the GPU to finish it: a frame
+    /// without a window, for benchmarks.
+    pub fn render_offscreen(&mut self, backdrop: Backdrop<'_>) -> Result<()> {
+        let (width, height) = (self.config.width.max(1), self.config.height.max(1));
+        let fits = self
+            .offscreen
+            .as_ref()
+            .is_some_and(|texture| (texture.width(), texture.height()) == (width, height));
+        if !fits {
+            self.offscreen = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("off-screen frame"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[self.ui_format],
+            }));
+        }
+        let texture = self.offscreen.clone().expect("just made");
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("off-screen frame"),
+            });
+        if let Some(timer) = &mut self.timer {
+            timer.collect(&self.device);
+            timer.begin_frame();
+        }
+        let ui_commands = self.encode(&mut encoder, &texture, (width, height), backdrop, None);
+        if let Some(timer) = &mut self.timer {
+            timer.end_frame(&mut encoder);
+        }
+        let submitted = self
+            .queue
+            .submit(ui_commands.into_iter().chain([encoder.finish()]));
+        if let Some(timer) = &mut self.timer {
+            timer.after_submit();
+        }
+        // As a window waits for its next image, so the GPU never falls more
+        // than a frame behind.
+        self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submitted),
+            timeout: None,
+        })?;
+        Ok(())
+    }
+
     pub fn capture(
         &mut self,
         backdrop: Backdrop<'_>,
@@ -602,9 +701,19 @@ impl Renderer {
                 label: Some("frame"),
             });
         let size = (self.config.width, self.config.height);
+        if let Some(timer) = &mut self.timer {
+            timer.collect(&self.device);
+            timer.begin_frame();
+        }
         let ui_commands = self.encode(&mut encoder, &frame.texture, size, backdrop, ui);
+        if let Some(timer) = &mut self.timer {
+            timer.end_frame(&mut encoder);
+        }
         self.queue
             .submit(ui_commands.into_iter().chain([encoder.finish()]));
+        if let Some(timer) = &mut self.timer {
+            timer.after_submit();
+        }
 
         pre_present();
         self.queue.present(frame);
@@ -612,6 +721,13 @@ impl Renderer {
             self.configure_surface();
         }
         Ok(true)
+    }
+
+    /// How long the GPU spent on each kind of pass, in milliseconds, for the
+    /// frames measured since last asked; empty where the graphics card
+    /// can't say.
+    pub fn take_gpu_times(&mut self) -> Vec<Vec<(&'static str, f64)>> {
+        self.timer.as_mut().map(GpuTimer::take).unwrap_or_default()
     }
 
     /// Turns waiting for the display's refresh on or off.
@@ -644,6 +760,7 @@ impl Renderer {
                 view,
                 scene,
                 (width, height),
+                &mut self.timer,
             ),
             Backdrop::Color(rgb) => {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -691,6 +808,10 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
+                timestamp_writes: self
+                    .timer
+                    .as_mut()
+                    .and_then(|timer| timer.pass("interface")),
                 ..Default::default()
             })
             .forget_lifetime();

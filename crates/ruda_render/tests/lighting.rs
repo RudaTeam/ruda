@@ -9,7 +9,7 @@ use ruda_core::{
     Appearance, BlockDef, BlockPos, ChunkPos, ContentBuilder, CubeTextures, Light, ResourceId,
     WorldBounds,
 };
-use ruda_render::{Backdrop, Camera, PaddedChunk, Renderer, Scene, mesh_chunk};
+use ruda_render::{Backdrop, Camera, Lighting, PaddedChunk, Renderer, Scene, mesh_chunk};
 use ruda_world::light::LightEngine;
 use ruda_world::{Chunk, World};
 
@@ -103,33 +103,43 @@ fn coloured_lamps_light_their_side_of_a_room() {
         lod_distance: 0.0,
         clouds: None,
     };
-    let (width, height, pixels) = renderer.capture(Backdrop::World(&scene), None).unwrap();
-    if let Some(dir) = std::env::var_os("RUDA_TEST_IMAGES") {
-        save(
-            &std::path::Path::new(&dir).join("lighting.png"),
-            width,
-            height,
-            &pixels,
-        );
-    }
+    for lighting in [Lighting::Atmospheric, Lighting::Classic] {
+        renderer.set_lighting(lighting);
+        let (width, height, pixels) = renderer.capture(Backdrop::World(&scene), None).unwrap();
+        if let Some(dir) = std::env::var_os("RUDA_TEST_IMAGES") {
+            save(
+                &std::path::Path::new(&dir)
+                    .join(format!("lighting-{lighting:?}.png").to_lowercase()),
+                width,
+                height,
+                &pixels,
+            );
+        }
 
-    // Average colour of a band of columns.
-    let band = |from: u32, to: u32| {
-        let mut sum = [0u64; 3];
-        for y in 0..height {
-            for x in from..to {
-                let at = ((y * width + x) * 4) as usize;
-                for (sum, &value) in sum.iter_mut().zip(&pixels[at..at + 3]) {
-                    *sum += u64::from(value);
+        // Average colour of a band of columns.
+        let band = |from: u32, to: u32| {
+            let mut sum = [0u64; 3];
+            for y in 0..height {
+                for x in from..to {
+                    let at = ((y * width + x) * 4) as usize;
+                    for (sum, &value) in sum.iter_mut().zip(&pixels[at..at + 3]) {
+                        *sum += u64::from(value);
+                    }
                 }
             }
-        }
-        sum
-    };
-    let left = band(0, width / 4);
-    let right = band(width * 3 / 4, width);
-    assert!(left[0] > left[2] * 2, "the left side is red: {left:?}");
-    assert!(right[2] > right[0] * 2, "the right side is blue: {right:?}");
+            sum
+        };
+        let left = band(0, width / 4);
+        let right = band(width * 3 / 4, width);
+        assert!(
+            left[0] > left[2] * 2,
+            "{lighting:?}: the left side is red: {left:?}"
+        );
+        assert!(
+            right[2] > right[0] * 2,
+            "{lighting:?}: the right side is blue: {right:?}"
+        );
+    }
 }
 
 fn save(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) {

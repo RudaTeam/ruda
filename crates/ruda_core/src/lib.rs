@@ -11,6 +11,7 @@ mod face;
 mod id;
 mod light;
 mod pos;
+mod wind;
 
 pub use block::{Appearance, BlockDef, BlockId, BlockRegistry, CubeTextures, Mount};
 pub use bounds::WorldBounds;
@@ -19,3 +20,4 @@ pub use face::Face;
 pub use id::{InvalidId, ResourceId};
 pub use light::Light;
 pub use pos::{BlockPos, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos};
+pub use wind::WindMap;

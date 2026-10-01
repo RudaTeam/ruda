@@ -24,6 +24,8 @@ enum State {
         last: Instant,
         frames: Vec<Duration>,
         busy: Vec<Duration>,
+        /// Per frame the GPU measured: milliseconds per kind of pass.
+        gpu: Vec<Vec<(&'static str, f64)>>,
     },
     Done,
 }
@@ -40,9 +42,16 @@ impl Benchmark {
 
     /// Call after every frame that reached the screen. `busy` is the time the
     /// frame took without waiting for the display, `loaded` says whether the
-    /// world around the player is complete. Returns the results once the
-    /// measurement is over.
-    pub fn frame(&mut self, now: Instant, busy: Duration, loaded: bool) -> Option<Report> {
+    /// world around the player is complete, `gpu` is the GPU's time per kind
+    /// of pass for frames measured since the last call. Returns the results
+    /// once the measurement is over.
+    pub fn frame(
+        &mut self,
+        now: Instant,
+        busy: Duration,
+        loaded: bool,
+        gpu: Vec<Vec<(&'static str, f64)>>,
+    ) -> Option<Report> {
         match &mut self.state {
             State::Loading { since } => {
                 let timed_out = now - *since > LOAD_TIMEOUT;
@@ -54,6 +63,7 @@ impl Benchmark {
                         last: now,
                         frames: Vec::new(),
                         busy: Vec::new(),
+                        gpu: Vec::new(),
                     };
                 }
                 None
@@ -62,14 +72,20 @@ impl Benchmark {
                 last,
                 frames,
                 busy: busy_times,
+                gpu: gpu_times,
             } => {
                 frames.push(now - *last);
                 busy_times.push(busy);
+                gpu_times.extend(gpu);
                 *last = now;
                 if frames.iter().sum::<Duration>() < self.duration {
                     return None;
                 }
-                let report = Report::new(std::mem::take(frames), std::mem::take(busy_times));
+                let report = Report::new(
+                    std::mem::take(frames),
+                    std::mem::take(busy_times),
+                    std::mem::take(gpu_times),
+                );
                 self.state = State::Done;
                 Some(report)
             }
@@ -87,6 +103,9 @@ pub struct Report {
     pub frame_time: Percentiles,
     /// Time a frame kept the CPU busy, without waiting for the display.
     pub busy: Percentiles,
+    /// The GPU's time per kind of pass and for the whole frame, where it
+    /// can be measured.
+    pub gpu: Vec<(&'static str, Percentiles)>,
 }
 
 /// Milliseconds.
@@ -126,13 +145,41 @@ impl fmt::Display for Percentiles {
 }
 
 impl Report {
-    fn new(frames: Vec<Duration>, busy: Vec<Duration>) -> Self {
+    fn new(frames: Vec<Duration>, busy: Vec<Duration>, gpu: Vec<Vec<(&'static str, f64)>>) -> Self {
         let total: Duration = frames.iter().sum();
+        let ms = |ms: f64| Duration::from_secs_f64(ms / 1000.0);
+        let mut kinds: Vec<&'static str> = Vec::new();
+        for frame in &gpu {
+            for &(kind, _) in frame {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+        }
+        let mut gpu_times: Vec<(&'static str, Percentiles)> = kinds
+            .into_iter()
+            .map(|kind| {
+                let times = gpu
+                    .iter()
+                    .filter_map(|frame| frame.iter().find(|(k, _)| *k == kind))
+                    .map(|&(_, time)| ms(time))
+                    .collect();
+                (kind, Percentiles::new(times))
+            })
+            .collect();
+        if !gpu.is_empty() {
+            let frames = gpu
+                .iter()
+                .map(|frame| ms(frame.iter().map(|&(_, time)| time).sum()))
+                .collect();
+            gpu_times.push(("whole frame", Percentiles::new(frames)));
+        }
         Self {
             frames: frames.len(),
             fps: frames.len() as f64 / total.as_secs_f64(),
             frame_time: Percentiles::new(frames),
             busy: Percentiles::new(busy),
+            gpu: gpu_times,
         }
     }
 }
@@ -143,7 +190,11 @@ impl fmt::Display for Report {
             f,
             "{} frames, {:.1} FPS\nframe time: {}\nbusy:       {}",
             self.frames, self.fps, self.frame_time, self.busy
-        )
+        )?;
+        for (kind, times) in &self.gpu {
+            write!(f, "\ngpu, {kind}: {times}")?;
+        }
+        Ok(())
     }
 }
 
@@ -156,14 +207,15 @@ mod tests {
         let mut benchmark = Benchmark::new(Duration::from_millis(100));
         let start = Instant::now();
         let busy = Duration::from_millis(1);
-        assert!(benchmark.frame(start, busy, false).is_none());
-        assert!(benchmark.frame(start, busy, true).is_none());
+        assert!(benchmark.frame(start, busy, false, Vec::new()).is_none());
+        assert!(benchmark.frame(start, busy, true, Vec::new()).is_none());
         let mut now = start;
         let mut report = None;
         for frame in 0..100 {
             // Every tenth frame is slow.
             now += Duration::from_millis(if frame % 10 == 9 { 20 } else { 10 });
-            if let Some(done) = benchmark.frame(now, busy, true) {
+            let gpu = vec![vec![("world", 2.0), ("shadows", 1.0)]];
+            if let Some(done) = benchmark.frame(now, busy, true, gpu) {
                 report = Some(done);
                 break;
             }
@@ -173,5 +225,8 @@ mod tests {
         assert_eq!(report.frame_time.p50, 10.0);
         assert_eq!(report.frame_time.max, 20.0);
         assert_eq!(report.busy.max, 1.0);
+        let gpu = |kind| report.gpu.iter().find(|(k, _)| *k == kind).unwrap().1;
+        assert_eq!(gpu("world").p50, 2.0);
+        assert_eq!(gpu("whole frame").p50, 3.0);
     }
 }

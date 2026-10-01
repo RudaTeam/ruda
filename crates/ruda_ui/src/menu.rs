@@ -1,6 +1,9 @@
 use egui::{Align2, Color32, ComboBox, RichText, Slider, TextureHandle, Ui, Vec2};
 
-use crate::settings::{FIELDS_OF_VIEW, GpuApi, LOD_DISTANCES, Settings, VIEW_DISTANCES};
+use crate::settings::{
+    Clouds, FIELDS_OF_VIEW, FpsLimit, GpuApi, LOD_DISTANCES, Lighting, Preset, Settings,
+    VIEW_DISTANCES,
+};
 use crate::{I18n, Language};
 
 const BUTTON_SIZE: Vec2 = Vec2::new(340.0, 48.0);
@@ -178,6 +181,53 @@ impl Menu {
                             .num_columns(2)
                             .spacing([24.0, 14.0])
                             .show(ui, |ui| {
+                                ui.label(t("settings-preset"));
+                                let preset_name = |preset: Option<Preset>| {
+                                    t(match preset {
+                                        Some(Preset::Standard) => "settings-preset-standard",
+                                        Some(Preset::High) => "settings-preset-high",
+                                        Some(Preset::Ultra) => "settings-preset-ultra",
+                                        None => "settings-preset-custom",
+                                    })
+                                };
+                                let current = Preset::of(graphics);
+                                ComboBox::from_id_salt("preset")
+                                    .selected_text(preset_name(current))
+                                    .width(COMBO_WIDTH)
+                                    .show_ui(ui, |ui| {
+                                        for preset in Preset::ALL {
+                                            let chosen = ui.selectable_label(
+                                                current == Some(preset),
+                                                preset_name(Some(preset)),
+                                            );
+                                            if chosen.clicked() {
+                                                preset.apply(graphics);
+                                            }
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label(t("settings-lighting"));
+                                let lighting_name = |lighting: Lighting| {
+                                    t(match lighting {
+                                        Lighting::Classic => "settings-lighting-classic",
+                                        Lighting::Atmospheric => "settings-lighting-atmospheric",
+                                    })
+                                };
+                                ComboBox::from_id_salt("lighting")
+                                    .selected_text(lighting_name(graphics.lighting))
+                                    .width(COMBO_WIDTH)
+                                    .show_ui(ui, |ui| {
+                                        for lighting in Lighting::ALL {
+                                            ui.selectable_value(
+                                                &mut graphics.lighting,
+                                                lighting,
+                                                lighting_name(lighting),
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+
                                 ui.label(t("settings-view-distance"));
                                 ui.horizontal(|ui| {
                                     ui.add(
@@ -208,8 +258,29 @@ impl Menu {
                                 });
                                 ui.end_row();
 
-                                ui.label(t("settings-vsync"));
-                                ui.checkbox(&mut graphics.vsync, "");
+                                ui.label(t("settings-fps-limit"));
+                                let limit_name = |limit: FpsLimit| match limit.fps() {
+                                    Some(fps) => i18n.get_with(
+                                        "settings-fps-limit-value",
+                                        &[("fps", i64::from(fps))],
+                                    ),
+                                    None if limit == FpsLimit::Display => {
+                                        t("settings-fps-limit-display")
+                                    }
+                                    None => t("settings-fps-limit-off"),
+                                };
+                                ComboBox::from_id_salt("fps limit")
+                                    .selected_text(limit_name(graphics.fps_limit))
+                                    .width(COMBO_WIDTH)
+                                    .show_ui(ui, |ui| {
+                                        for limit in FpsLimit::ALL {
+                                            ui.selectable_value(
+                                                &mut graphics.fps_limit,
+                                                limit,
+                                                limit_name(limit),
+                                            );
+                                        }
+                                    });
                                 ui.end_row();
 
                                 ui.label(t("settings-fullscreen"));
@@ -217,7 +288,27 @@ impl Menu {
                                 ui.end_row();
 
                                 ui.label(t("settings-clouds"));
-                                ui.checkbox(&mut graphics.clouds, "");
+                                let clouds_name = |clouds: Clouds| {
+                                    t(match clouds {
+                                        Clouds::Off => "settings-clouds-off",
+                                        Clouds::Standard => "settings-clouds-standard",
+                                        Clouds::Volumetric => "settings-clouds-volumetric",
+                                    })
+                                };
+                                ComboBox::from_id_salt("clouds")
+                                    .selected_text(clouds_name(graphics.clouds))
+                                    .width(COMBO_WIDTH)
+                                    .show_ui(ui, |ui| {
+                                        for clouds in Clouds::ALL {
+                                            ui.selectable_value(
+                                                &mut graphics.clouds,
+                                                clouds,
+                                                clouds_name(clouds),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(t("settings-clouds-note"));
                                 ui.end_row();
 
                                 ui.label(t("settings-shadows"));

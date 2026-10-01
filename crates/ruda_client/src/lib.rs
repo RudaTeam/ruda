@@ -39,6 +39,46 @@ pub enum Event {
     },
 }
 
+/// The world's time: the server's last word on it, counted on by the
+/// client's own clock.
+///
+/// The two clocks drift a little apart, so the server's time and the
+/// client's count differ by a fraction of a tick at each update. Instead of
+/// jumping to the server's time, which shakes everything that moves with it
+/// (the sun, its shadows, the clouds), the count eases over to it.
+#[derive(Clone, Copy, Debug)]
+struct Clock {
+    ticks: u64,
+    at: Instant,
+    /// How far ahead of `ticks` the count was when they arrived; this fades
+    /// out over [`Clock::EASE`].
+    ahead: f64,
+}
+
+impl Clock {
+    const EASE: f64 = 1.0;
+    /// Larger differences, like the time being set, are jumped to.
+    const MOST_EASED: f64 = 0.5 * TICK_RATE as f64;
+
+    fn new(previous: Option<Self>, ticks: u64, now: Instant) -> Self {
+        let ahead = previous
+            .map(|clock| clock.at(now) - ticks as f64)
+            .filter(|ahead| ahead.abs() < Self::MOST_EASED)
+            .unwrap_or(0.0);
+        Self {
+            ticks,
+            at: now,
+            ahead,
+        }
+    }
+
+    fn at(&self, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        let easing = (1.0 - elapsed / Self::EASE).max(0.0);
+        self.ticks as f64 + elapsed * f64::from(TICK_RATE) + self.ahead * easing
+    }
+}
+
 #[derive(Debug)]
 pub struct Client {
     connection: ClientConnection,
@@ -47,8 +87,7 @@ pub struct Client {
     lod: HashMap<LodTilePos, LodTile>,
     spawn: Option<DVec3>,
     bounds: Option<WorldBounds>,
-    /// The server's time and when it arrived.
-    time: Option<(u64, Instant)>,
+    time: Option<Clock>,
     sky_seed: u64,
     events: Vec<Event>,
     next_seq: u32,
@@ -110,7 +149,7 @@ impl Client {
                 time,
                 sky_seed,
             } => {
-                self.time = Some((time, Instant::now()));
+                self.time = Some(Clock::new(None, time, Instant::now()));
                 self.sky_seed = sky_seed;
                 let ours = self.content.blocks().iter().map(|(_, def)| &def.id);
                 if !ours.eq(blocks.iter()) {
@@ -148,7 +187,7 @@ impl Client {
                     }
                 }
             }
-            ServerMessage::Time(time) => self.time = Some((time, Instant::now())),
+            ServerMessage::Time(time) => self.set_time(time, Instant::now()),
             ServerMessage::LodTile { pos, tile } => {
                 if !tile.is_complete() {
                     return self.disconnect("the server sent a malformed tile");
@@ -285,8 +324,11 @@ impl Client {
     /// The world's time in ticks, counting on smoothly between the server's
     /// updates; see [`ruda_protocol::DAY_LENGTH`].
     pub fn time(&self) -> Option<f64> {
-        let (time, at) = self.time?;
-        Some(time as f64 + at.elapsed().as_secs_f64() * f64::from(TICK_RATE))
+        self.time.map(|clock| clock.at(Instant::now()))
+    }
+
+    fn set_time(&mut self, ticks: u64, now: Instant) {
+        self.time = Some(Clock::new(self.time, ticks, now));
     }
 
     /// Decides the clouds, once joined.
@@ -370,5 +412,26 @@ mod tests {
             ]
         );
         assert!(affected_by(pos, &old, &old).is_empty());
+    }
+
+    #[test]
+    fn the_clock_eases_over_to_the_servers_time() {
+        let start = Instant::now();
+        let later = |seconds: f64| start + std::time::Duration::from_secs_f64(seconds);
+        let rate = f64::from(TICK_RATE);
+        let clock = Clock::new(None, 1000, start);
+        assert_eq!(clock.at(later(1.0)), 1000.0 + rate);
+
+        // A second later the server says it's a tick behind the count: the
+        // count doesn't jump back, and in a second it agrees with the server.
+        let behind = 1000 + TICK_RATE as u64 - 1;
+        let eased = Clock::new(Some(clock), behind, later(1.0));
+        assert_eq!(eased.at(later(1.0)), clock.at(later(1.0)));
+        assert!(eased.at(later(1.5)) > eased.at(later(1.4)));
+        assert_eq!(eased.at(later(2.0)), behind as f64 + rate);
+
+        // Setting the time jumps.
+        let set = Clock::new(Some(clock), 9000, later(1.0));
+        assert_eq!(set.at(later(1.0)), 9000.0);
     }
 }

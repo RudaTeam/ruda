@@ -7,5 +7,8 @@ mod style;
 
 pub use i18n::{I18n, Language};
 pub use menu::{Menu, MenuAction, MenuContext, Screen};
-pub use settings::{FIELDS_OF_VIEW, GpuApi, Graphics, LOD_DISTANCES, Settings, VIEW_DISTANCES};
+pub use settings::{
+    Clouds, FIELDS_OF_VIEW, FpsLimit, GpuApi, Graphics, LOD_DISTANCES, Lighting, Preset, Settings,
+    VIEW_DISTANCES,
+};
 pub use style::{BACKGROUND, apply as apply_style};

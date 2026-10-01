@@ -129,6 +129,27 @@ fn a_pillar_casts_a_shadow() {
     };
     let [shaded_off, sunny_off] = brightness(false);
     let [shaded_on, sunny_on] = brightness(true);
+
+    // The wider cascades are drawn a part at a time over a few frames; while
+    // the camera moves, the shadows still stay where they are, and the sunlit
+    // ground stays lit.
+    let ground = |pixels: &[u8], width: u32, height: u32| {
+        let lower = &pixels[(width * height / 2 * 4) as usize..];
+        lower.iter().map(|&c| f64::from(c)).sum::<f64>() / lower.len() as f64
+    };
+    let (width, height, pixels) = renderer.capture(Backdrop::World(&scene), None).unwrap();
+    let still = ground(&pixels, width, height);
+    let mut moving = scene;
+    for frame in 0..8 {
+        moving.camera.position.y -= 0.5;
+        let (width, height, pixels) = renderer.capture(Backdrop::World(&moving), None).unwrap();
+        let lit = ground(&pixels, width, height);
+        assert!(
+            (lit - still).abs() < still * 0.1,
+            "frame {frame} of moving down: the ground looks {lit}, standing still {still}"
+        );
+    }
+
     assert!(
         (shaded_off - sunny_off).abs() < sunny_off * 0.1,
         "without shadows the ground looks the same: {shaded_off} and {sunny_off}"
