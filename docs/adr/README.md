@@ -20,7 +20,7 @@
 |---|---|---|
 | [0001](0001-record-architecture-decisions.md) | Ведём архитектурные решения в формате ADR | Принято |
 | [0002](0002-rust-cargo-workspace.md) | Rust и структура Cargo workspace | Принято |
-| [0003](0003-license-and-dependency-policy.md) | Лицензия проекта и политика зависимостей | Отложено |
+| [0003](0003-license-and-dependency-policy.md) | Лицензия Apache-2.0 и политика зависимостей | Принято |
 | [0004](0004-graphics-wgpu-winit.md) | Графика: свой движок на wgpu + winit | Принято |
 | [0005](0005-target-platforms-and-hardware.md) | Целевые платформы и минимальные требования | Принято |
 | [0006](0006-client-server-integrated-server.md) | Клиент-сервер; одиночная игра — встроенный сервер | Принято |
