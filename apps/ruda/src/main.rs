@@ -1,5 +1,6 @@
 //! Game client: a window with the menus and the world of an integrated server.
 
+mod benchmark;
 mod game;
 mod interface;
 mod settings;
@@ -20,7 +21,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHan
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Icon, Window, WindowId};
 
-use crate::game::{Control, Game, GameConfig, MAX_VIEW_DISTANCE};
+use crate::benchmark::Benchmark;
+use crate::game::{CameraStart, Control, Game, GameConfig, MAX_VIEW_DISTANCE};
 use crate::interface::Interface;
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/branding/app-icon.png");
@@ -36,6 +38,11 @@ struct Args {
     #[arg(long)]
     seed: Option<u64>,
 
+    /// Start the camera at `x,y,z` or `x,y,z,yaw,pitch` (degrees) instead of
+    /// the spawn point.
+    #[arg(long, value_name = "X,Y,Z[,YAW,PITCH]", allow_hyphen_values = true)]
+    camera: Option<CameraStart>,
+
     /// Graphics API instead of the one in the settings; `auto` prefers
     /// Vulkan/Metal/DX12 and falls back to OpenGL.
     #[arg(long, value_enum, env = "RUDA_GPU_BACKEND")]
@@ -50,9 +57,19 @@ struct Args {
     #[arg(long, value_name = "N")]
     exit_after_frames: Option<u64>,
 
-    /// With --exit-after-frames, save the last frame to this PNG file.
-    #[arg(long, value_name = "PATH", requires = "exit_after_frames")]
+    /// With --exit-after-frames or --benchmark, save the last frame to this
+    /// PNG file.
+    #[arg(long, value_name = "PATH")]
     screenshot: Option<PathBuf>,
+
+    /// Start a singleplayer world, wait until it has loaded, measure frame
+    /// times for this many seconds, print them and exit.
+    #[arg(long, value_name = "SECONDS", conflicts_with = "exit_after_frames")]
+    benchmark: Option<f64>,
+
+    /// Don't wait for the display's refresh, whatever the settings say.
+    #[arg(long)]
+    no_vsync: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -192,6 +209,7 @@ struct App {
     zero_sized: bool,
     /// When a menu with nothing going on next needs drawing.
     repaint_at: Option<Instant>,
+    benchmark: Option<Benchmark>,
     /// First fatal error; `main` returns it once the event loop has exited.
     error: Option<anyhow::Error>,
 }
@@ -206,7 +224,6 @@ impl App {
         let system_language = sys_locale::get_locale()
             .map_or(Language::English, |locale| Language::from_locale(&locale));
         Self {
-            args,
             display,
             window: None,
             renderer: None,
@@ -227,6 +244,10 @@ impl App {
             occluded: false,
             zero_sized: false,
             repaint_at: None,
+            benchmark: args
+                .benchmark
+                .map(|seconds| Benchmark::new(Duration::from_secs_f64(seconds))),
+            args,
             error: None,
         }
     }
@@ -268,7 +289,7 @@ impl App {
                 renderer => renderer?,
             },
         };
-        if !graphics.vsync {
+        if !graphics.vsync || self.args.no_vsync {
             renderer.set_vsync(false);
         }
 
@@ -276,7 +297,7 @@ impl App {
         window.request_redraw();
         self.window = Some(window);
         self.renderer = Some(renderer);
-        if self.args.singleplayer {
+        if self.args.singleplayer || self.benchmark.is_some() {
             self.start_game()?;
         } else {
             self.menu = Some(Menu::new(Screen::Main));
@@ -293,6 +314,7 @@ impl App {
             seed: self.args.seed.unwrap_or_else(random_seed),
             view_distance: self.args.view_distance.unwrap_or(graphics.view_distance),
             fov: f32::from(graphics.fov),
+            camera: self.args.camera,
         };
         self.game = Some(Game::start(config, renderer)?);
         self.resume();
@@ -326,7 +348,10 @@ impl App {
             game.input.clear();
         }
         self.menu = None;
-        self.grab_cursor(true);
+        // A benchmark keeps its view, wherever the mouse goes.
+        if self.benchmark.is_none() {
+            self.grab_cursor(true);
+        }
     }
 
     fn on_menu_action(&mut self, event_loop: &ActiveEventLoop, action: MenuAction) -> Result<()> {
@@ -437,12 +462,26 @@ impl App {
                 Backdrop::Color([color.r(), color.g(), color.b()])
             }
         };
-        if renderer.render(backdrop, ui.as_ref(), || window.pre_present_notify())? {
+        let presented = renderer.render(backdrop, ui.as_ref(), || window.pre_present_notify())?;
+        if presented {
             self.frames += 1;
             self.title.frames += 1;
             self.first_frame_at.get_or_insert(now);
             #[cfg(feature = "tracy")]
             tracing_tracy::client::frame_mark();
+            let busy = now.elapsed().saturating_sub(renderer.surface_wait());
+            if let (Some(benchmark), Some(game)) = (&mut self.benchmark, &self.game)
+                && let Some(report) = benchmark.frame(now, busy, game.is_loaded())
+            {
+                let stats = renderer.stats();
+                info!("benchmark: {report}; {stats}");
+                println!("{report}\n{stats}");
+                if let Some(path) = &self.args.screenshot {
+                    let (width, height, pixels) = renderer.capture(backdrop, ui.as_ref())?;
+                    save_png(path, width, height, &pixels)?;
+                }
+                event_loop.exit();
+            }
         }
 
         let elapsed = now - self.title.since;
@@ -484,6 +523,10 @@ impl App {
             event_loop.exit();
         } else if self.occluded || self.zero_sized {
             self.repaint_at = None;
+        } else if !presented {
+            // The window can't show frames right now, for example while the
+            // screen is locked: try again a little later instead of spinning.
+            self.repaint_at = Some(now + Duration::from_millis(16));
         } else if repaint_after.is_zero() {
             window.request_redraw();
         } else {
@@ -601,13 +644,18 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 ..
-            } if self.menu.is_none() && !self.cursor_grabbed => {
+            } if self.menu.is_none() && !self.cursor_grabbed && self.benchmark.is_none() => {
                 self.grab_cursor(true);
                 if let Some(game) = &mut self.game {
                     game.input.clear();
                 }
             }
-            WindowEvent::Focused(false) => self.pause(),
+            // Automated runs keep going in the background.
+            WindowEvent::Focused(false)
+                if self.benchmark.is_none() && self.args.exit_after_frames.is_none() =>
+            {
+                self.pause()
+            }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.redraw(event_loop) {
                     self.fail(event_loop, error);

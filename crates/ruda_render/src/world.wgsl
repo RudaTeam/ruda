@@ -1,5 +1,6 @@
 // Chunks are drawn as instanced quads: each instance is one packed quad (see
-// `mesh.rs`) and the vertex shader works out its four corners.
+// `mesh.rs`) and the vertex shader works out its four corners. The high half
+// of the quad's second word is its chunk's slot (see `world_pass.rs`).
 
 struct Globals {
     view_proj: mat4x4<f32>,
@@ -10,17 +11,20 @@ struct Globals {
     selection: vec4<f32>,
     // xy: viewport size in pixels.
     screen: vec4<f32>,
+    // The block the camera is in and the camera's position inside it. Chunk
+    // positions are integers, so subtracting them stays exact anywhere.
+    camera_block: vec4<i32>,
+    camera_fract: vec4<f32>,
 }
 
-struct Chunk {
-    // Origin of the chunk relative to the camera.
-    origin: vec4<f32>,
-}
+// Width of `chunk_origins`, whose texels are chunk slots.
+const ORIGINS_WIDTH = 128u;
 
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var block_textures: texture_2d_array<f32>;
 @group(0) @binding(2) var block_sampler: sampler;
-@group(1) @binding(0) var<uniform> chunk: Chunk;
+// xyz: the world position of the chunk in each slot.
+@group(0) @binding(3) var chunk_origins: texture_2d<i32>;
 
 struct ChunkVertex {
     @builtin(position) clip: vec4<f32>,
@@ -71,7 +75,10 @@ fn chunk_vertex(@builtin(vertex_index) corner: u32, @location(0) quad: vec2<u32>
         + unit(axis) * select(0.0, 1.0, positive)
         + unit(u_axis) * (cu * width)
         + unit(v_axis) * (cv * height);
-    let position = chunk.origin.xyz + local;
+    let slot = quad.y >> 16u;
+    let texel = vec2<i32>(i32(slot % ORIGINS_WIDTH), i32(slot / ORIGINS_WIDTH));
+    let origin = textureLoad(chunk_origins, texel, 0).xyz;
+    let position = vec3<f32>(origin - globals.camera_block.xyz) + local - globals.camera_fract.xyz;
 
     var out: ChunkVertex;
     out.clip = globals.view_proj * vec4<f32>(position, 1.0);

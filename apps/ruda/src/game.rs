@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use glam::{DVec3, Vec3};
@@ -20,6 +21,8 @@ const SPEED: f64 = 12.0;
 const SPRINT_SPEED: f64 = 40.0;
 /// Radians of camera turn per unit of mouse movement.
 const MOUSE_SENSITIVITY: f32 = 0.0025;
+/// See [`Game::is_loaded`].
+const LOAD_QUIET: Duration = Duration::from_secs(1);
 /// The farthest the integrated server streams the world, in chunks.
 pub const MAX_VIEW_DISTANCE: u8 = 32;
 
@@ -30,6 +33,39 @@ pub struct GameConfig {
     pub view_distance: u8,
     /// Vertical field of view in degrees.
     pub fov: f32,
+    /// Where the camera starts instead of the spawn point.
+    pub camera: Option<CameraStart>,
+}
+
+/// A camera position and direction, angles in degrees.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraStart {
+    pub position: DVec3,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl std::str::FromStr for CameraStart {
+    type Err = String;
+
+    /// `x,y,z` or `x,y,z,yaw,pitch`.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let numbers = text
+            .split(',')
+            .map(|part| part.trim().parse::<f64>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let (position, yaw, pitch) = match numbers[..] {
+            [x, y, z] => (DVec3::new(x, y, z), 0.0, 0.0),
+            [x, y, z, yaw, pitch] => (DVec3::new(x, y, z), yaw, pitch),
+            _ => return Err("expected x,y,z or x,y,z,yaw,pitch".into()),
+        };
+        Ok(Self {
+            position,
+            yaw: yaw as f32,
+            pitch: pitch as f32,
+        })
+    }
 }
 
 /// What the window should do after an update.
@@ -51,6 +87,9 @@ pub struct Game {
     target: Option<RayHit>,
     view_distance: f32,
     joined: bool,
+    start: Option<CameraStart>,
+    /// When chunks last arrived, left or got new geometry.
+    last_change: Instant,
 }
 
 impl Game {
@@ -90,6 +129,8 @@ impl Game {
             target: None,
             view_distance: (i32::from(config.view_distance) * CHUNK_SIZE) as f32,
             joined: false,
+            start: config.camera,
+            last_change: Instant::now(),
         })
     }
 
@@ -102,10 +143,24 @@ impl Game {
         renderer: &mut Renderer,
     ) -> Result<Control> {
         for event in self.client.update() {
+            if matches!(event, Event::ChunkLoaded(_) | Event::ChunkUnloaded(_)) {
+                self.last_change = Instant::now();
+            }
             match event {
                 Event::Joined { spawn } => {
-                    self.camera.position = spawn;
-                    self.camera.pitch = -0.3;
+                    match self.start {
+                        Some(start) => {
+                            self.camera.position = start.position;
+                            self.camera.yaw = 0.0;
+                            self.camera.pitch = 0.0;
+                            self.camera
+                                .rotate(start.yaw.to_radians(), start.pitch.to_radians());
+                        }
+                        None => {
+                            self.camera.position = spawn;
+                            self.camera.pitch = -0.3;
+                        }
+                    }
                     self.joined = true;
                 }
                 Event::ChunkLoaded(pos) => self.mesher.chunk_loaded(pos),
@@ -168,6 +223,7 @@ impl Game {
         self.mesher.schedule(self.client.world(), center);
         for (pos, mesh) in self.mesher.finished() {
             renderer.upload_chunk(pos, &mesh);
+            self.last_change = Instant::now();
         }
         Ok(control)
     }
@@ -227,7 +283,14 @@ impl Game {
             camera: self.camera,
             target: self.target.map(|hit| hit.block),
             view_distance: self.view_distance,
+            bounds: self.client.bounds(),
         }
+    }
+
+    /// Whether the world around the player has stopped loading: nothing
+    /// arrived or got meshed for a second.
+    pub fn is_loaded(&self) -> bool {
+        self.joined && self.mesher.backlog() == 0 && self.last_change.elapsed() > LOAD_QUIET
     }
 
     /// Debug information for the window title.

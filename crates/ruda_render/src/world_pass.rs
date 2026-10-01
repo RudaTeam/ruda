@@ -1,42 +1,81 @@
 //! Draws the block world, the outline of the targeted block and the crosshair.
+//!
+//! Chunk geometry lives in a few large shared buffers ("pages"). Every chunk
+//! gets a slot whose texel in a small texture holds the chunk's position, and
+//! its quads carry the slot, so drawing needs no per-chunk state: each draw
+//! is just a range of quads, and neighbouring ranges merge into one draw.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
-use glam::Vec3;
-use ruda_core::{CHUNK_SIZE, ChunkPos};
-use wgpu::util::DeviceExt as _;
+use glam::{DVec3, Vec3};
+use ruda_core::{CHUNK_SIZE, ChunkPos, Face, WorldBounds};
+use tracing::warn;
 
+use crate::arena::{RangeAllocator, Slots};
 use crate::camera::Frustum;
+use crate::culling::visible_chunks;
 use crate::textures::{BlockTextures, MIP_LEVELS, TEXTURE_SIZE};
-use crate::{ChunkMesh, Scene};
+use crate::{ChunkMesh, RenderStats, Scene, Visibility};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 /// Bytes of the `Globals` uniform in `world.wgsl`.
-const GLOBALS_SIZE: u64 = 128;
-/// Bytes of the `Chunk` uniform in `world.wgsl`.
-const CHUNK_UNIFORM_SIZE: u64 = 16;
+const GLOBALS_SIZE: u64 = 160;
+const QUAD_BYTES: u64 = 8;
+/// Quads per page: 8 MiB.
+const PAGE_QUADS: u32 = 1 << 20;
+/// Width and height of the chunk position texture, `ORIGINS_WIDTH` in
+/// `world.wgsl`. Its texels are the chunk slots.
+const ORIGINS_WIDTH: u32 = 128;
+const MAX_SLOTS: u32 = ORIGINS_WIDTH * ORIGINS_WIDTH;
 
 pub(crate) struct WorldPass {
     globals: wgpu::Buffer,
     globals_layout: wgpu::BindGroupLayout,
     globals_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
-    /// One slot per chunk drawn this frame, addressed with dynamic offsets.
-    chunk_uniforms: wgpu::Buffer,
-    chunk_layout: wgpu::BindGroupLayout,
-    chunk_group: wgpu::BindGroup,
-    chunk_slots: u64,
-    slot_size: u64,
+    block_textures: wgpu::TextureView,
+    /// Position of each slot's chunk, as `Rgba32Sint` texels.
+    origins: wgpu::Texture,
+    origins_view: wgpu::TextureView,
     chunk_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     crosshair_pipeline: wgpu::RenderPipeline,
-    meshes: HashMap<ChunkPos, GpuMesh>,
+    chunks: HashMap<ChunkPos, ChunkEntry>,
+    pages: Vec<Page>,
+    slots: Slots,
     depth: wgpu::TextureView,
+    stats: RenderStats,
+    culling: bool,
+    /// Scratch space reused every frame.
+    visible: Vec<ChunkPos>,
+    draws: Vec<Draw>,
 }
 
-struct GpuMesh {
+/// What the renderer knows about a loaded chunk.
+struct ChunkEntry {
+    visibility: Visibility,
+    /// `None` for chunks without geometry, like air.
+    gpu: Option<GpuChunk>,
+}
+
+struct GpuChunk {
+    slot: u32,
+    page: usize,
+    quads: Range<u32>,
+    face_counts: [u32; 6],
+}
+
+struct Page {
     buffer: wgpu::Buffer,
-    quads: u32,
+    space: RangeAllocator,
+}
+
+/// A run of quads in one page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Draw {
+    page: usize,
+    quads: Range<u32>,
 }
 
 impl WorldPass {
@@ -84,6 +123,16 @@ impl WorldPass {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Sint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -96,41 +145,33 @@ impl WorldPass {
             ..Default::default()
         });
         let textures = BlockTextures::load(&ruda_core::ContentBuilder::new().build(), 2);
+        let block_textures = upload_textures(device, queue, &textures);
+        let origins = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("chunk origins"),
+            size: wgpu::Extent3d {
+                width: ORIGINS_WIDTH,
+                height: ORIGINS_WIDTH,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Sint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let origins_view = origins.create_view(&Default::default());
         let globals_group = Self::globals_group(
             device,
             &globals_layout,
             &globals,
             &sampler,
-            &upload_textures(device, queue, &textures),
+            &block_textures,
+            &origins_view,
         );
 
-        let chunk_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("chunk"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(CHUNK_UNIFORM_SIZE),
-                },
-                count: None,
-            }],
-        });
-        let slot_size =
-            u64::from(device.limits().min_uniform_buffer_offset_alignment).max(CHUNK_UNIFORM_SIZE);
-        let chunk_slots = 256;
-        let (chunk_uniforms, chunk_group) =
-            Self::chunk_uniforms(device, &chunk_layout, chunk_slots, slot_size);
-
-        let chunk_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("chunks"),
-                bind_group_layouts: &[Some(&globals_layout), Some(&chunk_layout)],
-                immediate_size: 0,
-            });
-        let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("overlay"),
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("world"),
             bind_group_layouts: &[Some(&globals_layout)],
             immediate_size: 0,
         });
@@ -186,7 +227,7 @@ impl WorldPass {
         };
         let chunk_pipeline = pipeline(
             "chunks",
-            &chunk_pipeline_layout,
+            &layout,
             "chunk_vertex",
             "chunk_fragment",
             &[Some(quad_buffer)],
@@ -196,7 +237,7 @@ impl WorldPass {
         );
         let outline_pipeline = pipeline(
             "block outline",
-            &overlay_layout,
+            &layout,
             "outline_vertex",
             "outline_fragment",
             &[],
@@ -206,7 +247,7 @@ impl WorldPass {
         );
         let crosshair_pipeline = pipeline(
             "crosshair",
-            &overlay_layout,
+            &layout,
             "crosshair_vertex",
             "crosshair_fragment",
             &[],
@@ -220,16 +261,20 @@ impl WorldPass {
             globals_layout,
             globals_group,
             sampler,
-            chunk_uniforms,
-            chunk_layout,
-            chunk_group,
-            chunk_slots,
-            slot_size,
+            block_textures,
+            origins,
+            origins_view,
             chunk_pipeline,
             outline_pipeline,
             crosshair_pipeline,
-            meshes: HashMap::new(),
+            chunks: HashMap::new(),
+            pages: Vec::new(),
+            slots: Slots::new(MAX_SLOTS),
             depth: depth_view(device, width, height),
+            stats: RenderStats::default(),
+            culling: true,
+            visible: Vec::new(),
+            draws: Vec::new(),
         }
     }
 
@@ -239,13 +284,14 @@ impl WorldPass {
         queue: &wgpu::Queue,
         textures: &BlockTextures,
     ) {
-        let view = upload_textures(device, queue, textures);
+        self.block_textures = upload_textures(device, queue, textures);
         self.globals_group = Self::globals_group(
             device,
             &self.globals_layout,
             &self.globals,
             &self.sampler,
-            &view,
+            &self.block_textures,
+            &self.origins_view,
         );
     }
 
@@ -253,47 +299,140 @@ impl WorldPass {
         self.depth = depth_view(device, width, height);
     }
 
-    pub(crate) fn upload(&mut self, device: &wgpu::Device, pos: ChunkPos, mesh: &ChunkMesh) {
-        if mesh.is_empty() {
-            self.meshes.remove(&pos);
-            return;
-        }
-        let bytes: Vec<u8> = mesh
-            .quads
-            .iter()
-            .flatten()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("chunk mesh"),
-            contents: &bytes,
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        self.meshes.insert(
+    pub(crate) fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pos: ChunkPos,
+        mesh: &ChunkMesh,
+    ) {
+        self.remove(pos);
+        let gpu = if mesh.quads.is_empty() {
+            None
+        } else {
+            self.place(device, queue, pos, mesh)
+        };
+        self.chunks.insert(
             pos,
-            GpuMesh {
-                buffer,
-                quads: mesh.quads.len() as u32,
+            ChunkEntry {
+                visibility: mesh.visibility,
+                gpu,
             },
         );
     }
 
+    /// Finds room for a chunk's quads and its slot, and uploads them.
+    fn place(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pos: ChunkPos,
+        mesh: &ChunkMesh,
+    ) -> Option<GpuChunk> {
+        let Some(slot) = self.slots.take() else {
+            warn!(?pos, "too many chunks with geometry, not drawing this one");
+            return None;
+        };
+        let len = mesh.quads.len() as u32;
+        let found = self
+            .pages
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, page)| Some((index, page.space.allocate(len)?)));
+        let (page, quads) = match found {
+            Some(found) => found,
+            None => {
+                let size = PAGE_QUADS.max(len);
+                let mut space = RangeAllocator::new(size);
+                let quads = space.allocate(len).expect("a new page fits the mesh");
+                self.pages.push(Page {
+                    buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("chunk quads"),
+                        size: u64::from(size) * QUAD_BYTES,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    space,
+                });
+                (self.pages.len() - 1, quads)
+            }
+        };
+
+        let bytes: Vec<u8> = mesh
+            .quads
+            .iter()
+            .flat_map(|&[shape, layer]| [shape, layer | slot << 16])
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        queue.write_buffer(
+            &self.pages[page].buffer,
+            u64::from(quads.start) * QUAD_BYTES,
+            &bytes,
+        );
+        let origin = pos.origin().0;
+        let texel: Vec<u8> = [origin.x, origin.y, origin.z, 0]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.origins,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: slot % ORIGINS_WIDTH,
+                    y: slot / ORIGINS_WIDTH,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &texel,
+            wgpu::TexelCopyBufferLayout::default(),
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        Some(GpuChunk {
+            slot,
+            page,
+            quads,
+            face_counts: mesh.face_counts,
+        })
+    }
+
     pub(crate) fn remove(&mut self, pos: ChunkPos) {
-        self.meshes.remove(&pos);
+        if let Some(gpu) = self.chunks.remove(&pos).and_then(|entry| entry.gpu) {
+            self.pages[gpu.page].space.free(gpu.quads);
+            self.slots.give_back(gpu.slot);
+        }
     }
 
     pub(crate) fn clear(&mut self) {
-        self.meshes.clear();
+        self.chunks.clear();
+        self.pages.clear();
+        self.slots = Slots::new(MAX_SLOTS);
     }
 
+    /// Chunks with geometry on the GPU.
     pub(crate) fn chunk_count(&self) -> usize {
-        self.meshes.len()
+        self.chunks
+            .values()
+            .filter(|entry| entry.gpu.is_some())
+            .count()
+    }
+
+    pub(crate) fn stats(&self) -> RenderStats {
+        self.stats
+    }
+
+    pub(crate) fn set_culling(&mut self, culling: bool) {
+        self.culling = culling;
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw(
         &mut self,
-        device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
@@ -306,36 +445,60 @@ impl WorldPass {
             .camera
             .view_proj(width as f32 / height as f32, scene.view_distance + 64.0);
         let frustum = Frustum::new(view_proj);
-        let size = CHUNK_SIZE as f32;
-
-        // Visible chunks, nearest first so the depth test rejects more.
-        let mut visible: Vec<(ChunkPos, Vec3)> = self
-            .meshes
-            .keys()
-            .map(|&pos| (pos, (pos.origin().0.as_dvec3() - camera).as_vec3()))
-            .filter(|(_, origin)| frustum.intersects_box(*origin, *origin + size))
-            .collect();
-        visible.sort_by(|a, b| a.1.length_squared().total_cmp(&b.1.length_squared()));
-
-        if visible.len() as u64 > self.chunk_slots {
-            self.chunk_slots = (visible.len() as u64).next_power_of_two();
-            (self.chunk_uniforms, self.chunk_group) =
-                Self::chunk_uniforms(device, &self.chunk_layout, self.chunk_slots, self.slot_size);
+        let radius = (scene.view_distance / CHUNK_SIZE as f32).ceil() as i32;
+        let bounds = scene.bounds.unwrap_or(WorldBounds::DEFAULT);
+        let world_y = (bounds.min_y >> 5)..=(bounds.max_y >> 5);
+        let chunks = &self.chunks;
+        if self.culling {
+            visible_chunks(
+                camera,
+                &frustum,
+                radius,
+                world_y,
+                |pos| chunks.get(&pos).map(|entry| entry.visibility),
+                &mut self.visible,
+            );
+        } else {
+            self.visible.clear();
+            self.visible.extend(chunks.keys().copied().filter(|pos| {
+                let min = (pos.origin().0.as_dvec3() - camera).as_vec3();
+                frustum.intersects_box(min, min + Vec3::splat(CHUNK_SIZE as f32))
+            }));
         }
-        if !visible.is_empty() {
-            let mut origins = vec![0u8; visible.len() * self.slot_size as usize];
-            for (slot, (_, origin)) in origins
-                .chunks_exact_mut(self.slot_size as usize)
-                .zip(&visible)
-            {
-                write_floats(&mut slot[..16], &[origin.x, origin.y, origin.z, 0.0]);
+
+        self.draws.clear();
+        self.stats = RenderStats {
+            chunks: self.chunk_count(),
+            ..Default::default()
+        };
+        for pos in &self.visible {
+            let Some(gpu) = self.chunks.get(pos).and_then(|entry| entry.gpu.as_ref()) else {
+                continue;
+            };
+            self.stats.drawn_chunks += 1;
+            let facing = if self.culling {
+                facing_camera(*pos, camera)
+            } else {
+                [true; 6]
+            };
+            let mut start = gpu.quads.start;
+            for face in Face::ALL {
+                let count = gpu.face_counts[face.index()];
+                if count > 0 && facing[face.index()] {
+                    push_draw(&mut self.draws, gpu.page, start..start + count);
+                    self.stats.quads += u64::from(count);
+                }
+                start += count;
             }
-            queue.write_buffer(&self.chunk_uniforms, 0, &origins);
         }
+        self.stats.draw_calls = self.draws.len();
 
         let selection = scene
             .target
             .map(|block| (block.0.as_dvec3() - camera).as_vec3());
+        let camera_block = camera.floor();
+        let camera_fract = (camera - camera_block).as_vec3();
+        let camera_block = camera_block.as_ivec3();
         let mut globals = [0u8; GLOBALS_SIZE as usize];
         write_floats(&mut globals[..64], &view_proj.to_cols_array());
         write_floats(
@@ -365,6 +528,15 @@ impl WorldPass {
                 0.0,
             ],
         );
+        for (bytes, value) in globals[128..144]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(camera_block.to_array())
+        {
+            *bytes = value.to_le_bytes();
+        }
+        write_floats(&mut globals[144..], &camera_fract.extend(0.0).to_array());
         queue.write_buffer(&self.globals, 0, &globals);
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -391,12 +563,13 @@ impl WorldPass {
         pass.set_bind_group(0, &self.globals_group, &[]);
 
         pass.set_pipeline(&self.chunk_pipeline);
-        for (slot, (pos, _)) in visible.iter().enumerate() {
-            let mesh = &self.meshes[pos];
-            let offset = (slot as u64 * self.slot_size) as u32;
-            pass.set_bind_group(1, &self.chunk_group, &[offset]);
-            pass.set_vertex_buffer(0, mesh.buffer.slice(..));
-            pass.draw(0..4, 0..mesh.quads);
+        let mut bound = None;
+        for draw in &self.draws {
+            if bound != Some(draw.page) {
+                pass.set_vertex_buffer(0, self.pages[draw.page].buffer.slice(..));
+                bound = Some(draw.page);
+            }
+            pass.draw(0..4, draw.quads.clone());
         }
 
         if scene.target.is_some() {
@@ -413,6 +586,7 @@ impl WorldPass {
         globals: &wgpu::Buffer,
         sampler: &wgpu::Sampler,
         textures: &wgpu::TextureView,
+        origins: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("world globals"),
@@ -430,35 +604,12 @@ impl WorldPass {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(origins),
+                },
             ],
         })
-    }
-
-    fn chunk_uniforms(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        slots: u64,
-        slot_size: u64,
-    ) -> (wgpu::Buffer, wgpu::BindGroup) {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("chunk origins"),
-            size: slots * slot_size,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("chunk origins"),
-            layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(CHUNK_UNIFORM_SIZE),
-                }),
-            }],
-        });
-        (buffer, group)
     }
 }
 
@@ -526,6 +677,33 @@ fn depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureVi
             view_formats: &[],
         })
         .create_view(&Default::default())
+}
+
+/// Which way the quads of a chunk may face the camera, in [`Face::ALL`] order.
+fn facing_camera(pos: ChunkPos, camera: DVec3) -> [bool; 6] {
+    let min = pos.origin().0.as_dvec3();
+    let max = min + f64::from(CHUNK_SIZE);
+    Face::ALL.map(|face| {
+        let axis = face.axis();
+        if face.is_positive() {
+            camera[axis] > min[axis]
+        } else {
+            camera[axis] < max[axis]
+        }
+    })
+}
+
+/// Adds a range of quads, extending the last draw if it ends where the range
+/// starts.
+fn push_draw(draws: &mut Vec<Draw>, page: usize, quads: Range<u32>) {
+    if let Some(last) = draws.last_mut()
+        && last.page == page
+        && last.quads.end == quads.start
+    {
+        last.quads.end = quads.end;
+        return;
+    }
+    draws.push(Draw { page, quads });
 }
 
 fn write_floats(out: &mut [u8], values: &[f32]) {

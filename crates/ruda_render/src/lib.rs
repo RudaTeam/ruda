@@ -3,17 +3,20 @@
 //! wgpu types never leave this crate: the rest of the engine sees the
 //! [`Renderer`], the [`Camera`] and the meshing helpers.
 
+mod arena;
 mod camera;
+mod culling;
 mod mesh;
 mod mesher;
 mod textures;
+mod visibility;
 mod world_pass;
 
 use std::fmt;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use ruda_core::{BlockPos, ChunkPos, Content};
+use ruda_core::{BlockPos, ChunkPos, Content, WorldBounds};
 use tracing::{info, warn};
 use wgpu::rwh::{HasDisplayHandle, HasWindowHandle};
 
@@ -21,6 +24,7 @@ pub use camera::{Camera, Frustum};
 pub use mesh::{BlockFaces, ChunkMesh, PaddedChunk, Quad, mesh_chunk};
 pub use mesher::ChunkMesher;
 pub use textures::BlockTextures;
+pub use visibility::Visibility;
 
 use world_pass::WorldPass;
 
@@ -57,6 +61,29 @@ pub struct Scene {
     pub target: Option<BlockPos>,
     /// How far the world is drawn, in blocks; fog hides the edge.
     pub view_distance: f32,
+    /// The heights the world spans; above it there is only sky.
+    pub bounds: Option<WorldBounds>,
+}
+
+/// What the last frame drew.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderStats {
+    /// Chunks with geometry on the GPU.
+    pub chunks: usize,
+    /// Chunks drawn after culling.
+    pub drawn_chunks: usize,
+    pub draw_calls: usize,
+    pub quads: u64,
+}
+
+impl fmt::Display for RenderStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} of {} chunks drawn in {} draw calls, {} quads",
+            self.drawn_chunks, self.chunks, self.draw_calls, self.quads
+        )
+    }
 }
 
 /// Graphics API to render with.
@@ -90,11 +117,14 @@ pub struct Renderer {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    window: Arc<dyn wgpu::WindowHandle>,
+    /// `None` for a renderer that only draws off-screen.
+    window: Option<Arc<dyn wgpu::WindowHandle>>,
     config: wgpu::SurfaceConfiguration,
     /// `None` while suspended: mobile platforms destroy the native window.
     surface: Option<wgpu::Surface<'static>>,
     world: WorldPass,
+    /// How long the last frame waited for the window to hand out an image.
+    surface_wait: std::time::Duration,
     ui: egui_wgpu::Renderer,
     /// egui blends in gamma space, so where the GPU allows it the interface
     /// draws through a non-sRGB view of the frame.
@@ -162,7 +192,7 @@ impl Renderer {
         // limits and let wgpu reject anything that goes beyond them.
         let required_limits =
             wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
-        let (device, queue) = adapter
+        let device = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ruda"),
                 required_limits,
@@ -179,6 +209,61 @@ impl Renderer {
             config.format = format;
         }
         config.present_mode = wgpu::PresentMode::AutoVsync;
+        let renderer = Self::with_device(
+            instance,
+            adapter,
+            device,
+            config,
+            Some(window),
+            Some(surface),
+        );
+        renderer.configure_surface();
+        Ok(renderer)
+    }
+
+    /// A renderer without a window, for drawing into images with
+    /// [`Renderer::capture`]: tests and tools.
+    pub async fn headless(width: u32, height: u32) -> Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .context("no GPU adapter")?;
+        let required_limits =
+            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
+        let device = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("ruda"),
+                required_limits,
+                ..Default::default()
+            })
+            .await
+            .context("failed to create the GPU device")?;
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            view_formats: Vec::new(),
+            color_space: Default::default(),
+        };
+        Ok(Self::with_device(
+            instance, adapter, device, config, None, None,
+        ))
+    }
+
+    fn with_device(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        (device, queue): (wgpu::Device, wgpu::Queue),
+        mut config: wgpu::SurfaceConfiguration,
+        window: Option<Arc<dyn wgpu::WindowHandle>>,
+        surface: Option<wgpu::Surface<'static>>,
+    ) -> Self {
+        let (width, height) = (config.width, config.height);
         let reinterpret =
             wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS | wgpu::DownlevelFlags::VIEW_FORMATS;
         let ui_format = if adapter
@@ -214,20 +299,19 @@ impl Renderer {
                 ..Default::default()
             },
         );
-        let renderer = Self {
+        Self {
             instance,
             adapter,
             device,
             queue,
             window,
             config,
-            surface: Some(surface),
+            surface,
             world,
+            surface_wait: std::time::Duration::ZERO,
             ui,
             ui_format,
-        };
-        renderer.configure_surface();
-        Ok(renderer)
+        }
     }
 
     /// Short description of the active GPU, e.g. "Metal · Apple M1".
@@ -260,7 +344,7 @@ impl Renderer {
 
     /// Replaces the geometry drawn for a chunk.
     pub fn upload_chunk(&mut self, pos: ChunkPos, mesh: &ChunkMesh) {
-        self.world.upload(&self.device, pos, mesh);
+        self.world.upload(&self.device, &self.queue, pos, mesh);
     }
 
     pub fn remove_chunk(&mut self, pos: ChunkPos) {
@@ -280,6 +364,25 @@ impl Renderer {
     /// Chunks with geometry on the GPU.
     pub fn chunk_count(&self) -> usize {
         self.world.chunk_count()
+    }
+
+    /// How long the last frame waited for the window to hand out an image to
+    /// draw into: with vertical sync, or when frames come faster than the
+    /// system composites them.
+    pub fn surface_wait(&self) -> std::time::Duration {
+        self.surface_wait
+    }
+
+    /// Turns skipping chunks hidden behind solid ground and faces turned away
+    /// from the camera on or off. It is on by default; turning it off shows
+    /// whether it hides anything that should be seen.
+    pub fn set_culling(&mut self, culling: bool) {
+        self.world.set_culling(culling);
+    }
+
+    /// What the last frame of the world drew.
+    pub fn stats(&self) -> RenderStats {
+        self.world.stats()
     }
 
     /// Draws a frame into an off-screen image instead of the window and
@@ -365,8 +468,10 @@ impl Renderer {
 
     /// Recreates the surface released by [`Renderer::suspend`].
     pub fn resume(&mut self) -> Result<()> {
-        if self.surface.is_none() {
-            self.surface = Some(create_surface(&self.instance, &self.window)?);
+        if self.surface.is_none()
+            && let Some(window) = &self.window
+        {
+            self.surface = Some(create_surface(&self.instance, window)?);
             self.configure_surface();
         }
         Ok(())
@@ -403,7 +508,10 @@ impl Renderer {
             return Ok(false);
         };
 
-        let (frame, suboptimal) = match surface.get_current_texture() {
+        let acquire = std::time::Instant::now();
+        let current = surface.get_current_texture();
+        self.surface_wait = acquire.elapsed();
+        let (frame, suboptimal) = match current {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -415,8 +523,10 @@ impl Renderer {
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 warn!("window surface lost, recreating it");
-                self.surface = Some(create_surface(&self.instance, &self.window)?);
-                self.configure_surface();
+                if let Some(window) = &self.window {
+                    self.surface = Some(create_surface(&self.instance, window)?);
+                    self.configure_surface();
+                }
                 return Ok(false);
             }
             wgpu::CurrentSurfaceTexture::Validation => {
@@ -466,7 +576,6 @@ impl Renderer {
         let view = &target.create_view(&wgpu::TextureViewDescriptor::default());
         match backdrop {
             Backdrop::World(scene) => self.world.draw(
-                &self.device,
                 &self.queue,
                 encoder,
                 view,

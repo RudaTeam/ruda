@@ -6,6 +6,8 @@ use ruda_core::{
 };
 use ruda_world::World;
 
+use crate::Visibility;
+
 const SIZE: usize = CHUNK_SIZE as usize;
 /// A chunk plus a one-block border on every side.
 const PADDED: usize = SIZE + 2;
@@ -139,9 +141,23 @@ fn pack(block: [usize; 3], width: usize, height: usize, face: Face, layer: u16) 
 }
 
 /// The geometry of one chunk.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkMesh {
+    /// Grouped by the direction they face, in [`Face::ALL`] order.
     pub quads: Vec<Quad>,
+    /// How many quads face each direction, in [`Face::ALL`] order.
+    pub face_counts: [u32; 6],
+    pub visibility: Visibility,
+}
+
+impl Default for ChunkMesh {
+    fn default() -> Self {
+        Self {
+            quads: Vec::new(),
+            face_counts: [0; 6],
+            visibility: Visibility::ALL,
+        }
+    }
 }
 
 impl ChunkMesh {
@@ -176,9 +192,11 @@ pub fn mesh_chunk(chunk: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
     }
 
     let mut quads = Vec::new();
+    let mut face_counts = [0; 6];
     // Per slice, texture layer + 1 of each visible face; 0 where there is none.
     let mut planes = vec![[[0u16; SIZE]; SIZE]; SIZE];
     for face in Face::ALL {
+        let before = quads.len();
         let axis = face.axis();
         let (u_axis, v_axis) = plane_axes(axis);
         let mut slices_used = 0u32;
@@ -216,8 +234,21 @@ pub fn mesh_chunk(chunk: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
                 quads.push(pack(block, width, height, face, cell - 1));
             });
         }
+        face_counts[face.index()] = (quads.len() - before) as u32;
     }
-    ChunkMesh { quads }
+
+    // The chunk's own solid blocks as rows along x.
+    let mut solid = [[0u32; SIZE]; SIZE];
+    for (y, rows) in solid.iter_mut().enumerate() {
+        for (z, row) in rows.iter_mut().enumerate() {
+            *row = (columns[0][(y + 1) * PADDED + z + 1] >> 1) as u32;
+        }
+    }
+    ChunkMesh {
+        quads,
+        face_counts,
+        visibility: Visibility::of(&solid),
+    }
 }
 
 /// Covers the non-zero cells with rectangles of equal cells, widest rows
@@ -398,6 +429,37 @@ mod tests {
             covered[face.index()] += width * height;
         }
         assert_eq!(covered, expected);
+    }
+
+    #[test]
+    fn groups_quads_by_face_and_finds_visibility() {
+        let f = fixture();
+        // A floor across the chunk at y = 4.
+        let mut chunk = Chunk::filled(BlockId::AIR);
+        for x in 0..32 {
+            for z in 0..32 {
+                chunk.set(LocalPos::new(x, 4, z), f.stone);
+            }
+        }
+        chunk.set(LocalPos::new(3, 10, 3), f.dirt);
+        let padded = PaddedChunk::gather(&world_with(chunk), ChunkPos::new(0, 0, 0)).unwrap();
+        let mesh = mesh_chunk(&padded, &f.faces);
+        assert_eq!(
+            mesh.face_counts.iter().sum::<u32>() as usize,
+            mesh.quads.len()
+        );
+        let mut start = 0;
+        for face in Face::ALL {
+            let count = mesh.face_counts[face.index()] as usize;
+            assert!(
+                mesh.quads[start..start + count]
+                    .iter()
+                    .all(|&q| unpack(q).3 == face)
+            );
+            start += count;
+        }
+        assert!(!mesh.visibility.connects(Face::NegY, Face::PosY));
+        assert!(mesh.visibility.connects(Face::NegX, Face::PosX));
     }
 
     #[test]

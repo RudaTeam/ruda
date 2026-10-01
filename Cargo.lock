@@ -2452,6 +2452,7 @@ dependencies = [
  "glam",
  "naga",
  "png",
+ "pollster",
  "rayon",
  "ruda_base",
  "ruda_core",

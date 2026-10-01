@@ -14,8 +14,8 @@ What we're aiming for:
 - a modding API that can carry big tech mods: machines, power networks, their own UIs.
 
 It's very early. You can fly around a generated world with hills, caves and
-ore, and break and place blocks. The world is endless sideways and 2048 blocks
-tall, from −1024 to +1023, with sea level at 0 and unbreakable bedrock at the
+ore, and break and place blocks. The world is endless sideways and 256 blocks
+tall, from −128 to +127, with sea level at 0 and unbreakable bedrock at the
 bottom. Single-player already runs on a local server
 inside the game; there's no survival, saving or network play yet.
 
@@ -56,8 +56,14 @@ The client takes a few options:
 - `--gpu-backend <auto|vulkan|metal|dx12|gl>` overrides the graphics API. You
   can also set it with `RUDA_GPU_BACKEND`. `auto` tries Vulkan, Metal and DX12
   before falling back to OpenGL.
+- `--camera <X,Y,Z[,YAW,PITCH]>` starts the camera at a given point instead
+  of the spawn point, angles in degrees.
 - `--exit-after-frames <N>` quits after N frames have been shown, and
   `--screenshot <PATH>` saves the last one. CI uses them as a smoke test.
+- `--benchmark <SECONDS>` starts a world, waits until it has loaded, then
+  measures frame times for that long and prints them. Add `--no-vsync` to
+  draw as fast as possible, and `--seed` and `--camera` to measure the same
+  view every time.
 
 Logging is controlled with `RUST_LOG`, for example `RUST_LOG=debug`. To profile
 with [Tracy](https://github.com/wolfpld/tracy), build with `--features tracy`.

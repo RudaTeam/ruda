@@ -68,6 +68,14 @@ impl Frustum {
         }
     }
 
+    /// A frustum that contains everything.
+    #[cfg(test)]
+    pub(crate) fn everything() -> Self {
+        Self {
+            planes: [Vec4::W; 6],
+        }
+    }
+
     /// Whether an axis-aligned box may be visible.
     pub fn intersects_box(&self, min: Vec3, max: Vec3) -> bool {
         self.planes.iter().all(|plane| {

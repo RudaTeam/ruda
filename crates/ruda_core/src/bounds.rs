@@ -10,11 +10,11 @@ pub struct WorldBounds {
 }
 
 impl WorldBounds {
-    /// From −1024 to +1023: 2048 blocks, exactly 64 chunks tall. Sea level
-    /// is at 0.
+    /// From −128 to +127: 256 blocks, exactly 8 chunks tall. Sea level is
+    /// at 0.
     pub const DEFAULT: Self = Self {
-        min_y: -1024,
-        max_y: 1023,
+        min_y: -128,
+        max_y: 127,
     };
 
     pub fn contains(self, pos: BlockPos) -> bool {
@@ -39,14 +39,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_world_is_64_chunks_tall() {
+    fn default_world_is_8_chunks_tall() {
         let bounds = WorldBounds::DEFAULT;
         let chunks = (-40..40)
             .filter(|&y| bounds.contains_chunk(ChunkPos::new(0, y, 0)))
             .count();
-        assert_eq!(chunks, 64);
-        assert!(bounds.contains(BlockPos::new(0, -1024, 0)));
-        assert!(!bounds.contains(BlockPos::new(0, -1025, 0)));
-        assert!(!bounds.contains(BlockPos::new(0, 1024, 0)));
+        assert_eq!(chunks, 8);
+        assert!(bounds.contains(BlockPos::new(0, -128, 0)));
+        assert!(!bounds.contains(BlockPos::new(0, -129, 0)));
+        assert!(!bounds.contains(BlockPos::new(0, 128, 0)));
     }
 }
