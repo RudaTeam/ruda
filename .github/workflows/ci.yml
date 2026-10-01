@@ -78,3 +78,39 @@ jobs:
         with:
           target: ${{ matrix.target }}
       - run: cargo build --workspace --target ${{ matrix.target }}
+
+  # M0: the client opens a window and presents frames on every tier 1 platform.
+  # Runners have no GPU, so Linux renders with Mesa (lavapipe, llvmpipe) under
+  # Xvfb and Windows with WARP.
+  smoke:
+    name: Smoke (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux x86_64, os: ubuntu-24.04, backends: vulkan gl }
+          - { name: Linux aarch64, os: ubuntu-24.04-arm, backends: vulkan gl }
+          - { name: Windows x86_64, os: windows-2025, backends: dx12 }
+          - { name: macOS aarch64, os: macos-15, backends: metal }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: Install software rendering
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb mesa-vulkan-drivers libvulkan1 \
+            libegl1 libegl-mesa0 libgl1-mesa-dri libxkbcommon-x11-0 libxcursor1 libxrandr2 libxi6
+      - run: cargo build -p ruda
+      - name: Present frames
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          wrap=()
+          if [ "$RUNNER_OS" = Linux ]; then wrap=(xvfb-run -a); fi
+          for backend in ${{ matrix.backends }}; do
+            echo "::group::$backend"
+            "${wrap[@]}" target/debug/ruda --gpu-backend "$backend" --exit-after-frames 60
+            echo "::endgroup::"
+          done
