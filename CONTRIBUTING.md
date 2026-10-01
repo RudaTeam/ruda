@@ -33,10 +33,10 @@ license). You keep the copyright on your work, and there is no CLA to sign.
    cargo deny check    # cargo install cargo-deny --locked
    ```
 
-3. Open a pull request. Pull requests are rebase-merged, which keeps commit
-   authorship intact, so squash your branch into one commit (or a few
-   meaningful ones) before it is merged. The **CI passed** check has to be
-   green.
+3. Open a pull request. Merging fast-forwards `main` to your branch, so the
+   commits land exactly as you made them. Rebase onto the latest `main` and
+   squash the branch into one commit (or a few meaningful ones). The
+   **CI passed** check has to be green.
 
 ## Assets
 
