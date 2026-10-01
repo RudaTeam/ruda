@@ -149,6 +149,38 @@ fn chunk_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>
     return out;
 }
 
+// Blocks that aren't cubes, as triangles; see `ModelVertex` in `mesh.rs`.
+@vertex
+fn model_vertex(@location(0) vertex: vec4<u32>) -> ChunkVertex {
+    let local = vec3<f32>(
+        f32(vertex.x & 1023u),
+        f32((vertex.x >> 10u) & 1023u),
+        f32((vertex.x >> 20u) & 1023u),
+    ) / 16.0 - 16.0;
+    let slot = vertex.y >> 18u;
+    let texel = vec2<i32>(i32(slot % ORIGINS_WIDTH), i32(slot / ORIGINS_WIDTH));
+    let origin = textureLoad(chunk_origins, texel, 0).xyz;
+    let position = vec3<f32>(origin - globals.camera_block.xyz) + local - globals.camera_fract.xyz;
+
+    var out: ChunkVertex;
+    out.clip = globals.view_proj * vec4<f32>(position, 1.0);
+    out.uv = vec2<f32>(f32(vertex.y & 31u), f32((vertex.y >> 5u) & 31u)) / 16.0;
+    out.layer = (vertex.y >> 10u) & 255u;
+    var shades = array<f32, 6>(0.8, 0.8, 1.0, 0.55, 0.7, 0.7);
+    out.shade = shades[(vertex.z >> 16u) & 7u];
+    out.distance = length(position);
+    let light = vertex.z & 0xffffu;
+    out.light = vec4<f32>(
+        f32(light & 15u),
+        f32((light >> 4u) & 15u),
+        f32((light >> 8u) & 15u),
+        f32((light >> 12u) & 15u),
+    ) / 15.0;
+    out.occlusion = 1.0;
+    out.glows = (vertex.x >> 30u) & 1u;
+    return out;
+}
+
 @fragment
 fn chunk_fragment(in: ChunkVertex) -> @location(0) vec4<f32> {
     let texel = textureSample(block_textures, block_sampler, in.uv, in.layer).rgb;

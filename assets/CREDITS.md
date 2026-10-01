@@ -17,6 +17,7 @@ Changes made for Ruda:
   over its stone texture;
 - `grass_side.png` is the pack's grass side overlay drawn over its dirt texture;
 - `bedrock.png` is the pack's cobblestone texture, darkened and with more contrast;
+- `torch.png` is the pack's `default_torch_on_floor.png`, unchanged;
 - `lamp.png` is the pack's `default_meselamp.png`, and `sky/sun.png` and
   `sky/moon.png` are its `misc/sun.png` and `misc/moon.png`, unchanged;
 - files are renamed to Ruda's block names.

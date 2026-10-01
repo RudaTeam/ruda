@@ -158,14 +158,14 @@ impl Client {
         self.send(&ClientMessage::ViewDistance(chunks));
     }
 
-    /// Breaks a solid block. Returns false if there is nothing that can be
-    /// broken.
+    /// Breaks a block. Returns false if there is nothing that can be broken.
     pub fn break_block(&mut self, pos: BlockPos) -> bool {
+        let blocks = self.content.blocks();
         let breakable = self
             .world
             .block(pos)
-            .is_some_and(|block| self.content.blocks().is_breakable(block));
-        if !self.is_solid(pos) || !breakable {
+            .is_some_and(|block| blocks.is_visible(block) && blocks.is_breakable(block));
+        if !breakable {
             return false;
         }
         let seq = self.next_seq();
@@ -173,14 +173,18 @@ impl Client {
         true
     }
 
-    /// Places `block` into an empty cell. Returns false if that isn't possible.
+    /// Places `block` into an empty cell; a torch needs a solid block to
+    /// hold on to. Returns false if that isn't possible.
     pub fn place_block(&mut self, pos: BlockPos, block: BlockId) -> bool {
         let blocks = self.content.blocks();
-        let empty = self.world.block(pos).is_some() && !self.is_solid(pos);
+        let empty = self.world.block(pos) == Some(BlockId::AIR);
         let inside = self.bounds.is_some_and(|bounds| bounds.contains(pos));
         let placeable =
-            block != BlockId::UNKNOWN && blocks.is_solid(block) && blocks.is_breakable(block);
-        if !empty || !inside || !placeable {
+            block != BlockId::UNKNOWN && blocks.is_visible(block) && blocks.is_breakable(block);
+        let supported = blocks
+            .support(block)
+            .is_none_or(|face| self.is_solid(pos.offset(face)));
+        if !empty || !inside || !placeable || !supported {
             return false;
         }
         let seq = self.next_seq();
@@ -213,6 +217,14 @@ impl Client {
                 reason: reason.to_owned(),
             });
         }
+    }
+
+    /// Whether the block at `pos` is loaded and can be aimed at: anything
+    /// but air.
+    pub fn is_targetable(&self, pos: BlockPos) -> bool {
+        self.world
+            .block(pos)
+            .is_some_and(|block| self.content.blocks().is_visible(block))
     }
 
     /// Whether the block at `pos` is loaded and solid.

@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use wgpu::rwh::{HasDisplayHandle, HasWindowHandle};
 
 pub use camera::{Camera, Frustum};
-pub use mesh::{BlockFaces, ChunkMesh, PaddedChunk, Quad, mesh_chunk};
+pub use mesh::{BlockFaces, ChunkMesh, ModelVertex, PaddedChunk, Quad, mesh_chunk};
 pub use mesher::ChunkMesher;
 pub use textures::BlockTextures;
 pub use visibility::Visibility;

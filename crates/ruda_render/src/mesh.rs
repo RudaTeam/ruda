@@ -3,7 +3,7 @@
 
 use ruda_core::{
     Appearance, BlockId, BlockRegistry, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, Face, Light, LocalPos,
-    ResourceId,
+    Mount, ResourceId,
 };
 use ruda_world::World;
 
@@ -14,11 +14,19 @@ const SIZE: usize = CHUNK_SIZE as usize;
 const PADDED: usize = SIZE + 2;
 
 /// For every block, the texture layer of each face, or `None` for blocks
-/// that are not drawn, and whether it glows.
+/// that are not cubes, whether it glows, and the model of blocks that
+/// aren't cubes.
 #[derive(Clone, Debug, Default)]
 pub struct BlockFaces {
     faces: Vec<Option<[u16; 6]>>,
     glowing: Vec<bool>,
+    models: Vec<Option<Model>>,
+}
+
+/// A block drawn from triangles rather than as a cube.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Model {
+    Torch { layer: u16, mount: Mount },
 }
 
 impl BlockFaces {
@@ -27,14 +35,32 @@ impl BlockFaces {
         let faces = blocks
             .iter()
             .map(|(_, def)| match &def.appearance {
-                Appearance::Invisible => None,
                 Appearance::Cube(textures) => {
                     Some(Face::ALL.map(|face| layer(textures.for_face(face))))
                 }
+                _ => None,
             })
             .collect();
         let glowing = blocks.iter().map(|(_, def)| !def.light.is_dark()).collect();
-        Self { faces, glowing }
+        let models = blocks
+            .iter()
+            .map(|(id, def)| match &def.appearance {
+                Appearance::Torch { texture } => Some(Model::Torch {
+                    layer: layer(texture),
+                    mount: blocks.mount(id)?,
+                }),
+                _ => None,
+            })
+            .collect();
+        Self {
+            faces,
+            glowing,
+            models,
+        }
+    }
+
+    fn model(&self, id: BlockId) -> Option<Model> {
+        self.models.get(id.index()).copied().flatten()
     }
 
     fn get(&self, id: BlockId) -> Option<[u16; 6]> {
@@ -153,6 +179,74 @@ fn plane_axes(axis: usize) -> (usize, usize) {
 ///
 /// Corner `i` is at u = `i & 1`, v = `i >> 1` of the face.
 pub type Quad = [u32; 4];
+
+/// A vertex of a block model, packed into four words like a [`Quad`]:
+///
+/// - word 0: x, y, z relative to the chunk in sixteenths of a block, plus
+///   256 (10 bits each), and whether it glows (1 bit);
+/// - word 1: texture u and v in pixels (5 bits each), texture layer (8 bits),
+///   and 14 bits the renderer fills in;
+/// - word 2: light (16 bits) and the face it shades like (3 bits).
+pub type ModelVertex = [u32; 4];
+
+/// The corners of the faces of a box, counter-clockwise seen from outside;
+/// bits 0, 1, 2 of each are x, y, z.
+const BOX_FACES: [(Face, [u8; 4]); 6] = [
+    (Face::PosX, [0b101, 0b001, 0b011, 0b111]),
+    (Face::NegX, [0b000, 0b100, 0b110, 0b010]),
+    (Face::PosY, [0b110, 0b111, 0b011, 0b010]),
+    (Face::NegY, [0b000, 0b001, 0b101, 0b100]),
+    (Face::PosZ, [0b100, 0b101, 0b111, 0b110]),
+    (Face::NegZ, [0b001, 0b000, 0b010, 0b011]),
+];
+
+/// A torch: a 2×10×2-pixel stick. On a wall it starts at the wall and its
+/// top leans 4 pixels out. Positions are in sixteenths of a block.
+fn torch_vertices(
+    block: [u32; 3],
+    mount: Mount,
+    layer: u16,
+    light: Light,
+    out: &mut Vec<ModelVertex>,
+) {
+    let corner = |bits: u8| -> [i32; 3] {
+        let [x, y, z] = [bits & 1, bits >> 1 & 1, bits >> 2 & 1].map(i32::from);
+        match mount {
+            Mount::Floor => [7 + 2 * x, 10 * y, 7 + 2 * z],
+            Mount::Wall(facing) => {
+                let out_axis = facing.axis();
+                let sign = if facing.is_positive() { 1 } else { -1 };
+                // Middle of the stick along the way it leans, bottom to top.
+                let middle = if facing.is_positive() { 1 } else { 15 } + 4 * sign * y;
+                let mut position = [7 + 2 * x, 3 + 10 * y, 7 + 2 * z];
+                let along = [x, y, z][out_axis];
+                position[out_axis] = middle + 2 * along - 1;
+                position
+            }
+        }
+    };
+    let origin = block.map(|c| c as i32 * 16);
+    for (face, corners) in BOX_FACES {
+        // Pixels of the texture: the stick's sides, its flame or its end.
+        let (top, bottom) = match face {
+            Face::PosY => (6, 8),
+            Face::NegY => (14, 16),
+            _ => (6, 16),
+        };
+        let uv = [(7, bottom), (9, bottom), (9, top), (7, top)];
+        for index in [0, 1, 2, 0, 2, 3] {
+            let p = corner(corners[index]);
+            let [x, y, z] = [0, 1, 2].map(|axis| (origin[axis] + p[axis] + 256) as u32);
+            let (u, v) = uv[index];
+            out.push([
+                x | y << 10 | z << 20 | 1 << 30,
+                u | v << 5 | u32::from(layer & 0xff) << 10,
+                u32::from(light.to_raw()) | (face.index() as u32) << 16,
+                0,
+            ]);
+        }
+    }
+}
 
 /// Everything that has to match for neighbouring faces to merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,6 +390,8 @@ fn face_look(
 pub struct ChunkMesh {
     /// Grouped by the direction they face, in [`Face::ALL`] order.
     pub quads: Vec<Quad>,
+    /// Triangles of the blocks that aren't cubes.
+    pub models: Vec<ModelVertex>,
     /// How many quads face each direction, in [`Face::ALL`] order.
     pub face_counts: [u32; 6],
     pub visibility: Visibility,
@@ -305,6 +401,7 @@ impl Default for ChunkMesh {
     fn default() -> Self {
         Self {
             quads: Vec::new(),
+            models: Vec::new(),
             face_counts: [0; 6],
             visibility: Visibility::ALL,
         }
@@ -313,7 +410,7 @@ impl Default for ChunkMesh {
 
 impl ChunkMesh {
     pub fn is_empty(&self) -> bool {
-        self.quads.is_empty()
+        self.quads.is_empty() && self.models.is_empty()
     }
 }
 
@@ -395,6 +492,16 @@ pub fn mesh_chunk(chunk: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
         face_counts[face.index()] = (quads.len() - before) as u32;
     }
 
+    let mut models = Vec::new();
+    for index in 0..CHUNK_VOLUME {
+        let local = LocalPos::from_index(index);
+        let padded = [local.x(), local.y(), local.z()].map(|c| c as usize + 1);
+        if let Some(Model::Torch { layer, mount }) = faces.model(chunk.get(padded)) {
+            let block = [local.x(), local.y(), local.z()];
+            torch_vertices(block, mount, layer, chunk.light(padded), &mut models);
+        }
+    }
+
     // The chunk's own solid blocks as rows along x.
     let mut solid = [[0u32; SIZE]; SIZE];
     for (y, rows) in solid.iter_mut().enumerate() {
@@ -404,6 +511,7 @@ pub fn mesh_chunk(chunk: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
     }
     ChunkMesh {
         quads,
+        models,
         face_counts,
         visibility: Visibility::of(&solid),
     }
@@ -619,6 +727,53 @@ mod tests {
         }
         assert!(!mesh.visibility.connects(Face::NegY, Face::PosY));
         assert!(mesh.visibility.connects(Face::NegX, Face::PosX));
+    }
+
+    #[test]
+    fn torches_are_models_on_the_floor_or_leaning_off_a_wall() {
+        let mut content = ContentBuilder::new();
+        let id: ResourceId = "test:torch".parse().unwrap();
+        let torch = content
+            .add_block(BlockDef::new(id.clone(), Appearance::Torch { texture: id }))
+            .unwrap();
+        let content = content.build();
+        let blocks = content.blocks();
+        let faces = BlockFaces::new(blocks, |_| 3);
+
+        // Sixteenths of a block within the block at local (x, y, z).
+        let positions = |mount_face: Face| {
+            let mut chunk = Chunk::filled(BlockId::AIR);
+            chunk.set(
+                LocalPos::new(4, 5, 6),
+                blocks.placed(torch, mount_face).unwrap(),
+            );
+            let padded = PaddedChunk::gather(&world_with(chunk), ChunkPos::new(0, 0, 0)).unwrap();
+            let mesh = mesh_chunk(&padded, &faces);
+            assert!(mesh.quads.is_empty());
+            assert_eq!(mesh.models.len(), 36);
+            mesh.models
+                .iter()
+                .map(|v| {
+                    let [x, y, z] = [0, 10, 20].map(|shift| ((v[0] >> shift) & 1023) as i32 - 256);
+                    [x - 64, y - 80, z - 96]
+                })
+                .collect::<Vec<_>>()
+        };
+        let range = |points: &[[i32; 3]], axis: usize| {
+            let values = points.iter().map(|p| p[axis]);
+            (values.clone().min().unwrap(), values.max().unwrap())
+        };
+
+        let floor = positions(Face::PosY);
+        assert_eq!(range(&floor, 0), (7, 9));
+        assert_eq!(range(&floor, 1), (0, 10));
+
+        // Hanging on the block at +z, leaning towards −z.
+        let wall = positions(Face::NegZ);
+        assert_eq!(range(&wall, 2), (10, 16));
+        assert_eq!(range(&wall, 1), (3, 13));
+        let bottom: Vec<[i32; 3]> = wall.iter().copied().filter(|p| p[1] == 3).collect();
+        assert_eq!(range(&bottom, 2), (14, 16));
     }
 
     #[test]

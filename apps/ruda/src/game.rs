@@ -210,7 +210,7 @@ impl Game {
             self.camera.position,
             self.camera.forward().as_dvec3(),
             REACH - 1.0,
-            |pos| client.is_solid(pos),
+            |pos| client.is_targetable(pos),
         );
 
         let mut control = Control::Continue;
@@ -228,6 +228,13 @@ impl Game {
                 Action::Pause => control = Control::Pause,
                 _ => {}
             }
+        }
+        // The wheel walks through the hotbar, away from the player meaning
+        // back.
+        let steps = self.input.take_scroll();
+        if cursor_grabbed && steps != 0 && !self.hotbar.is_empty() {
+            let len = self.hotbar.len() as i32;
+            self.selected = (self.selected as i32 - steps).rem_euclid(len) as usize;
         }
 
         let center = BlockPos(self.camera.position.floor().as_ivec3()).chunk();
@@ -275,7 +282,11 @@ impl Game {
         if pos == BlockPos(self.camera.position.floor().as_ivec3()) {
             return;
         }
-        self.client.place_block(pos, self.hotbar[self.selected].1);
+        // A torch hangs on the wall or stands on the floor it was put against.
+        let block = self.hotbar[self.selected].1;
+        if let Some(block) = self.client.content().blocks().placed(block, hit.face) {
+            self.client.place_block(pos, block);
+        }
     }
 
     /// How far the world is loaded and drawn, in chunks.

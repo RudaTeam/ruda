@@ -48,6 +48,7 @@ pub(crate) struct WorldPass {
     sky_pipeline: wgpu::RenderPipeline,
     celestial_pipeline: wgpu::RenderPipeline,
     chunk_pipeline: wgpu::RenderPipeline,
+    model_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     crosshair_pipeline: wgpu::RenderPipeline,
     chunks: HashMap<ChunkPos, ChunkEntry>,
@@ -71,7 +72,11 @@ struct ChunkEntry {
 struct GpuChunk {
     slot: u32,
     page: usize,
+    /// Everything allocated for the chunk: its quads, then its model
+    /// vertices, 16 bytes each.
+    space: Range<u32>,
     quads: Range<u32>,
+    models: Range<u32>,
     face_counts: [u32; 6],
 }
 
@@ -249,6 +254,26 @@ impl WorldPass {
                 shader_location: 0,
             }],
         };
+        let model_buffer = wgpu::VertexBufferLayout {
+            array_stride: QUAD_BYTES,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32x4,
+                offset: 0,
+                shader_location: 0,
+            }],
+        };
+        let model_pipeline = pipeline(
+            "block models",
+            &layout,
+            "model_vertex",
+            "chunk_fragment",
+            &[Some(model_buffer)],
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::Face::Back),
+            (true, wgpu::CompareFunction::Less),
+            None,
+        );
         let chunk_pipeline = pipeline(
             "chunks",
             &layout,
@@ -318,6 +343,7 @@ impl WorldPass {
             sky_pipeline,
             celestial_pipeline,
             chunk_pipeline,
+            model_pipeline,
             outline_pipeline,
             crosshair_pipeline,
             chunks: HashMap::new(),
@@ -381,7 +407,7 @@ impl WorldPass {
         mesh: &ChunkMesh,
     ) {
         self.remove(pos);
-        let gpu = if mesh.quads.is_empty() {
+        let gpu = if mesh.is_empty() {
             None
         } else {
             self.place(device, queue, pos, mesh)
@@ -407,13 +433,13 @@ impl WorldPass {
             warn!(?pos, "too many chunks with geometry, not drawing this one");
             return None;
         };
-        let len = mesh.quads.len() as u32;
+        let len = (mesh.quads.len() + mesh.models.len()) as u32;
         let found = self
             .pages
             .iter_mut()
             .enumerate()
             .find_map(|(index, page)| Some((index, page.space.allocate(len)?)));
-        let (page, quads) = match found {
+        let (page, space) = match found {
             Some(found) => found,
             None => {
                 let size = PAGE_QUADS.max(len);
@@ -432,19 +458,21 @@ impl WorldPass {
             }
         };
 
+        // Quads and model vertices both carry the slot in bits 18 to 31 of
+        // their second word.
         let bytes: Vec<u8> = mesh
             .quads
             .iter()
-            .flat_map(|&[shape, look, light_a, light_b]| {
-                [shape, look | slot << 18, light_a, light_b]
-            })
+            .chain(&mesh.models)
+            .flat_map(|&[a, b, c, d]| [a, b | slot << 18, c, d])
             .flat_map(u32::to_le_bytes)
             .collect();
         queue.write_buffer(
             &self.pages[page].buffer,
-            u64::from(quads.start) * QUAD_BYTES,
+            u64::from(space.start) * QUAD_BYTES,
             &bytes,
         );
+        let quads_end = space.start + mesh.quads.len() as u32;
         let origin = pos.origin().0;
         let texel: Vec<u8> = [origin.x, origin.y, origin.z, 0]
             .into_iter()
@@ -472,14 +500,16 @@ impl WorldPass {
         Some(GpuChunk {
             slot,
             page,
-            quads,
+            quads: space.start..quads_end,
+            models: quads_end..space.end,
+            space,
             face_counts: mesh.face_counts,
         })
     }
 
     pub(crate) fn remove(&mut self, pos: ChunkPos) {
         if let Some(gpu) = self.chunks.remove(&pos).and_then(|entry| entry.gpu) {
-            self.pages[gpu.page].space.free(gpu.quads);
+            self.pages[gpu.page].space.free(gpu.space);
             self.slots.give_back(gpu.slot);
         }
     }
@@ -645,6 +675,22 @@ impl WorldPass {
                 bound = Some(draw.page);
             }
             pass.draw(0..4, draw.quads.clone());
+        }
+
+        pass.set_pipeline(&self.model_pipeline);
+        bound = None;
+        for pos in &self.visible {
+            let Some(gpu) = self.chunks.get(pos).and_then(|entry| entry.gpu.as_ref()) else {
+                continue;
+            };
+            if gpu.models.is_empty() {
+                continue;
+            }
+            if bound != Some(gpu.page) {
+                pass.set_vertex_buffer(0, self.pages[gpu.page].buffer.slice(..));
+                bound = Some(gpu.page);
+            }
+            pass.draw(gpu.models.clone(), 0..1);
         }
 
         if scene.target.is_some() {

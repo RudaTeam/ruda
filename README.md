@@ -14,7 +14,7 @@ What we're aiming for:
 - a modding API that can carry big tech mods: machines, power networks, their own UIs.
 
 It's very early. You can fly around a generated world with hills, caves and
-ore, break and place blocks, and light caves with lamps. Days and nights pass
+ore, break and place blocks, and light caves with lamps and torches. Days and nights pass
 every 20 minutes, light spreads from the sky and from glowing blocks in colour,
 and corners are softly shaded. The world is endless sideways and 256 blocks
 tall, from −128 to +127, with sea level at 0 and unbreakable bedrock at the
@@ -46,7 +46,7 @@ In the game:
 | Space / Left Shift | Up / down |
 | Left Ctrl | Fly faster |
 | Left / right click | Break / place a block |
-| 1–9, 0 | Pick the block to place |
+| 1–9, 0, mouse wheel | Pick the block to place |
 | Esc | Pause menu |
 
 The client takes a few options:

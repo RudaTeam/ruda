@@ -12,7 +12,7 @@ mod id;
 mod light;
 mod pos;
 
-pub use block::{Appearance, BlockDef, BlockId, BlockRegistry, CubeTextures};
+pub use block::{Appearance, BlockDef, BlockId, BlockRegistry, CubeTextures, Mount};
 pub use bounds::WorldBounds;
 pub use content::{Content, ContentBuilder, ContentError};
 pub use face::Face;

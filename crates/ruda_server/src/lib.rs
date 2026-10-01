@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use glam::{DVec3, IVec3};
-use ruda_core::{BlockId, BlockPos, ChunkPos, Content, WorldBounds};
+use ruda_core::{BlockId, BlockPos, ChunkPos, Content, Face, WorldBounds};
 use ruda_net::{ClientConnection, RecvError, ServerConnection, local_pair};
 pub use ruda_protocol::TICK_RATE;
 use ruda_protocol::{ClientMessage, DAY_LENGTH, PROTOCOL_VERSION, REACH, ServerMessage};
@@ -169,10 +169,11 @@ impl Server {
         }
         self.clients.retain(|client| client.connected);
         self.light_chunks();
+        // Before streaming: chunks sent below already carry their new light.
+        self.send_light_changes();
         for index in 0..self.clients.len() {
             self.stream_chunks(index);
         }
-        self.send_light_changes();
         self.ticks += 1;
         self.time += 1;
         if self.ticks.is_multiple_of(u64::from(TICK_RATE)) {
@@ -329,11 +330,17 @@ impl Server {
         let content = Arc::clone(&self.content);
         let blocks = content.blocks();
         let breaking = block == BlockId::AIR;
-        // Players can't place what they couldn't break.
+        // Players can't place what they couldn't break, and torches need
+        // something solid to hold on to.
         let placeable = block != BlockId::UNKNOWN
             && block.index() < blocks.len()
-            && blocks.is_solid(block)
-            && blocks.is_breakable(block);
+            && blocks.is_visible(block)
+            && blocks.is_breakable(block)
+            && blocks.support(block).is_none_or(|face| {
+                self.world
+                    .block(pos.offset(face))
+                    .is_some_and(|support| blocks.is_solid(support))
+            });
         let in_reach = self.clients[index]
             .position
             .is_some_and(|eye| eye.distance(pos.0.as_dvec3() + 0.5) <= REACH);
@@ -341,21 +348,27 @@ impl Server {
         // Breaking needs something breakable there, placing needs an empty cell.
         let target_ok = current.is_some_and(|current| {
             if breaking {
-                blocks.is_solid(current) && blocks.is_breakable(current)
+                blocks.is_visible(current) && blocks.is_breakable(current)
             } else {
-                !blocks.is_solid(current)
+                current == BlockId::AIR
             }
         });
         let allowed =
             (breaking || placeable) && in_reach && self.config.bounds.contains(pos) && target_ok;
 
-        if allowed && let Some(old) = self.world.set_block(pos, block) {
-            let changed = self.light.block_changed(&mut self.world, pos, old);
-            self.light_changed.extend(changed);
-            self.modified.insert(pos.chunk());
-            for client in &mut self.clients {
-                if client.sent.contains(&pos.chunk()) {
-                    client.send(ServerMessage::BlockChanged { pos, block });
+        if allowed {
+            self.change_block(pos, block);
+            // Torches fall when what held them goes.
+            if !blocks.is_solid(block) {
+                for face in Face::ALL {
+                    let near = pos.offset(face);
+                    if self
+                        .world
+                        .block(near)
+                        .is_some_and(|near| blocks.support(near) == Some(face.opposite()))
+                    {
+                        self.change_block(near, BlockId::AIR);
+                    }
                 }
             }
         } else if let Some(current) = current
@@ -367,6 +380,22 @@ impl Server {
             });
         }
         self.clients[index].send(ServerMessage::ActionDone { seq });
+    }
+
+    /// Sets a block, updates the light around it and tells every client that
+    /// has its chunk.
+    fn change_block(&mut self, pos: BlockPos, block: BlockId) {
+        let Some(old) = self.world.set_block(pos, block) else {
+            return;
+        };
+        let changed = self.light.block_changed(&mut self.world, pos, old);
+        self.light_changed.extend(changed);
+        self.modified.insert(pos.chunk());
+        for client in &mut self.clients {
+            if client.sent.contains(&pos.chunk()) {
+                client.send(ServerMessage::BlockChanged { pos, block });
+            }
+        }
     }
 
     /// Sends the nearest missing chunks around the client, asks for the ones
@@ -591,6 +620,7 @@ mod tests {
         client: ClientConnection,
         stone: BlockId,
         bedrock: BlockId,
+        torch: BlockId,
     }
 
     impl Harness {
@@ -609,6 +639,10 @@ mod tests {
                     BlockDef::new(id.clone(), Appearance::Cube(CubeTextures::all(id)))
                         .unbreakable(),
                 )
+                .unwrap();
+            let id: ResourceId = "test:torch".parse().unwrap();
+            let torch = content
+                .add_block(BlockDef::new(id.clone(), Appearance::Torch { texture: id }))
                 .unwrap();
             let config = ServerConfig {
                 view_distance: 1,
@@ -634,6 +668,7 @@ mod tests {
                 client,
                 stone,
                 bedrock,
+                torch,
             }
         }
 
@@ -678,11 +713,16 @@ mod tests {
     }
 
     #[test]
-    fn streams_the_nearest_chunk_first() {
-        let mut harness = Harness::new();
-        harness.join();
-        let first = harness.expect(|m| matches!(m, ServerMessage::Chunk { .. }));
-        assert!(matches!(first, ServerMessage::Chunk { pos, .. } if pos == ChunkPos::new(0, 0, 0)));
+    fn streams_nearer_chunks_first() {
+        // Chunks go out in this order once they are ready.
+        let offsets = view_offsets(3, 2);
+        assert_eq!(offsets[0], IVec3::ZERO);
+        assert!(
+            offsets
+                .windows(2)
+                .all(|pair| pair[0].length_squared() <= pair[1].length_squared())
+        );
+        assert!(offsets.iter().all(|&offset| in_view(offset, 3, 2)));
     }
 
     #[test]
@@ -803,6 +843,53 @@ mod tests {
             unreachable!()
         };
         assert!(later > time);
+    }
+
+    #[test]
+    fn torches_need_and_fall_with_their_support() {
+        let mut harness = Harness::new();
+        harness.join();
+        harness.expect(
+            |m| matches!(m, ServerMessage::Chunk { pos, .. } if *pos == ChunkPos::new(0, 0, 0)),
+        );
+        let blocks = harness.server.content.blocks().clone();
+        let on_floor = blocks.placed(harness.torch, Face::PosY).unwrap();
+        let on_wall = blocks.placed(harness.torch, Face::NegZ).unwrap();
+
+        // Not in mid-air.
+        harness.send(ClientMessage::PlaceBlock {
+            pos: BlockPos::new(3, 3, 3),
+            block: on_floor,
+            seq: 1,
+        });
+        harness.expect(|m| matches!(m, ServerMessage::ActionDone { seq: 1 }));
+        assert_eq!(
+            harness.server.world().block(BlockPos::new(3, 3, 3)),
+            Some(BlockId::AIR)
+        );
+
+        // On the ground, and on the side of a block.
+        let wall = BlockPos::new(3, 0, 5);
+        let hanging = BlockPos::new(3, 0, 4);
+        for (seq, pos, block) in [
+            (2, BlockPos::new(3, 0, 3), on_floor),
+            (3, wall, harness.stone),
+            (4, hanging, on_wall),
+        ] {
+            harness.send(ClientMessage::PlaceBlock { pos, block, seq });
+            harness.expect(|m| matches!(m, ServerMessage::ActionDone { seq: s } if *s == seq));
+            assert_eq!(harness.server.world().block(pos), Some(block));
+        }
+
+        // Without its wall, the torch falls.
+        harness.send(ClientMessage::BreakBlock { pos: wall, seq: 5 });
+        harness.expect(|m| {
+            matches!(m, ServerMessage::BlockChanged { pos, block } if *pos == hanging && *block == BlockId::AIR)
+        });
+        assert_eq!(
+            harness.server.world().block(BlockPos::new(3, 0, 3)),
+            Some(on_floor)
+        );
     }
 
     /// Waits for `count` chunks, then for a few more ticks in case there are

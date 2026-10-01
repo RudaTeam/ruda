@@ -11,7 +11,7 @@ use ruda_worldgen::{Ore, TerrainGenerator, TerrainSettings};
 pub const NAMESPACE: &str = "base";
 
 /// Blocks a player can place, in hotbar order.
-pub const HOTBAR: [&str; 10] = [
+pub const HOTBAR: [&str; 11] = [
     "stone",
     "cobblestone",
     "dirt",
@@ -22,6 +22,7 @@ pub const HOTBAR: [&str; 10] = [
     "copper_ore",
     "iron_ore",
     "lamp",
+    "torch",
 ];
 
 /// The sun and the moon, for the renderer's sky.
@@ -34,7 +35,7 @@ macro_rules! textures {
     };
 }
 
-const TEXTURES: [(&str, &[u8]); 12] = textures![
+const TEXTURES: [(&str, &[u8]); 13] = textures![
     "bedrock",
     "cobblestone",
     "copper_ore",
@@ -47,6 +48,7 @@ const TEXTURES: [(&str, &[u8]); 12] = textures![
     "planks",
     "sand",
     "stone",
+    "torch",
 ];
 
 /// Blocks that look the same from every side, with a texture of the same name.
@@ -84,6 +86,15 @@ pub fn register(content: &mut ContentBuilder) -> Result<(), ContentError> {
     let bedrock = CubeTextures::all(id("bedrock")?);
     content.add_block(BlockDef::new(id("bedrock")?, Appearance::Cube(bedrock)).unbreakable())?;
     // A warm, amber light.
+    content.add_block(
+        BlockDef::new(
+            id("torch")?,
+            Appearance::Torch {
+                texture: id("torch")?,
+            },
+        )
+        .emits_light(14, 11, 6),
+    )?;
     let lamp = CubeTextures::all(id("lamp")?);
     content.add_block(BlockDef::new(id("lamp")?, Appearance::Cube(lamp)).emits_light(15, 12, 7))?;
     Ok(())
@@ -143,11 +154,15 @@ mod tests {
     fn every_block_texture_is_registered() {
         let content = content();
         for (_, def) in content.blocks().iter() {
-            let Appearance::Cube(textures) = &def.appearance else {
-                continue;
+            let textures: Vec<&ResourceId> = match &def.appearance {
+                Appearance::Cube(textures) => Face::ALL
+                    .iter()
+                    .map(|&face| textures.for_face(face))
+                    .collect(),
+                Appearance::Torch { texture } => vec![texture],
+                Appearance::Invisible => continue,
             };
-            for face in Face::ALL {
-                let texture = textures.for_face(face);
+            for texture in textures {
                 if texture.namespace() == NAMESPACE {
                     assert!(
                         content.texture(texture).is_some(),

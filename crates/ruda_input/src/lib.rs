@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use glam::{Vec2, Vec3};
-use winit::event::{DeviceEvent, ElementState, MouseButton, WindowEvent};
+use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 /// Something the player wants to do.
@@ -71,6 +71,8 @@ pub struct Input {
     held: HashSet<Action>,
     pressed: Vec<Action>,
     look: Vec2,
+    /// Mouse wheel turns, in lines; positive is away from the player.
+    scroll: f32,
 }
 
 impl Input {
@@ -90,6 +92,13 @@ impl Input {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 self.button(Button::Mouse(*button), *state == ElementState::Pressed);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.scroll += match delta {
+                    MouseScrollDelta::LineDelta(_, lines) => *lines,
+                    // Touchpads scroll in pixels; call a line 40 of them.
+                    MouseScrollDelta::PixelDelta(pixels) => pixels.y as f32 / 40.0,
+                };
             }
             // Keys released while the window was in the background never
             // report it.
@@ -124,6 +133,7 @@ impl Input {
         self.held.clear();
         self.pressed.clear();
         self.look = Vec2::ZERO;
+        self.scroll = 0.0;
     }
 
     pub fn is_held(&self, action: Action) -> bool {
@@ -138,6 +148,14 @@ impl Input {
     /// Mouse movement since the last call, in device units.
     pub fn take_look(&mut self) -> Vec2 {
         std::mem::take(&mut self.look)
+    }
+
+    /// Whole mouse wheel steps since the last call, positive away from the
+    /// player; the rest of a step carries over.
+    pub fn take_scroll(&mut self) -> i32 {
+        let steps = self.scroll.trunc();
+        self.scroll -= steps;
+        steps as i32
     }
 
     /// Desired movement: x to the right, y up, z forward, each from −1 to 1.
