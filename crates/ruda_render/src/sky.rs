@@ -9,6 +9,10 @@ use ruda_core::Light;
 
 use crate::atmosphere::{Lit, SkyTables};
 
+/// How far the sun's path across the sky leans to the south: at noon a
+/// block's shadow is about half a block long instead of shrinking to
+/// nothing under it.
+const SUN_PATH_TILT: f32 = 25.0_f32.to_radians();
 /// The moon's light next to the sun's: far brighter than in life, so nights
 /// are dark but not black.
 const MOONLIGHT: f32 = 0.03;
@@ -185,8 +189,8 @@ impl SkyLook {
     /// light.
     pub(crate) fn at(time_of_day: f32, eye: Eye, cover: f32) -> Self {
         let angle = time_of_day.rem_euclid(1.0) * TAU;
-        // East to west, tilted a little to the south.
-        let sun = Vec3::new(angle.cos(), angle.sin(), 0.25).normalize();
+        // East to west, tilted to the south.
+        let sun = Vec3::new(angle.cos(), angle.sin(), SUN_PATH_TILT.tan()).normalize();
         let day = smoothstep(-0.15, 0.15, sun.y);
         let tables = SkyTables::get();
         let by_sun = tables.light(sun, 1.0);

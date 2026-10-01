@@ -171,12 +171,15 @@ impl Menu {
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.add_space(8.0);
 
+                        let heading = |ui: &mut Ui, id| {
+                            ui.label(
+                                RichText::new(t(id))
+                                    .strong()
+                                    .color(Color32::from_rgb(232, 128, 48)),
+                            )
+                        };
                         let graphics = &mut settings.graphics;
-                        ui.label(
-                            RichText::new(t("settings-graphics"))
-                                .strong()
-                                .color(Color32::from_rgb(232, 128, 48)),
-                        );
+                        heading(ui, "settings-graphics");
                         egui::Grid::new("graphics")
                             .num_columns(2)
                             .spacing([24.0, 14.0])
@@ -256,6 +259,10 @@ impl Menu {
                                         ),
                                     );
                                 });
+                                ui.end_row();
+
+                                ui.label(t("settings-view-bobbing"));
+                                ui.checkbox(&mut graphics.view_bobbing, "");
                                 ui.end_row();
 
                                 ui.label(t("settings-fps-limit"));
@@ -381,6 +388,13 @@ impl Menu {
                                             }
                                         }
                                     });
+                                ui.end_row();
+
+                                heading(ui, "settings-controls");
+                                ui.end_row();
+                                ui.label(t("settings-auto-jump"));
+                                ui.checkbox(&mut settings.controls.auto_jump, "")
+                                    .on_hover_text(t("settings-auto-jump-note"));
                                 ui.end_row();
                             });
                     });

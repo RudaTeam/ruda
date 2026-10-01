@@ -73,6 +73,12 @@ impl LightEngine {
         self.lit.contains(&pos)
     }
 
+    /// Takes a chunk that was lit elsewhere, like one the server sent with
+    /// its light: changes nearby spread through it from now on.
+    pub fn mark_lit(&mut self, pos: ChunkPos) {
+        self.lit.insert(pos);
+    }
+
     /// The chunk above `pos`, if it has to be lit before `pos` can be.
     pub fn needs_above(&self, pos: ChunkPos) -> Option<ChunkPos> {
         (pos.0.y < *self.world_y.end()).then(|| ChunkPos(pos.0 + IVec3::Y))

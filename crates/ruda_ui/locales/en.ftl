@@ -23,6 +23,7 @@ settings-view-distance-value = { $chunks } { $chunks ->
 } ({ $blocks } blocks)
 settings-fov = Field of view
 settings-fov-value = { $degrees }°
+settings-view-bobbing = View bobbing
 settings-fps-limit = Frame rate limit
 settings-fps-limit-off = Unlimited
 settings-fps-limit-value = { $fps } FPS
@@ -42,4 +43,7 @@ settings-gpu-api = Graphics API
 settings-gpu-api-auto = Automatic
 settings-restart-note = Takes effect after a restart
 settings-language = Language
+settings-controls = Controls
+settings-auto-jump = Auto-jump
+settings-auto-jump-note = Jumps onto a block you walk into
 settings-back = Back

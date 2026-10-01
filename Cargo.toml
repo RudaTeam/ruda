@@ -19,6 +19,7 @@ ruda_net = { path = "crates/ruda_net" }
 ruda_protocol = { path = "crates/ruda_protocol" }
 ruda_render = { path = "crates/ruda_render" }
 ruda_server = { path = "crates/ruda_server" }
+ruda_sim = { path = "crates/ruda_sim" }
 ruda_ui = { path = "crates/ruda_ui" }
 ruda_world = { path = "crates/ruda_world" }
 ruda_worldgen = { path = "crates/ruda_worldgen" }

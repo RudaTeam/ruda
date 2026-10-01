@@ -4,15 +4,15 @@
 //! passes them through an in-memory channel, multiplayer over the network,
 //! and either way the client learns about the world only from these.
 
-use glam::DVec3;
 use ruda_core::{BlockId, BlockPos, ChunkPos, ResourceId, WorldBounds};
+pub use ruda_sim::{PlayerInput, PlayerState};
 use ruda_world::lod::{LodTile, LodTilePos};
 use ruda_world::{Chunk, ChunkLight};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Simulation steps per second.
 pub const TICK_RATE: u32 = 20;
@@ -22,7 +22,7 @@ pub const TICK_RATE: u32 = 20;
 pub const DAY_LENGTH: u64 = 24_000;
 
 /// How far a player can reach to break or place blocks, measured in blocks
-/// from the eye to the block's centre. Clients aim within it and the server
+/// from the eyes to the block's centre. Clients aim within it and the server
 /// rejects actions beyond it.
 pub const REACH: f64 = 8.0;
 
@@ -31,8 +31,9 @@ pub const REACH: f64 = 8.0;
 pub enum ClientMessage {
     /// The first message on a new connection.
     Hello { protocol: u32, name: String },
-    /// Where the player's camera is. The server streams the chunks around it.
-    Position(DVec3),
+    /// What the player wants to do this tick; sent every tick. The server
+    /// moves the player by it and answers with [`ServerMessage::Player`].
+    Input(PlayerInput),
     /// How far, in chunks, the client wants the world around it. The server
     /// may send less.
     ViewDistance(u8),
@@ -56,7 +57,6 @@ pub enum ServerMessage {
     /// Accepts the connection. Block id `n` of this session is `blocks[n]`.
     Welcome {
         blocks: Vec<ResourceId>,
-        spawn: DVec3,
         bounds: WorldBounds,
         /// Ticks since the world began, see [`DAY_LENGTH`].
         time: u64,
@@ -66,6 +66,10 @@ pub enum ServerMessage {
     },
     /// Closes the connection.
     Disconnect { reason: String },
+    /// Where this client's player is and how it moves, once the server has
+    /// applied its inputs up to `ack`. Also puts the player somewhere: where
+    /// it starts, or where the server moved it.
+    Player { ack: u32, state: PlayerState },
     /// A chunk with its light. The server sends chunks only once their
     /// light is final; later it changes only with [`ServerMessage::Light`].
     Chunk { pos: ChunkPos, chunk: Chunk },
@@ -115,7 +119,13 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             name: "player".into(),
         });
-        round_trip(ClientMessage::Position(DVec3::new(1.5, -2.0, 1e9)));
+        round_trip(ClientMessage::Input(PlayerInput {
+            seq: 3,
+            walk: glam::Vec2::new(0.5, -1.0),
+            yaw: 1.5,
+            jump: true,
+            ..Default::default()
+        }));
         round_trip(ClientMessage::PlaceBlock {
             pos: BlockPos::new(-1, 2, -3),
             block: BlockId::from_raw(7),
@@ -130,7 +140,6 @@ mod tests {
         });
         round_trip(ServerMessage::Welcome {
             blocks: vec!["ruda:air".parse().unwrap(), "base:stone".parse().unwrap()],
-            spawn: DVec3::new(0.5, 70.0, 0.5),
             bounds: WorldBounds::DEFAULT,
             time: 1234,
             sky_seed: 99,
@@ -140,6 +149,10 @@ mod tests {
             light: ChunkLight::uniform(ruda_core::Light::SKY),
         });
         round_trip(ServerMessage::Time(99));
+        round_trip(ServerMessage::Player {
+            ack: 7,
+            state: PlayerState::flying(glam::DVec3::new(0.5, 70.0, -1e9)),
+        });
         round_trip(ServerMessage::LodTile {
             pos: LodTilePos::new(-3, 4),
             tile: LodTile {
@@ -153,7 +166,6 @@ mod tests {
     fn rejects_invalid_resource_ids() {
         let message = ServerMessage::Welcome {
             blocks: vec!["base:stone".parse().unwrap()],
-            spawn: DVec3::ZERO,
             bounds: WorldBounds::DEFAULT,
             time: 0,
             sky_seed: 0,

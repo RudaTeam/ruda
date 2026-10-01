@@ -3,9 +3,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use glam::DVec3;
-use ruda_client::{Client, Event};
-use ruda_core::{BlockId, ContentBuilder, WorldBounds};
+use glam::{DVec3, Vec2};
+use ruda_client::Client;
+use ruda_core::{BlockId, ChunkPos, ContentBuilder, Light, WorldBounds};
+use ruda_protocol::PlayerInput;
 use ruda_server::{Server, ServerConfig};
 use ruda_world::{RayHit, raycast};
 
@@ -32,19 +33,37 @@ impl Game {
         Self { server, client }
     }
 
-    /// Runs both sides until `done` holds, collecting the client's events.
-    fn run_until(&mut self, mut done: impl FnMut(&Client, &[Event]) -> bool) -> Vec<Event> {
-        let mut events = Vec::new();
+    /// Runs both sides until `done` holds.
+    fn run_until(&mut self, mut done: impl FnMut(&Client) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             self.server.tick();
-            events.extend(self.client.update());
-            if done(&self.client, &events) {
-                return events;
+            for _ in self.client.update() {}
+            if done(&self.client) {
+                return;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        panic!("timed out; events so far: {events:?}");
+        panic!("timed out");
+    }
+
+    /// Joins and waits for the world around the player: the chunks its feet
+    /// are in, below them and to the side.
+    fn join(&mut self) -> DVec3 {
+        self.run_until(|client| client.player().is_some());
+        let feet = self.client.player().unwrap().position;
+        let chunk = ruda_core::BlockPos(feet.floor().as_ivec3()).chunk().0;
+        self.run_until(|client| {
+            (-1..=0).all(|y| {
+                (-1..=1).all(|z| {
+                    (-1..=1).all(|x| {
+                        let pos = ChunkPos(chunk + glam::IVec3::new(x, y, z));
+                        client.world().chunk(pos).is_some()
+                    })
+                })
+            })
+        });
+        feet
     }
 }
 
@@ -55,22 +74,20 @@ fn ground_below(client: &Client, from: DVec3) -> Option<RayHit> {
 #[test]
 fn joins_receives_terrain_and_edits_it() {
     let mut game = Game::new();
-    let events =
-        game.run_until(|_, events| events.iter().any(|e| matches!(e, Event::Joined { .. })));
-    let Some(Event::Joined { spawn }) = events
-        .into_iter()
-        .find(|e| matches!(e, Event::Joined { .. }))
-    else {
-        unreachable!()
-    };
-    game.client.set_position(spawn);
-
-    // Wait for the ground under the spawn point.
-    game.run_until(|client, _| ground_below(client, spawn).is_some());
-    let ground = ground_below(&game.client, spawn).unwrap();
+    let feet = game.join();
+    // The player starts standing on the ground.
+    let ground = ground_below(&game.client, feet + DVec3::Y * 0.5).unwrap();
+    assert!(ground.distance < 0.5 + 1e-9);
 
     assert!(game.client.break_block(ground.block));
-    game.run_until(|client, _| client.pending_actions() == 0);
+    // The hole is lit right away, not only once the server's light comes.
+    let light = |client: &Client| {
+        let chunk = client.world().chunk(ground.block.chunk()).unwrap();
+        chunk.light().get(ground.block.local())
+    };
+    assert_eq!(light(&game.client).sky(), Light::MAX);
+    game.run_until(|client| client.pending_actions() == 0);
+    assert_eq!(light(&game.client).sky(), Light::MAX);
     assert_eq!(game.server.world().block(ground.block), Some(BlockId::AIR));
     assert_eq!(game.client.world().block(ground.block), Some(BlockId::AIR));
 
@@ -81,6 +98,31 @@ fn joins_receives_terrain_and_edits_it() {
         .id(&ruda_base::id("planks").unwrap())
         .unwrap();
     assert!(game.client.place_block(ground.block, planks));
-    game.run_until(|client, _| client.pending_actions() == 0);
+    game.run_until(|client| client.pending_actions() == 0);
     assert_eq!(game.server.world().block(ground.block), Some(planks));
+
+    // Not into the player, though.
+    let feet_block = ground.block.offset(ruda_core::Face::PosY);
+    assert!(!game.client.place_block(feet_block, planks));
+}
+
+#[test]
+fn predicts_where_the_server_moves_the_player() {
+    let mut game = Game::new();
+    let start = game.join();
+    for _ in 0..15 {
+        game.client.tick_player(PlayerInput {
+            walk: Vec2::new(0.3, 1.0),
+            jump: true,
+            ..Default::default()
+        });
+        game.server.tick();
+        for _ in game.client.update() {}
+    }
+    let predicted = *game.client.player().unwrap();
+    game.run_until(|client| client.pending_inputs() == 0);
+    let decided = *game.client.player().unwrap();
+    assert!(start.distance(decided.position) > 1.0);
+    assert_eq!(predicted, decided);
+    assert_eq!(game.client.player_position(1.0), Some(decided.position));
 }

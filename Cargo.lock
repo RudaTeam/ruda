@@ -2365,6 +2365,7 @@ dependencies = [
  "ruda_protocol",
  "ruda_render",
  "ruda_server",
+ "ruda_sim",
  "ruda_ui",
  "ruda_world",
  "sys-locale",
@@ -2400,6 +2401,7 @@ dependencies = [
  "ruda_net",
  "ruda_protocol",
  "ruda_server",
+ "ruda_sim",
  "ruda_world",
 ]
 
@@ -2436,6 +2438,7 @@ dependencies = [
  "glam",
  "postcard",
  "ruda_core",
+ "ruda_sim",
  "ruda_world",
  "serde",
  "thiserror 2.0.21",
@@ -2470,8 +2473,19 @@ dependencies = [
  "ruda_core",
  "ruda_net",
  "ruda_protocol",
+ "ruda_sim",
  "ruda_world",
  "tracing",
+]
+
+[[package]]
+name = "ruda_sim"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "ruda_core",
+ "ruda_world",
+ "serde",
 ]
 
 [[package]]

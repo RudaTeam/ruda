@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use glam::{Vec2, Vec3};
+use glam::Vec2;
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -14,8 +14,10 @@ pub enum Action {
     MoveBack,
     MoveLeft,
     MoveRight,
-    MoveUp,
-    MoveDown,
+    /// Also flies up; pressed twice quickly, starts or stops flying.
+    Jump,
+    /// Also flies down.
+    Sneak,
     Sprint,
     Break,
     Place,
@@ -44,8 +46,8 @@ impl Default for Bindings {
             (KeyS, MoveBack),
             (KeyA, MoveLeft),
             (KeyD, MoveRight),
-            (Space, MoveUp),
-            (ShiftLeft, MoveDown),
+            (Space, Jump),
+            (ShiftLeft, Sneak),
             (ControlLeft, Sprint),
             (Escape, Action::Pause),
         ]
@@ -158,15 +160,15 @@ impl Input {
         steps as i32
     }
 
-    /// Desired movement: x to the right, y up, z forward, each from −1 to 1.
-    pub fn movement(&self) -> Vec3 {
+    /// Where the player wants to walk: x to the right, y forward, each from
+    /// −1 to 1.
+    pub fn walk(&self) -> Vec2 {
         let axis = |positive, negative| {
             f32::from(u8::from(self.is_held(positive)))
                 - f32::from(u8::from(self.is_held(negative)))
         };
-        Vec3::new(
+        Vec2::new(
             axis(Action::MoveRight, Action::MoveLeft),
-            axis(Action::MoveUp, Action::MoveDown),
             axis(Action::MoveForward, Action::MoveBack),
         )
     }
@@ -182,7 +184,7 @@ mod tests {
         input.button(Button::Key(KeyCode::KeyW), true);
         input.button(Button::Key(KeyCode::KeyW), true);
         input.button(Button::Key(KeyCode::KeyD), true);
-        assert_eq!(input.movement(), Vec3::new(1.0, 0.0, 1.0));
+        assert_eq!(input.walk(), Vec2::new(1.0, 1.0));
         assert_eq!(
             input.take_pressed(),
             vec![Action::MoveForward, Action::MoveRight]
@@ -190,7 +192,7 @@ mod tests {
         assert!(input.take_pressed().is_empty());
 
         input.button(Button::Key(KeyCode::KeyW), false);
-        assert_eq!(input.movement(), Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(input.walk(), Vec2::new(1.0, 0.0));
         input.button(Button::Key(KeyCode::Digit3), true);
         assert_eq!(input.take_pressed(), vec![Action::Hotbar(2)]);
     }

@@ -1,5 +1,5 @@
 use glam::camera::rh::{proj::directx, view::look_to_mat4};
-use glam::{DVec3, Mat4, Vec3, Vec4};
+use glam::{DVec3, Mat4, Quat, Vec3, Vec4};
 
 /// A first-person camera. Rendering happens relative to its position, so
 /// precision does not degrade far from the world origin.
@@ -11,6 +11,8 @@ pub struct Camera {
     pub yaw: f32,
     /// Look up (positive) or down, in radians.
     pub pitch: f32,
+    /// Lean around the view direction in radians, positive to the right.
+    pub roll: f32,
     /// Vertical field of view in radians.
     pub fov_y: f32,
 }
@@ -24,6 +26,7 @@ impl Camera {
             position,
             yaw: 0.0,
             pitch: 0.0,
+            roll: 0.0,
             fov_y: 70.0_f32.to_radians(),
         }
     }
@@ -49,7 +52,9 @@ impl Camera {
     pub fn view_proj(&self, aspect: f32, far: f32) -> Mat4 {
         // Depth from 0 to 1, as in WebGPU.
         let projection = directx::perspective(self.fov_y, aspect, 0.05, far);
-        projection * look_to_mat4(Vec3::ZERO, self.forward(), Vec3::Y)
+        let forward = self.forward();
+        let up = Quat::from_axis_angle(forward, self.roll) * Vec3::Y;
+        projection * look_to_mat4(Vec3::ZERO, forward, up)
     }
 }
 
@@ -100,6 +105,17 @@ mod tests {
         assert!(camera.forward().abs_diff_eq(Vec3::X, 1e-6));
         camera.rotate(0.0, 10.0);
         assert!(camera.pitch < std::f32::consts::FRAC_PI_2);
+    }
+
+    #[test]
+    fn rolling_leans_the_view() {
+        let mut camera = Camera::new(DVec3::ZERO);
+        camera.roll = 0.1;
+        // Leaning right, what is straight up ahead shows to the left.
+        let up_ahead = camera
+            .view_proj(1.0, 100.0)
+            .project_point3(Vec3::new(0.0, 1.0, -10.0));
+        assert!(up_ahead.x < 0.0 && up_ahead.y > 0.0, "{up_ahead}");
     }
 
     #[test]

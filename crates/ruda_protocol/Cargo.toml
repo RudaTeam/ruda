@@ -12,6 +12,7 @@ publish.workspace = true
 glam = { workspace = true, features = ["serde"] }
 postcard.workspace = true
 ruda_core = { workspace = true, features = ["serde"] }
+ruda_sim = { workspace = true, features = ["serde"] }
 ruda_world = { workspace = true, features = ["serde"] }
 serde.workspace = true
 thiserror.workspace = true

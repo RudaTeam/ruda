@@ -13,7 +13,7 @@ What we're aiming for:
 - smooth play on weak hardware, with a Raspberry Pi 4 as the low bar;
 - a modding API that can carry big tech mods: machines, power networks, their own UIs.
 
-It's very early. You can fly around a generated world with hills, rocky
+It's very early. You can walk, jump and fly around a generated world with hills, rocky
 mountains, caves and ore, break and place blocks, and light caves with lamps and torches. Days and nights pass
 every 20 minutes, light spreads from the sky and from glowing blocks in colour,
 and corners are softly shaded. Blocky clouds drift with the wind at the height
@@ -33,10 +33,10 @@ cargo run -p ruda-server   # dedicated server (a stub until network play lands)
 ```
 
 The game opens on the main menu. Settings has the view distance, how far
-simplified far terrain reaches beyond it, field of view, vertical sync,
+simplified far terrain reaches beyond it, field of view, view bobbing, vertical sync,
 fullscreen, clouds, sun shadows (off by default: they cost a
-second drawing of the world), graphics API and language (English or
-Russian; the system language by default). They are saved to `settings.toml`
+second drawing of the world), graphics API, language (English or
+Russian; the system language by default) and auto-jump. They are saved to `settings.toml`
 in `~/.config/ruda` on Linux, `~/Library/Application Support/Ruda` on macOS
 and `%APPDATA%\Ruda` on Windows.
 
@@ -45,9 +45,11 @@ In the game:
 | Key | Action |
 |---|---|
 | Mouse | Look around |
-| W A S D | Fly |
-| Space / Left Shift | Up / down |
-| Left Ctrl | Fly faster |
+| W A S D | Walk |
+| Space | Jump; press twice quickly to start or stop flying |
+| Left Shift | Sneak: slower, and you don't fall off edges |
+| Space / Left Shift while flying | Up / down |
+| Left Ctrl | Sprint, or fly faster |
 | Left / right click | Break / place a block |
 | 1–9, 0, mouse wheel | Pick the block to place |
 | Esc | Pause menu |
@@ -66,7 +68,8 @@ The client takes a few options:
   can also set it with `RUDA_GPU_BACKEND`. `auto` tries Vulkan, Metal and DX12
   before falling back to OpenGL.
 - `--camera <X,Y,Z[,YAW,PITCH]>` starts the camera at a given point instead
-  of the spawn point, angles in degrees.
+  of the spawn point, angles in degrees, with the player flying so it stays
+  there.
 - `--exit-after-frames <N>` quits after N frames have been shown, and
   `--screenshot <PATH>` saves the last one. CI uses them as a smoke test.
 - `--benchmark <SECONDS>` starts a world, waits until it has loaded, then

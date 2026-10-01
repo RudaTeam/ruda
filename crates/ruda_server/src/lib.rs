@@ -15,7 +15,9 @@ use glam::{DVec3, IVec3};
 use ruda_core::{BlockId, BlockPos, ChunkPos, Content, Face, WorldBounds};
 use ruda_net::{ClientConnection, RecvError, ServerConnection, local_pair};
 pub use ruda_protocol::TICK_RATE;
-use ruda_protocol::{ClientMessage, DAY_LENGTH, PROTOCOL_VERSION, REACH, ServerMessage};
+use ruda_protocol::{
+    ClientMessage, DAY_LENGTH, PROTOCOL_VERSION, PlayerInput, PlayerState, REACH, ServerMessage,
+};
 use ruda_world::light::LightEngine;
 use ruda_world::lod::{LOD_TILE_SIZE, LodTile, LodTilePos};
 use ruda_world::{Chunk, Generator, World};
@@ -29,6 +31,9 @@ const CHUNKS_PER_TICK: usize = 64;
 const LOD_TILES_PER_TICK: usize = 4;
 /// Time a tick may spend lighting new chunks.
 const LIGHT_BUDGET: Duration = Duration::from_millis(10);
+/// Inputs a player can save up while its messages are held up, to apply
+/// once they arrive.
+const INPUT_SLACK: u32 = 10;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ServerConfig {
@@ -43,6 +48,9 @@ pub struct ServerConfig {
     pub max_lod_distance: i32,
     /// Decides the clouds; see [`ServerMessage::Welcome`].
     pub sky_seed: u64,
+    /// Where players' feet start, flying, instead of on the ground in the
+    /// middle of the world.
+    pub spawn: Option<DVec3>,
 }
 
 impl Default for ServerConfig {
@@ -54,6 +62,7 @@ impl Default for ServerConfig {
             start_time: DAY_LENGTH / 24,
             max_lod_distance: 2048,
             sky_seed: 0,
+            spawn: None,
         }
     }
 }
@@ -102,7 +111,7 @@ pub struct Server {
     /// Offsets of the chunks streamed around a player, nearest first, by
     /// view distance.
     views: HashMap<i32, Arc<[IVec3]>>,
-    spawn: DVec3,
+    spawn: PlayerState,
     ticks: u64,
     /// Ticks since the world began.
     time: u64,
@@ -112,7 +121,8 @@ struct RemoteClient {
     connection: ServerConnection,
     /// Set once the client has said hello.
     name: Option<String>,
-    position: Option<DVec3>,
+    /// Set once the client has said hello.
+    player: Option<Player>,
     /// In chunks.
     view_distance: i32,
     sent: HashSet<ChunkPos>,
@@ -128,13 +138,31 @@ impl RemoteClient {
             self.connected = false;
         }
     }
+
+    /// Where the player looks from; the world is streamed around it.
+    fn eye(&self) -> Option<DVec3> {
+        Some(self.player.as_ref()?.state.eye())
+    }
+}
+
+/// A client's player, moved by its inputs.
+struct Player {
+    state: PlayerState,
+    /// The last input handled.
+    ack: u32,
+    /// Inputs it may still apply: one more each tick, so a client sending
+    /// them faster doesn't move faster.
+    allowance: u32,
+    /// Whether the client needs to hear where its player is.
+    changed: bool,
 }
 
 impl Server {
     pub fn new(content: Arc<Content>, generator: Arc<dyn Generator>, config: ServerConfig) -> Self {
-        let spawn = match generator.surface_height(0, 0) {
-            Some(height) => DVec3::new(0.5, f64::from(height) + 3.0, 0.5),
-            None => DVec3::new(0.5, 100.0, 0.5),
+        let spawn = match (config.spawn, generator.surface_height(0, 0)) {
+            (Some(position), _) => PlayerState::flying(position),
+            (None, Some(height)) => PlayerState::new(DVec3::new(0.5, f64::from(height) + 1.0, 0.5)),
+            (None, None) => PlayerState::flying(DVec3::new(0.5, 100.0, 0.5)),
         };
         let (generated_tx, generated_rx) = mpsc::channel();
         let (lod_tx, lod_rx) = mpsc::channel();
@@ -170,7 +198,7 @@ impl Server {
         self.clients.push(RemoteClient {
             connection,
             name: None,
-            position: None,
+            player: None,
             view_distance: DEFAULT_VIEW_DISTANCE.min(self.config.view_distance),
             sent: HashSet::new(),
             lod_distance: 0,
@@ -183,8 +211,9 @@ impl Server {
         &self.world
     }
 
+    /// Where players' feet start.
     pub fn spawn(&self) -> DVec3 {
-        self.spawn
+        self.spawn.position
     }
 
     pub fn client_count(&self) -> usize {
@@ -205,10 +234,14 @@ impl Server {
                 None => self.lod_unsupported = true,
             }
         }
+        for player in self.clients.iter_mut().filter_map(|c| c.player.as_mut()) {
+            player.allowance = (player.allowance + 1).min(INPUT_SLACK);
+        }
         for index in 0..self.clients.len() {
             self.handle_messages(index);
         }
         self.clients.retain(|client| client.connected);
+        self.send_players();
         self.light_chunks();
         // Before streaming: chunks sent below already carry their new light.
         self.send_light_changes();
@@ -339,9 +372,14 @@ impl Server {
                     .collect();
                 let client = &mut self.clients[index];
                 client.name = Some(name);
+                client.player = Some(Player {
+                    state: self.spawn,
+                    ack: 0,
+                    allowance: INPUT_SLACK,
+                    changed: true,
+                });
                 client.send(ServerMessage::Welcome {
                     blocks,
-                    spawn: self.spawn,
                     bounds: self.config.bounds,
                     time: self.time,
                     sky_seed: self.config.sky_seed,
@@ -349,11 +387,7 @@ impl Server {
             }
             _ if !greeted => self.kick(index, "expected a hello first"),
             ClientMessage::Hello { .. } => self.kick(index, "said hello twice"),
-            ClientMessage::Position(position) => {
-                if position.is_finite() {
-                    self.clients[index].position = Some(position);
-                }
-            }
+            ClientMessage::Input(input) => self.move_player(index, &input),
             ClientMessage::ViewDistance(chunks) => {
                 self.clients[index].view_distance =
                     i32::from(chunks).clamp(1, self.config.view_distance);
@@ -367,6 +401,48 @@ impl Server {
             }
             ClientMessage::PlaceBlock { pos, block, seq } => {
                 self.block_action(index, pos, block, seq);
+            }
+        }
+    }
+
+    /// Moves a client's player by its input for one tick, unless the client
+    /// is sending them faster than the ticks go: then the input is dropped,
+    /// and the client hears where its player really is.
+    fn move_player(&mut self, index: usize, input: &PlayerInput) {
+        let Self {
+            world,
+            content,
+            config,
+            clients,
+            ..
+        } = self;
+        let Some(player) = &mut clients[index].player else {
+            return;
+        };
+        if input.seq <= player.ack {
+            return;
+        }
+        if player.allowance > 0 {
+            player.allowance -= 1;
+            let solid = ruda_sim::solid_in(world, content.blocks(), config.bounds);
+            player.state.step(input, solid);
+        }
+        player.ack = input.seq;
+        player.changed = true;
+    }
+
+    /// Tells clients where their players are, if that changed.
+    fn send_players(&mut self) {
+        for client in &mut self.clients {
+            let Some(player) = &mut client.player else {
+                continue;
+            };
+            if std::mem::take(&mut player.changed) {
+                let message = ServerMessage::Player {
+                    ack: player.ack,
+                    state: player.state,
+                };
+                client.send(message);
             }
         }
     }
@@ -389,8 +465,17 @@ impl Server {
                     .is_some_and(|support| blocks.is_solid(support))
             });
         let in_reach = self.clients[index]
-            .position
+            .eye()
             .is_some_and(|eye| eye.distance(pos.0.as_dvec3() + 0.5) <= REACH);
+        // Nobody gets walled in.
+        let in_someone = placeable
+            && blocks.is_solid(block)
+            && self.clients.iter().any(|client| {
+                client
+                    .player
+                    .as_ref()
+                    .is_some_and(|player| player.state.overlaps(pos))
+            });
         let current = self.world.block(pos);
         // Breaking needs something breakable there, placing needs an empty cell.
         let target_ok = current.is_some_and(|current| {
@@ -400,8 +485,11 @@ impl Server {
                 current == BlockId::AIR
             }
         });
-        let allowed =
-            (breaking || placeable) && in_reach && self.config.bounds.contains(pos) && target_ok;
+        let allowed = (breaking || placeable)
+            && in_reach
+            && !in_someone
+            && self.config.bounds.contains(pos)
+            && target_ok;
 
         if allowed {
             self.change_block(pos, block);
@@ -448,7 +536,7 @@ impl Server {
     /// Sends the nearest missing chunks around the client, asks for the ones
     /// that don't exist yet, and tells it to forget those it moved away from.
     fn stream_chunks(&mut self, index: usize) {
-        let Some(position) = self.clients[index].position else {
+        let Some(position) = self.clients[index].eye() else {
             return;
         };
         let center = BlockPos(position.floor().as_ivec3()).chunk();
@@ -517,7 +605,7 @@ impl Server {
     /// yet, asks for the ones that don't exist, and tells it to forget those
     /// it moved away from.
     fn stream_lod(&mut self, index: usize) {
-        let Some(position) = self.clients[index].position else {
+        let Some(position) = self.clients[index].eye() else {
             return;
         };
         let reach = if self.lod_unsupported {
@@ -598,7 +686,7 @@ impl Server {
             .clients
             .iter()
             .filter_map(|client| {
-                let center = BlockPos(client.position?.floor().as_ivec3()).chunk();
+                let center = BlockPos(client.eye()?.floor().as_ivec3()).chunk();
                 Some((center, client.view_distance + 2))
             })
             .collect();
@@ -625,7 +713,7 @@ impl Server {
             .iter()
             .filter_map(|client| {
                 let reach = client.lod_distance + 2 * LOD_TILE_SIZE;
-                Some((client.position?, f64::from(reach)))
+                Some((client.eye()?, f64::from(reach)))
             })
             .collect();
         self.lod_tiles.retain(|&pos, _| {
@@ -747,9 +835,11 @@ fn view_offsets(radius: i32, vertical: i32) -> Vec<IVec3> {
 
 #[cfg(test)]
 mod tests {
+    use glam::Vec2;
     use ruda_core::{
         Appearance, BlockDef, ContentBuilder, CubeTextures, Light, LocalPos, ResourceId,
     };
+    use ruda_sim::EYE_HEIGHT;
 
     use super::*;
 
@@ -860,13 +950,27 @@ mod tests {
             panic!("the expected message never came");
         }
 
-        fn join(&mut self) {
+        /// Joins and waits to hear where the player starts: standing on the
+        /// ground at (0.5, 0, 0.5).
+        fn join(&mut self) -> PlayerState {
             self.send(ClientMessage::Hello {
                 protocol: PROTOCOL_VERSION,
                 name: "tester".into(),
             });
             self.expect(|m| matches!(m, ServerMessage::Welcome { .. }));
-            self.send(ClientMessage::Position(DVec3::new(0.5, 1.5, 0.5)));
+            let ServerMessage::Player { ack: 0, state } =
+                self.expect(|m| matches!(m, ServerMessage::Player { .. }))
+            else {
+                panic!("the player should start before any input");
+            };
+            state
+        }
+
+        /// Moves the player, hovering, so its eyes are at `eye`.
+        fn put_eyes_at(&mut self, eye: DVec3) {
+            let player = self.server.clients[0].player.as_mut().unwrap();
+            player.state = PlayerState::flying(eye - DVec3::Y * EYE_HEIGHT);
+            player.changed = true;
         }
     }
 
@@ -937,10 +1041,128 @@ mod tests {
     }
 
     #[test]
+    fn moves_players_by_their_inputs() {
+        let mut harness = Harness::new();
+        let start = harness.join();
+        assert_eq!(start.position, DVec3::new(0.5, 0.0, 0.5));
+        // The player waits until the world around it is there.
+        received_chunks(&mut harness, 10);
+
+        let forward = |seq| {
+            ClientMessage::Input(PlayerInput {
+                seq,
+                walk: Vec2::Y,
+                ..Default::default()
+            })
+        };
+        for seq in 1..=5 {
+            harness.send(forward(seq));
+        }
+        let ServerMessage::Player { state, .. } =
+            harness.expect(|m| matches!(m, ServerMessage::Player { ack: 5, .. }))
+        else {
+            unreachable!()
+        };
+        let mut expected = start;
+        for seq in 1..=5 {
+            let ClientMessage::Input(input) = forward(seq) else {
+                unreachable!()
+            };
+            // The flat world: ground below y = 0.
+            expected.step(&input, |pos: BlockPos| Some(pos.0.y < 0));
+        }
+        assert!(state.position.z < 0.0);
+        assert_eq!(state.position.z, expected.position.z);
+        assert_eq!(state.position.y, 0.0);
+
+        // Sent faster than the ticks go, inputs are handled but don't all
+        // move the player.
+        for seq in 6..=40 {
+            harness.send(forward(seq));
+        }
+        let ServerMessage::Player { state: later, .. } =
+            harness.expect(|m| matches!(m, ServerMessage::Player { ack: 40, .. }))
+        else {
+            unreachable!()
+        };
+        let walked = state.position.z - later.position.z;
+        assert!(walked > 1.0 && walked < 3.0, "{walked}");
+
+        // Old inputs don't count again.
+        harness.send(forward(3));
+        for _ in 0..3 {
+            harness.server.tick();
+        }
+        while let Some(message) = harness.client.try_recv().unwrap() {
+            assert!(!matches!(message, ServerMessage::Player { .. }));
+        }
+    }
+
+    #[test]
+    fn starts_players_where_asked() {
+        let mut harness = Harness::new();
+        let config = ServerConfig {
+            spawn: Some(DVec3::new(3.0, 20.0, -4.0)),
+            ..harness.server.config
+        };
+        harness.server = Server::new(
+            Arc::clone(&harness.server.content),
+            Arc::clone(&harness.server.generator),
+            config,
+        );
+        let (client, server_end) = local_pair();
+        harness.server.connect(server_end);
+        harness.client = client;
+        let state = harness.join();
+        assert_eq!(state, PlayerState::flying(DVec3::new(3.0, 20.0, -4.0)));
+    }
+
+    #[test]
+    fn walls_nobody_in() {
+        let mut harness = Harness::new();
+        harness.join();
+        harness.expect(
+            |m| matches!(m, ServerMessage::Chunk { pos, .. } if *pos == ChunkPos::new(0, 0, 0)),
+        );
+        let feet = BlockPos::new(0, 0, 0);
+        harness.send(ClientMessage::PlaceBlock {
+            pos: feet,
+            block: harness.stone,
+            seq: 1,
+        });
+        harness.expect(|m| matches!(m, ServerMessage::ActionDone { seq: 1 }));
+        assert_eq!(harness.server.world().block(feet), Some(BlockId::AIR));
+
+        // Next to the player is fine, and so is a torch at its feet.
+        let beside = BlockPos::new(1, 0, 0);
+        let torch = harness
+            .server
+            .content
+            .blocks()
+            .placed(harness.torch, Face::PosY)
+            .unwrap();
+        for (seq, pos, block) in [(2, beside, harness.stone), (3, feet, torch)] {
+            harness.send(ClientMessage::PlaceBlock { pos, block, seq });
+            harness.expect(|m| matches!(m, ServerMessage::ActionDone { seq: s } if *s == seq));
+            assert_eq!(harness.server.world().block(pos), Some(block));
+        }
+
+        // Nor blocks that don't exist.
+        let pos = BlockPos::new(2, 0, 0);
+        harness.send(ClientMessage::PlaceBlock {
+            pos,
+            block: BlockId::from_raw(9999),
+            seq: 4,
+        });
+        harness.expect(|m| matches!(m, ServerMessage::ActionDone { seq: 4 }));
+        assert_eq!(harness.server.world().block(pos), Some(BlockId::AIR));
+    }
+
+    #[test]
     fn keeps_unbreakable_blocks_and_world_bounds() {
         let mut harness = Harness::new();
         harness.join();
-        harness.send(ClientMessage::Position(DVec3::new(0.5, -29.5, 0.5)));
+        harness.put_eyes_at(DVec3::new(0.5, -29.5, 0.5));
         let floor = BlockPos::new(0, -32, 0);
         harness.expect(|m| matches!(m, ServerMessage::Chunk { pos, .. } if *pos == floor.chunk()));
 

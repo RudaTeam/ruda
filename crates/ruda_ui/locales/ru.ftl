@@ -30,6 +30,7 @@ settings-view-distance-value = { $chunks } { $chunks ->
 })
 settings-fov = Поле зрения
 settings-fov-value = { $degrees }°
+settings-view-bobbing = Покачивание камеры
 settings-fps-limit = Ограничение FPS
 settings-fps-limit-off = Без ограничения
 settings-fps-limit-value = { $fps } FPS
@@ -54,4 +55,7 @@ settings-gpu-api = Графический API
 settings-gpu-api-auto = Автоматически
 settings-restart-note = Применится после перезапуска
 settings-language = Язык
+settings-controls = Управление
+settings-auto-jump = Автопрыжок
+settings-auto-jump-note = Сам запрыгивает на блок, в который упираешься
 settings-back = Назад

@@ -18,6 +18,15 @@ pub struct Settings {
     /// `None` follows the system language.
     pub language: Option<Language>,
     pub graphics: Graphics,
+    pub controls: Controls,
+}
+
+/// How the game handles.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Controls {
+    /// Jump onto a block the player walks into without pressing jump.
+    pub auto_jump: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -30,6 +39,8 @@ pub struct Graphics {
     pub lod_distance: u16,
     /// Vertical field of view in degrees.
     pub fov: u8,
+    /// The view sways with the player's steps.
+    pub view_bobbing: bool,
     pub fps_limit: FpsLimit,
     pub fullscreen: bool,
     /// Shadows cast by the sun and moon; costly.
@@ -47,6 +58,7 @@ impl Default for Graphics {
             view_distance: 12,
             lod_distance: 1024,
             fov: 70,
+            view_bobbing: true,
             fps_limit: FpsLimit::default(),
             fullscreen: false,
             shadows: false,
@@ -264,6 +276,7 @@ mod tests {
         settings.graphics.fps_limit = FpsLimit::HundredTwenty;
         settings.graphics.gpu_api = GpuApi::Gl;
         settings.graphics.clouds = Clouds::Off;
+        settings.controls.auto_jump = true;
         assert_eq!(Settings::from_toml(&settings.to_toml()).unwrap(), settings);
     }
 
@@ -273,6 +286,8 @@ mod tests {
         assert_eq!(settings.graphics.view_distance, 16);
         assert_eq!(settings.graphics.fov, 70);
         assert_eq!(settings.language, None);
+        assert!(!settings.controls.auto_jump);
+        assert!(settings.graphics.view_bobbing);
     }
 
     #[test]

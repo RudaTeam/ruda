@@ -1,28 +1,33 @@
 //! The client's side of the game: the world as the server has sent it, and
 //! the player's actions on it.
 //!
-//! Actions apply locally right away so the game feels instant; the server
-//! either confirms them or sends back what the world really looks like.
+//! Actions and movement apply locally right away so the game feels instant;
+//! the server either confirms them or sends back what the world really looks
+//! like and where the player really is.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{DVec3, IVec3};
-use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ChunkPos, Content, LocalPos, WorldBounds};
+use ruda_core::{
+    BlockId, BlockPos, CHUNK_SHIFT, CHUNK_SIZE, ChunkPos, Content, LocalPos, WorldBounds,
+};
 use ruda_net::{ClientConnection, Disconnected, RecvError};
-use ruda_protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, TICK_RATE};
-use std::collections::HashMap;
+use ruda_protocol::{
+    ClientMessage, PROTOCOL_VERSION, PlayerInput, PlayerState, ServerMessage, TICK_RATE,
+};
+use ruda_sim::solid_in;
 
+use ruda_world::light::LightEngine;
 use ruda_world::lod::{LodTile, LodTilePos};
 use ruda_world::{ChunkLight, World};
 
 /// Something that happened since the last [`Client::update`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    /// The server let us in; the player starts at `spawn`.
-    Joined {
-        spawn: DVec3,
-    },
+    /// The server let us in; where the player is follows shortly.
+    Joined,
     ChunkLoaded(ChunkPos),
     ChunkUnloaded(ChunkPos),
     /// A block changed, by this player's action or anybody else's.
@@ -79,13 +84,104 @@ impl Clock {
     }
 }
 
+/// Where the player is, as the client works it out from its own inputs ahead
+/// of the server's word.
+#[derive(Clone, Debug)]
+struct Prediction {
+    /// After the last input.
+    state: PlayerState,
+    /// A tick earlier: the camera moves between the two.
+    previous: PlayerState,
+    /// Inputs sent that the server hasn't handled yet, oldest first.
+    pending: VecDeque<PlayerInput>,
+    /// How far the camera lags behind where the server's word moved the
+    /// player, when it did: this fades out instead of the camera jumping.
+    correction: DVec3,
+    corrected_at: Instant,
+}
+
+impl Prediction {
+    /// How long a correction takes to fade to a third.
+    const FADE: f64 = 0.1;
+    /// Larger corrections, like being moved by the server, are jumped to.
+    const MOST_EASED: f64 = 4.0;
+
+    fn new(state: PlayerState, now: Instant) -> Self {
+        Self {
+            state,
+            previous: state,
+            pending: VecDeque::new(),
+            correction: DVec3::ZERO,
+            corrected_at: now,
+        }
+    }
+
+    fn correction(&self, now: Instant) -> DVec3 {
+        let elapsed = now
+            .saturating_duration_since(self.corrected_at)
+            .as_secs_f64();
+        self.correction * (-elapsed / Self::FADE).exp()
+    }
+
+    /// Where the feet are to be drawn, `alpha` of the way through the tick.
+    fn position(&self, alpha: f64, now: Instant) -> DVec3 {
+        self.previous.position.lerp(self.state.position, alpha) + self.correction(now)
+    }
+
+    /// Moves the player by an input the server has yet to handle.
+    fn advance(&mut self, input: PlayerInput, solid: impl Fn(BlockPos) -> Option<bool>) {
+        self.previous = self.state;
+        self.state.step(&input, solid);
+        self.pending.push_back(input);
+    }
+
+    /// Takes the server's word on where the player was after input `ack`,
+    /// and works out from it where the inputs since then take the player.
+    fn correct(
+        &mut self,
+        ack: u32,
+        state: PlayerState,
+        solid: impl Fn(BlockPos) -> Option<bool>,
+        now: Instant,
+    ) {
+        while self.pending.front().is_some_and(|input| input.seq <= ack) {
+            self.pending.pop_front();
+        }
+        let mut predicted = state;
+        for input in &self.pending {
+            predicted.step(input, &solid);
+        }
+        let error = self.state.position - predicted.position;
+        if error.length() > Self::MOST_EASED {
+            *self = Self {
+                pending: std::mem::take(&mut self.pending),
+                ..Self::new(predicted, now)
+            };
+            return;
+        }
+        // The camera stays where it is for now and eases over.
+        if error != DVec3::ZERO {
+            self.correction = self.correction(now) + error;
+            self.corrected_at = now;
+            self.previous.position -= error;
+        }
+        self.state = predicted;
+    }
+}
+
 #[derive(Debug)]
 pub struct Client {
     connection: ClientConnection,
     content: Arc<Content>,
     world: World,
+    /// Spreads light after blocks change, as the server does, so the world
+    /// doesn't show stale light until the server's arrives. Set once
+    /// joined.
+    light: Option<LightEngine>,
     lod: HashMap<LodTilePos, LodTile>,
-    spawn: Option<DVec3>,
+    /// Set once the server has said where the player is.
+    player: Option<Prediction>,
+    last_input: u32,
     bounds: Option<WorldBounds>,
     time: Option<Clock>,
     sky_seed: u64,
@@ -93,7 +189,6 @@ pub struct Client {
     next_seq: u32,
     /// Actions the server has not answered yet.
     pending: usize,
-    last_position: Option<DVec3>,
     connected: bool,
 }
 
@@ -112,15 +207,16 @@ impl Client {
             connection,
             content,
             world: World::new(),
+            light: None,
             lod: HashMap::new(),
-            spawn: None,
+            player: None,
+            last_input: 0,
             bounds: None,
             time: None,
             sky_seed: 0,
             events: Vec::new(),
             next_seq: 0,
             pending: 0,
-            last_position: None,
             connected: true,
         })
     }
@@ -144,7 +240,6 @@ impl Client {
         match message {
             ServerMessage::Welcome {
                 blocks,
-                spawn,
                 bounds,
                 time,
                 sky_seed,
@@ -155,27 +250,44 @@ impl Client {
                 if !ours.eq(blocks.iter()) {
                     return self.disconnect("this game's content differs from the server's");
                 }
-                self.spawn = Some(spawn);
                 self.bounds = Some(bounds);
-                self.events.push(Event::Joined { spawn });
+                self.light = Some(LightEngine::new(self.content.blocks(), bounds));
+                self.events.push(Event::Joined);
             }
             ServerMessage::Disconnect { reason } => self.disconnect(&reason),
+            ServerMessage::Player { ack, state } => {
+                let now = Instant::now();
+                let solid = solid_in(
+                    &self.world,
+                    self.content.blocks(),
+                    self.bounds.unwrap_or_default(),
+                );
+                match &mut self.player {
+                    Some(player) => player.correct(ack, state, solid, now),
+                    None => self.player = Some(Prediction::new(state, now)),
+                }
+            }
             ServerMessage::Chunk { pos, chunk } => {
                 self.world.insert_chunk(pos, chunk);
+                if let Some(light) = &mut self.light {
+                    light.mark_lit(pos);
+                }
                 self.events.push(Event::ChunkLoaded(pos));
             }
             ServerMessage::UnloadChunk(pos) => {
+                if let Some(light) = &mut self.light {
+                    light.forget(pos);
+                }
                 if self.world.remove_chunk(pos).is_some() {
                     self.events.push(Event::ChunkUnloaded(pos));
                 }
             }
             ServerMessage::BlockChanged { pos, block } => {
-                if self
-                    .world
-                    .set_block(pos, block)
-                    .is_some_and(|previous| previous != block)
+                if let Some(previous) = self.world.set_block(pos, block)
+                    && previous != block
                 {
                     self.events.push(Event::BlockChanged(pos));
+                    self.relight(pos, previous);
                 }
             }
             ServerMessage::Light { pos, light } => {
@@ -204,15 +316,53 @@ impl Client {
         }
     }
 
-    /// Tells the server where the player is, if it moved noticeably.
-    pub fn set_position(&mut self, position: DVec3) {
-        let moved = self
-            .last_position
-            .is_none_or(|last| last.distance_squared(position) > 0.01);
-        if moved {
-            self.last_position = Some(position);
-            self.send(&ClientMessage::Position(position));
-        }
+    /// Moves the player by this tick's input right away, and sends the input
+    /// to the server; its `seq` is filled in. Call once a tick. Does nothing
+    /// until the server has said where the player is.
+    pub fn tick_player(&mut self, mut input: PlayerInput) {
+        let solid = solid_in(
+            &self.world,
+            self.content.blocks(),
+            self.bounds.unwrap_or_default(),
+        );
+        let Some(player) = &mut self.player else {
+            return;
+        };
+        self.last_input += 1;
+        input.seq = self.last_input;
+        player.advance(input, solid);
+        self.send(&ClientMessage::Input(input));
+    }
+
+    /// Where the player is after its last input, once the server has said
+    /// where it starts.
+    pub fn player(&self) -> Option<&PlayerState> {
+        Some(&self.player.as_ref()?.state)
+    }
+
+    /// Where the player's feet are to be drawn, `alpha` of the way from the
+    /// tick before the last to the last.
+    pub fn player_position(&self, alpha: f64) -> Option<DVec3> {
+        Some(self.player.as_ref()?.position(alpha, Instant::now()))
+    }
+
+    /// Whether a jump would take the player onto the block it is walking
+    /// into with `input`; see [`PlayerState::should_auto_jump`].
+    pub fn should_auto_jump(&self, input: &PlayerInput) -> bool {
+        let solid = solid_in(
+            &self.world,
+            self.content.blocks(),
+            self.bounds.unwrap_or_default(),
+        );
+        self.player()
+            .is_some_and(|player| player.should_auto_jump(input, solid))
+    }
+
+    /// Inputs sent that the server has not handled yet.
+    pub fn pending_inputs(&self) -> usize {
+        self.player
+            .as_ref()
+            .map_or(0, |player| player.pending.len())
     }
 
     /// Asks the server to stream the world this far around the player, in
@@ -248,7 +398,8 @@ impl Client {
     }
 
     /// Places `block` into an empty cell; a torch needs a solid block to
-    /// hold on to. Returns false if that isn't possible.
+    /// hold on to, and a solid block can't go where the player is. Returns
+    /// false if that isn't possible.
     pub fn place_block(&mut self, pos: BlockPos, block: BlockId) -> bool {
         let blocks = self.content.blocks();
         let empty = self.world.block(pos) == Some(BlockId::AIR);
@@ -258,7 +409,9 @@ impl Client {
         let supported = blocks
             .support(block)
             .is_none_or(|face| self.is_solid(pos.offset(face)));
-        if !empty || !inside || !placeable || !supported {
+        let in_player =
+            blocks.is_solid(block) && self.player().is_some_and(|player| player.overlaps(pos));
+        if !empty || !inside || !placeable || !supported || in_player {
             return false;
         }
         let seq = self.next_seq();
@@ -267,10 +420,41 @@ impl Client {
     }
 
     fn act(&mut self, pos: BlockPos, block: BlockId, message: ClientMessage) {
-        self.world.set_block(pos, block);
-        self.events.push(Event::BlockChanged(pos));
+        if let Some(previous) = self.world.set_block(pos, block) {
+            self.events.push(Event::BlockChanged(pos));
+            self.relight(pos, previous);
+        }
         self.pending += 1;
         self.send(&message);
+    }
+
+    /// Spreads light after the block at `pos`, once `old`, changed, as the
+    /// server will. Its word on the light follows and wins.
+    fn relight(&mut self, pos: BlockPos, old: BlockId) {
+        let (Some(light), Some(bounds)) = (&mut self.light, self.bounds) else {
+            return;
+        };
+        // The light of the columns it can change, to tell which chunks look
+        // different afterwards.
+        let center = pos.chunk().0;
+        let heights = (bounds.min_y >> CHUNK_SHIFT)..=(bounds.max_y >> CHUNK_SHIFT);
+        let before: Vec<(ChunkPos, ChunkLight)> = heights
+            .flat_map(|y| (-1..=1).flat_map(move |z| (-1..=1).map(move |x| (x, y, z))))
+            .map(|(x, y, z)| ChunkPos::new(center.x + x, y, center.z + z))
+            .filter_map(|pos| Some((pos, self.world.chunk(pos)?.light().clone())))
+            .collect();
+        let changed = light.block_changed(&mut self.world, pos, old);
+        let mut affected: Vec<ChunkPos> = Vec::new();
+        for (pos, old) in before.iter().filter(|(pos, _)| changed.contains(pos)) {
+            if let Some(chunk) = self.world.chunk(*pos) {
+                affected.extend(affected_by(*pos, old, chunk.light()));
+            }
+        }
+        affected.sort_by_key(|pos| (pos.0.x, pos.0.y, pos.0.z));
+        affected.dedup();
+        if !affected.is_empty() {
+            self.events.push(Event::LightChanged(affected));
+        }
     }
 
     fn next_seq(&mut self) -> u32 {
@@ -314,11 +498,6 @@ impl Client {
 
     pub fn content(&self) -> &Arc<Content> {
         &self.content
-    }
-
-    /// Where the server put the player, once joined.
-    pub fn spawn(&self) -> Option<DVec3> {
-        self.spawn
     }
 
     /// The world's time in ticks, counting on smoothly between the server's
@@ -385,9 +564,72 @@ fn affected_by(pos: ChunkPos, old: &ChunkLight, new: &ChunkLight) -> Vec<ChunkPo
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use glam::Vec2;
     use ruda_core::Light;
 
     use super::*;
+
+    /// Ground below y = 0.
+    fn flat(pos: BlockPos) -> Option<bool> {
+        Some(pos.0.y < 0)
+    }
+
+    fn walk(seq: u32) -> PlayerInput {
+        PlayerInput {
+            seq,
+            walk: Vec2::Y,
+            ..Default::default()
+        }
+    }
+
+    /// A player on the ground that has walked four ticks, and where the
+    /// server saw it after the first two.
+    fn walked() -> (Prediction, PlayerState, Instant) {
+        let now = Instant::now();
+        let mut start = PlayerState::new(DVec3::new(0.5, 0.0, 0.5));
+        start.step(&PlayerInput::default(), flat);
+        start.step(&PlayerInput::default(), flat);
+        let mut prediction = Prediction::new(start, now);
+        let mut server = start;
+        for seq in 1..=4 {
+            prediction.advance(walk(seq), flat);
+            if seq <= 2 {
+                server.step(&walk(seq), flat);
+            }
+        }
+        (prediction, server, now)
+    }
+
+    #[test]
+    fn keeps_its_prediction_when_the_server_agrees() {
+        let (mut prediction, server, now) = walked();
+        let before = prediction.clone();
+        prediction.correct(2, server, flat, now);
+        assert_eq!(prediction.state, before.state);
+        assert_eq!(prediction.pending.len(), 2);
+        assert_eq!(prediction.correction(now), DVec3::ZERO);
+    }
+
+    #[test]
+    fn eases_over_to_where_the_server_puts_the_player() {
+        let (mut prediction, mut server, now) = walked();
+        let drawn = prediction.position(0.5, now);
+        // Something pushed the player a block aside.
+        server.position.x += 1.0;
+        prediction.correct(2, server, flat, now);
+        assert!((prediction.state.position.x - 1.5).abs() < 1e-9);
+        assert!((prediction.position(0.5, now) - drawn).length() < 1e-9);
+        let later = now + Duration::from_secs(1);
+        assert!((prediction.position(0.5, later).x - 1.5).abs() < 1e-3);
+
+        // Far moves are jumped to.
+        server.position.x += 10.0;
+        prediction.correct(3, server, flat, now);
+        assert_eq!(prediction.pending.len(), 1);
+        assert!((prediction.position(0.0, now).x - 11.5).abs() < 1e-9);
+    }
 
     #[test]
     fn light_changes_reach_the_neighbours_they_touch() {

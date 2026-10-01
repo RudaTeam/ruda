@@ -7,25 +7,28 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
-use glam::{DVec3, IVec3, Vec3};
+use glam::{DVec3, IVec3};
 use ruda_client::{Client, Event};
 use ruda_core::{
     BlockId, BlockPos, CHUNK_SIZE, ChunkPos, ContentBuilder, Light, WindMap, WorldBounds,
 };
 use ruda_input::{Action, Input};
-use ruda_protocol::{DAY_LENGTH, REACH, TICK_RATE};
+use ruda_protocol::{DAY_LENGTH, PlayerInput, REACH, TICK_RATE};
 use ruda_render::{
     BlockFaces, Camera, ChunkMesher, CloudSky, Renderer, Scene, cloud_obstacles,
     far_cloud_obstacles, mesh_lod,
 };
 use ruda_server::ServerConfig;
+use ruda_sim::EYE_HEIGHT;
 use ruda_world::lod::LodTilePos;
 use ruda_world::{RayHit, raycast};
 use tracing::{info, warn};
 
-/// Flying speed in blocks per second.
-const SPEED: f64 = 12.0;
-const SPRINT_SPEED: f64 = 40.0;
+/// Seconds a tick lasts.
+const TICK: f64 = 1.0 / TICK_RATE as f64;
+/// Most ticks run in one update: after a long hitch the game drops time
+/// rather than racing to catch up.
+const MAX_TICKS_PER_UPDATE: u32 = 5;
 /// Radians of camera turn per unit of mouse movement.
 const MOUSE_SENSITIVITY: f32 = 0.0025;
 /// How much of the sky clouds cover, until weather decides it.
@@ -44,7 +47,8 @@ pub struct GameConfig {
     pub view_distance: u8,
     /// Vertical field of view in degrees.
     pub fov: f32,
-    /// Where the camera starts instead of the spawn point.
+    /// Where the camera starts, the player flying, instead of the spawn
+    /// point.
     pub camera: Option<CameraStart>,
     /// The time the world starts at, in ticks; see [`DAY_LENGTH`].
     pub time: Option<u64>,
@@ -52,6 +56,10 @@ pub struct GameConfig {
     /// none.
     pub lod_distance: u16,
     pub clouds: bool,
+    /// Jump onto blocks the player walks into.
+    pub auto_jump: bool,
+    /// The view sways with the player's steps.
+    pub view_bobbing: bool,
 }
 
 /// A camera position and direction, angles in degrees.
@@ -85,6 +93,47 @@ impl std::str::FromStr for CameraStart {
     }
 }
 
+/// How the view sways as the player walks, as in Minecraft.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Bob {
+    /// Grows as the player walks, by one every other step.
+    walked: f64,
+    /// How strongly the view sways: up to 0.1 when walking on the ground,
+    /// less sneaking, and dying away in the air.
+    amount: f64,
+}
+
+impl Bob {
+    /// After a tick in which the player moved by `moved`.
+    fn step(self, moved: DVec3, on_ground: bool) -> Self {
+        let distance = moved.x.hypot(moved.z);
+        let amount = if on_ground { distance.min(0.1) } else { 0.0 };
+        Self {
+            walked: self.walked + distance * 0.6,
+            amount: self.amount + (amount - self.amount) * 0.4,
+        }
+    }
+
+    fn lerp(self, to: Self, alpha: f64) -> Self {
+        Self {
+            walked: self.walked + (to.walked - self.walked) * alpha,
+            amount: self.amount + (to.amount - self.amount) * alpha,
+        }
+    }
+
+    /// Moves and tilts `camera` with the steps: a little sideways and up,
+    /// leaning and dipping with them.
+    fn sway(self, camera: &mut Camera) {
+        let phase = self.walked * std::f64::consts::PI;
+        let (sin, cos) = phase.sin_cos();
+        let right = camera.right().as_dvec3();
+        let up = right.cross(camera.forward().as_dvec3());
+        camera.position += right * (-sin * self.amount * 0.5) + up * (cos.abs() * self.amount);
+        camera.roll += (sin * self.amount * 3.0).to_radians() as f32;
+        camera.pitch -= ((phase - 0.2).cos().abs() * self.amount * 5.0).to_radians() as f32;
+    }
+}
+
 /// What the window should do after an update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Control {
@@ -115,6 +164,16 @@ pub struct Game {
     start: Option<CameraStart>,
     /// When chunks last arrived, left or got new geometry.
     last_change: Instant,
+    /// Seconds since the last tick.
+    since_tick: f64,
+    /// Jump was pressed since the last tick.
+    jump_pressed: bool,
+    auto_jump: bool,
+    /// How far through the tick the frame is, from 0 to 1.
+    alpha: f64,
+    /// The sway of the view a tick ago and now.
+    bob: [Bob; 2],
+    view_bobbing: bool,
 }
 
 impl Game {
@@ -132,6 +191,9 @@ impl Game {
                 .seed
                 .wrapping_mul(0x9e37_79b9_7f4a_7c15)
                 .rotate_left(29),
+            spawn: config
+                .camera
+                .map(|start| start.position - DVec3::Y * EYE_HEIGHT),
             ..Default::default()
         };
         if let Some(time) = config.time {
@@ -172,11 +234,18 @@ impl Game {
             joined: false,
             start: config.camera,
             last_change: Instant::now(),
+            since_tick: 0.0,
+            jump_pressed: false,
+            auto_jump: config.auto_jump,
+            alpha: 0.0,
+            bob: [Bob::default(); 2],
+            view_bobbing: config.view_bobbing,
         })
     }
 
-    /// Advances the game by `dt` seconds. Mouse movement only turns the
-    /// camera and clicks only act while the cursor is grabbed.
+    /// Advances the game by `dt` seconds, running the ticks due. Mouse
+    /// movement only turns the camera and clicks only act while the cursor
+    /// is grabbed.
     pub fn update(
         &mut self,
         dt: f64,
@@ -190,19 +259,15 @@ impl Game {
                 self.last_change = Instant::now();
             }
             match event {
-                Event::Joined { spawn } => {
+                Event::Joined => {
                     match self.start {
                         Some(start) => {
-                            self.camera.position = start.position;
                             self.camera.yaw = 0.0;
                             self.camera.pitch = 0.0;
                             self.camera
                                 .rotate(start.yaw.to_radians(), start.pitch.to_radians());
                         }
-                        None => {
-                            self.camera.position = spawn;
-                            self.camera.pitch = -0.3;
-                        }
+                        None => self.camera.pitch = -0.3,
                     }
                     self.joined = true;
                 }
@@ -252,9 +317,23 @@ impl Game {
             self.camera
                 .rotate(look.x * MOUSE_SENSITIVITY, -look.y * MOUSE_SENSITIVITY);
         }
-        self.fly(dt);
-        if self.joined {
-            self.client.set_position(self.camera.position);
+        let pressed = self.input.take_pressed();
+        self.jump_pressed |= pressed.contains(&Action::Jump);
+        self.since_tick += dt;
+        let mut ticks = 0;
+        while self.since_tick >= TICK {
+            if ticks == MAX_TICKS_PER_UPDATE {
+                self.since_tick = 0.0;
+                break;
+            }
+            self.since_tick -= TICK;
+            self.tick();
+            ticks += 1;
+        }
+        // Between the last two ticks; turning goes straight to the camera.
+        self.alpha = self.since_tick / TICK;
+        if let Some(feet) = self.client.player_position(self.alpha) {
+            self.camera.position = feet + DVec3::Y * EYE_HEIGHT;
         }
 
         // Aim a little short of the reach limit: the server measures to the
@@ -268,7 +347,7 @@ impl Game {
         );
 
         let mut control = Control::Continue;
-        for action in self.input.take_pressed() {
+        for action in pressed {
             match action {
                 Action::Break if cursor_grabbed => {
                     if let Some(hit) = self.target {
@@ -311,30 +390,28 @@ impl Game {
         Ok(control)
     }
 
-    /// Free flight, horizontally along the view and straight up or down.
-    fn fly(&mut self, dt: f64) {
-        let movement = self.input.movement();
-        if movement == Vec3::ZERO {
-            return;
-        }
-        let forward = self.camera.forward();
-        let forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
-        let direction =
-            (forward * movement.z + self.camera.right() * movement.x + Vec3::Y * movement.y)
-                .normalize_or_zero();
-        let speed = if self.input.is_held(Action::Sprint) {
-            SPRINT_SPEED
-        } else {
-            SPEED
+    /// Moves the player by what the player holds: one tick of the game.
+    fn tick(&mut self) {
+        let jump_pressed = std::mem::take(&mut self.jump_pressed);
+        let mut input = PlayerInput {
+            walk: self.input.walk(),
+            yaw: self.camera.yaw,
+            pitch: self.camera.pitch,
+            jump: jump_pressed || self.input.is_held(Action::Jump),
+            jump_pressed,
+            sneak: self.input.is_held(Action::Sneak),
+            sprint: self.input.is_held(Action::Sprint),
+            ..Default::default()
         };
-        self.camera.position += direction.as_dvec3() * speed * dt;
-        // Stay above the floor of the world; above the build limit is fine
-        // for a look around.
-        if let Some(bounds) = self.client.bounds() {
-            self.camera.position.y = self.camera.position.y.clamp(
-                f64::from(bounds.min_y) + 1.5,
-                f64::from(bounds.max_y) + 256.0,
-            );
+        if self.auto_jump && self.client.should_auto_jump(&input) {
+            input.jump = true;
+        }
+        let before = self.client.player().map(|player| player.position);
+        self.client.tick_player(input);
+        let now = self.bob[1];
+        self.bob[0] = now;
+        if let (Some(before), Some(player)) = (before, self.client.player()) {
+            self.bob[1] = now.step(player.position - before, player.on_ground);
         }
     }
 
@@ -343,10 +420,6 @@ impl Game {
             return;
         };
         let pos = hit.block.offset(hit.face);
-        // Don't wall the camera in.
-        if pos == BlockPos(self.camera.position.floor().as_ivec3()) {
-            return;
-        }
         // A torch hangs on the wall or stands on the floor it was put against.
         let block = self.hotbar[self.selected].1;
         if let Some(block) = self.client.content().blocks().placed(block, hit.face) {
@@ -369,6 +442,14 @@ impl Game {
         }
     }
 
+    pub fn set_auto_jump(&mut self, auto_jump: bool) {
+        self.auto_jump = auto_jump;
+    }
+
+    pub fn set_view_bobbing(&mut self, view_bobbing: bool) {
+        self.view_bobbing = view_bobbing;
+    }
+
     pub fn set_clouds(&mut self, clouds: bool) {
         self.clouds = clouds;
     }
@@ -386,8 +467,12 @@ impl Game {
     }
 
     pub fn scene(&self) -> Scene {
+        let mut camera = self.camera;
+        if self.view_bobbing {
+            self.bob[0].lerp(self.bob[1], self.alpha).sway(&mut camera);
+        }
         Scene {
-            camera: self.camera,
+            camera,
             target: self.target.map(|hit| hit.block),
             view_distance: self.view_distance,
             bounds: self.client.bounds(),
@@ -453,5 +538,40 @@ impl Game {
         {
             warn!("the server thread panicked");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sway after `ticks` of moving by `moved` a tick.
+    fn walk(moved: DVec3, on_ground: bool, ticks: usize, from: Bob) -> Bob {
+        (0..ticks).fold(from, |bob, _| bob.step(moved, on_ground))
+    }
+
+    #[test]
+    fn the_view_sways_only_while_walking_on_the_ground() {
+        let standing = walk(DVec3::ZERO, true, 20, Bob::default());
+        let mut camera = Camera::new(DVec3::new(0.5, 70.0, 0.5));
+        let still = camera;
+        standing.sway(&mut camera);
+        assert_eq!(camera.position, still.position);
+        assert_eq!((camera.roll, camera.pitch), (still.roll, still.pitch));
+
+        // At a walk, about 0.22 blocks a tick.
+        let walking = walk(DVec3::new(0.0, 0.0, -0.22), true, 20, Bob::default());
+        assert!((walking.amount - 0.1).abs() < 1e-3);
+        assert!(walking.walked > 2.0);
+        for alpha in [0.0, 0.3, 0.7] {
+            let mut swayed = still;
+            Bob::default().lerp(walking, alpha).sway(&mut swayed);
+            assert!(swayed.position.distance(still.position) <= 0.12);
+            assert!(swayed.roll.abs() <= 0.3_f32.to_radians() + 1e-6);
+        }
+
+        // In the air it dies away.
+        let jumping = walk(DVec3::new(0.0, 0.0, -0.22), false, 20, walking);
+        assert!(jumping.amount < 1e-4);
     }
 }

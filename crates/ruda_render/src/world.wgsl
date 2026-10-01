@@ -341,36 +341,86 @@ fn cascade_shadow(cascade: i32, position: vec3<f32>, normal: vec3<f32>, facing: 
     // grazes the face, so faces don't shade themselves.
     let texel = 2.0 * globals.shadow[cascade] * globals.shadow.w;
     let lifted = position + normal * texel * (1.0 + 2.0 * (1.0 - facing));
-    let light = globals.shadow_view_proj[cascade] * vec4<f32>(lifted, 1.0);
+    let matrix = globals.shadow_view_proj[cascade];
+    let light = matrix * vec4<f32>(lifted, 1.0);
     let uv = vec2<f32>(light.x * 0.5 + 0.5, 0.5 - light.y * 0.5);
     if any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) || light.z >= 1.0 {
         return 1.0;
     }
-    return tent(uv, light.z, i32(globals.shadow_layers[cascade]));
+    // As soft in every cascade, but no sharper than a couple of texels.
+    let radius = max(SHADOW_SOFTNESS / texel, 1.5) * globals.shadow.w;
+    let slope = depth_slope(matrix, normal);
+    return soft_shadow(uv, light.z, slope, radius, i32(globals.shadow_layers[cascade]));
 }
 
-// A tent filter over 5×5 texels from nine filtered comparisons (after
-// Castaño, "Shadow Mapping Summary"): the edge is soft and slides smoothly
-// as the light moves instead of stepping texel by texel.
-fn tent(uv: vec2<f32>, depth: f32, layer: i32) -> f32 {
-    let texel = globals.shadow.w;
-    let at = uv / texel;
-    let base = floor(at + 0.5);
-    let st = at + 0.5 - base;
-    let base_uv = (base - 0.5) * texel;
-    let uw = vec3<f32>(4.0 - 3.0 * st.x, 7.0, 1.0 + 3.0 * st.x);
-    let u = vec3<f32>((3.0 - 2.0 * st.x) / uw.x - 2.0, (3.0 + st.x) / uw.y, st.x / uw.z + 2.0);
-    let vw = vec3<f32>(4.0 - 3.0 * st.y, 7.0, 1.0 + 3.0 * st.y);
-    let v = vec3<f32>((3.0 - 2.0 * st.y) / vw.x - 2.0, (3.0 + st.y) / vw.y, st.y / vw.z + 2.0);
-    var sum = 0.0;
-    for (var j = 0; j < 3; j++) {
-        for (var i = 0; i < 3; i++) {
-            let offset = vec2<f32>(u[i], v[j]) * texel;
-            sum += uw[i] * vw[j]
-                * textureSampleCompareLevel(shadow_map, shadow_sampler, base_uv + offset, layer, depth);
-        }
+// How wide the soft edge of a shadow is, in blocks either way.
+const SHADOW_SOFTNESS = 0.15;
+// Comparisons averaged for a soft edge: each texel of the shadow map
+// counts for little, so edges don't twitch as the sun moves across the
+// texels.
+const SHADOW_TAPS = 32;
+
+// The share of comparisons over a disc of `radius` that find no shadow.
+// The disc is filled in a sunflower pattern, each comparison bilinearly
+// filtered. Each is made with the depth the face would have there rather
+// than at the middle, so a wide disc doesn't shade the face it lies on.
+fn soft_shadow(uv: vec2<f32>, depth: f32, slope: vec2<f32>, radius: f32, layer: i32) -> f32 {
+    // Most points are in full light or full shadow: if the middle and a
+    // ring around it agree, so does the rest of the disc.
+    var quick = shadow_tap(uv, depth, slope, vec2<f32>(0.0), layer);
+    let eighth = mat2x2<f32>(0.7071068, 0.7071068, -0.7071068, 0.7071068);
+    var around = vec2<f32>(0.9 * radius, 0.0);
+    for (var i = 0; i < 8; i++) {
+        quick += shadow_tap(uv, depth, slope, around, layer);
+        around = eighth * around;
     }
-    return sum / 144.0;
+    if quick == 0.0 || quick == 9.0 {
+        return quick / 9.0;
+    }
+    // The golden angle.
+    let turn = mat2x2<f32>(-0.7373688, 0.6754903, -0.6754903, -0.7373688);
+    var direction = vec2<f32>(1.0, 0.0);
+    var sum = 0.0;
+    for (var i = 0; i < SHADOW_TAPS; i++) {
+        let offset = direction * sqrt((f32(i) + 0.5) / f32(SHADOW_TAPS)) * radius;
+        sum += shadow_tap(uv, depth, slope, offset, layer);
+        direction = turn * direction;
+    }
+    return sum / f32(SHADOW_TAPS);
+}
+
+// One filtered comparison, `offset` across the shadow map from `uv`.
+fn shadow_tap(uv: vec2<f32>, depth: f32, slope: vec2<f32>, offset: vec2<f32>, layer: i32) -> f32 {
+    return textureSampleCompareLevel(
+        shadow_map,
+        shadow_sampler,
+        uv + offset,
+        layer,
+        depth + dot(slope, offset),
+    );
+}
+
+// How depth from the light changes across the shadow map along a face
+// turned towards `normal`: per unit of u and of v.
+fn depth_slope(matrix: mat4x4<f32>, normal: vec3<f32>) -> vec2<f32> {
+    let side = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(normal.y) > 0.5);
+    let along = normalize(cross(normal, side));
+    let across = cross(normal, along);
+    let l1 = (matrix * vec4<f32>(along, 0.0)).xyz;
+    let l2 = (matrix * vec4<f32>(across, 0.0)).xyz;
+    // How far across the map a block along the face goes: u to the right,
+    // v down.
+    let a = vec2<f32>(0.5 * l1.x, -0.5 * l1.y);
+    let b = vec2<f32>(0.5 * l2.x, -0.5 * l2.y);
+    let det = a.x * b.y - a.y * b.x;
+    if abs(det) < 1e-12 {
+        return vec2<f32>(0.0);
+    }
+    let slope = vec2<f32>(l1.z * b.y - a.y * l2.z, a.x * l2.z - l1.z * b.x) / det;
+    // Where the light grazes the face the slope grows without bound; the
+    // face gets little light there anyway.
+    let steepness = length(slope);
+    return slope * min(1.0, 1.0 / max(steepness, 1e-6));
 }
 
 @fragment

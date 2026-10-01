@@ -110,7 +110,7 @@ mod tests {
         drop(server);
         assert!(matches!(client.try_recv(), Err(RecvError::Disconnected)));
         assert_eq!(
-            client.send(&ClientMessage::Position(Default::default())),
+            client.send(&ClientMessage::Input(Default::default())),
             Err(Disconnected)
         );
     }

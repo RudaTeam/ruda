@@ -264,14 +264,33 @@ struct ShadowMap {
     cascades: [(wgpu::Buffer, wgpu::BindGroup); CASCADES],
     /// How each cascade was last drawn.
     drawn: [Option<Drawn>; CASCADES],
+    /// Frames drawn so far.
+    frames: u64,
+    /// Room of chunk geometry that was replaced or taken away while a
+    /// cascade being drawn a part at a time may still draw from it. It is
+    /// given out again once no such cascade does.
+    retired: Vec<Retired>,
+}
+
+/// A chunk's room in a page, and its slot, kept out of use for a while.
+struct Retired {
+    page: usize,
+    space: Range<u32>,
+    slot: u32,
+    /// The first frame whose cascades don't draw from it.
+    from: u64,
 }
 
 /// A cascade being drawn over a few frames.
 struct Progress {
     drawn: Drawn,
+    /// The chunks as they were when it was started: chunks changed since
+    /// keep their old geometry until it is done, see `ShadowMap::retired`.
     draws: Vec<Draw>,
     /// Parts drawn so far.
     part: usize,
+    /// The frame it was started in.
+    started: u64,
 }
 
 /// A cascade as drawn: the wider ones are drawn over a few frames and used
@@ -973,9 +992,35 @@ impl WorldPass {
 
     pub(crate) fn remove(&mut self, pos: ChunkPos) {
         if let Some(gpu) = self.chunks.remove(&pos).and_then(|entry| entry.gpu) {
-            self.pages[gpu.page].space.free(gpu.space);
-            self.slots.give_back(gpu.slot);
+            // A cascade of the shadow map started before may still draw it.
+            self.shadows.retired.push(Retired {
+                page: gpu.page,
+                space: gpu.space,
+                slot: gpu.slot,
+                from: self.shadows.frames + 1,
+            });
         }
+    }
+
+    /// Gives out again the room of chunk geometry that no cascade being
+    /// drawn draws from any more.
+    fn release_retired(&mut self) {
+        let oldest = self
+            .shadows
+            .progress
+            .iter()
+            .flatten()
+            .map(|progress| progress.started)
+            .min();
+        let (pages, slots) = (&mut self.pages, &mut self.slots);
+        self.shadows.retired.retain(|retired| {
+            let in_use = oldest.is_some_and(|started| started < retired.from);
+            if !in_use {
+                pages[retired.page].space.free(retired.space.clone());
+                slots.give_back(retired.slot);
+            }
+            in_use
+        });
     }
 
     pub(crate) fn clear(&mut self) {
@@ -983,6 +1028,9 @@ impl WorldPass {
         self.lods.clear();
         self.pages.clear();
         self.slots = Slots::new(MAX_SLOTS);
+        self.shadows.retired.clear();
+        self.shadows.progress = [None, None, None];
+        self.shadows.drawn = [None; CASCADES];
     }
 
     /// Chunks with geometry on the GPU.
@@ -1130,12 +1178,14 @@ impl WorldPass {
         ]);
         globals.floats(sky.sun_disc.extend(0.0).to_array());
         let reach = reach(scene.view_distance);
+        self.shadows.frames += 1;
         if shadowed {
             self.draw_shadows(queue, encoder, camera, reach, toward_light, timer);
         } else {
             self.shadows.drawn = [None; CASCADES];
             self.shadows.progress = [None, None, None];
         }
+        self.release_retired();
         for drawn in &self.shadows.drawn {
             // A cascade drawn a few frames ago is used from where the camera
             // was then.
@@ -1583,6 +1633,7 @@ impl WorldPass {
                     },
                     draws: self.casters(view_proj, camera),
                     part: 0,
+                    started: self.shadows.frames,
                 });
             }
             let progress = self.shadows.progress[index].as_mut().expect("just started");
@@ -2484,6 +2535,8 @@ impl ShadowMap {
             drawn: [None; CASCADES],
             front: [0; CASCADES],
             progress: [None, None, None],
+            frames: 0,
+            retired: Vec::new(),
         }
     }
 

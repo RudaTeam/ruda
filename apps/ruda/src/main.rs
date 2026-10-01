@@ -47,7 +47,7 @@ struct Args {
     time: Option<u64>,
 
     /// Start the camera at `x,y,z` or `x,y,z,yaw,pitch` (degrees) instead of
-    /// the spawn point.
+    /// the spawn point, the player flying so it stays there.
     #[arg(long, value_name = "X,Y,Z[,YAW,PITCH]", allow_hyphen_values = true)]
     camera: Option<CameraStart>,
 
@@ -436,6 +436,8 @@ impl App {
             time: self.args.time,
             lod_distance: self.args.lod_distance.unwrap_or(graphics.lod_distance),
             clouds: clouds != Clouds::Off,
+            auto_jump: self.settings.controls.auto_jump,
+            view_bobbing: graphics.view_bobbing,
         };
         self.game = Some(Game::start(config, renderer)?);
         self.resume();
@@ -533,6 +535,8 @@ impl App {
             if new.clouds != old.clouds {
                 game.set_clouds(clouds != Clouds::Off);
             }
+            game.set_auto_jump(self.settings.controls.auto_jump);
+            game.set_view_bobbing(new.view_bobbing);
         }
         self.i18n
             .set_language(self.settings.language.unwrap_or(self.system_language));
@@ -880,6 +884,8 @@ fn run_headless(args: &Args) -> Result<()> {
         time: args.time,
         lod_distance: args.lod_distance.unwrap_or(graphics.lod_distance),
         clouds: clouds != Clouds::Off,
+        auto_jump: false,
+        view_bobbing: graphics.view_bobbing,
     };
     let mut game = Game::start(config, &mut renderer)?;
     let seconds = args.benchmark.context("--headless needs --benchmark")?;

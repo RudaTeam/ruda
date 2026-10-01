@@ -27,6 +27,7 @@ ruda_input.workspace = true
 ruda_protocol.workspace = true
 ruda_render.workspace = true
 ruda_server.workspace = true
+ruda_sim.workspace = true
 ruda_ui.workspace = true
 ruda_world.workspace = true
 sys-locale.workspace = true
