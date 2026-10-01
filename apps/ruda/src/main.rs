@@ -38,6 +38,11 @@ struct Args {
     #[arg(long)]
     seed: Option<u64>,
 
+    /// Start the world at this time of day, in ticks: 0 is sunrise, 6000
+    /// noon, 12000 sunset and 18000 midnight.
+    #[arg(long, value_name = "TICKS")]
+    time: Option<u64>,
+
     /// Start the camera at `x,y,z` or `x,y,z,yaw,pitch` (degrees) instead of
     /// the spawn point.
     #[arg(long, value_name = "X,Y,Z[,YAW,PITCH]", allow_hyphen_values = true)]
@@ -315,6 +320,7 @@ impl App {
             view_distance: self.args.view_distance.unwrap_or(graphics.view_distance),
             fov: f32::from(graphics.fov),
             camera: self.args.camera,
+            time: self.args.time,
         };
         self.game = Some(Game::start(config, renderer)?);
         self.resume();

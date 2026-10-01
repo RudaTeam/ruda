@@ -6,12 +6,19 @@
 
 use glam::DVec3;
 use ruda_core::{BlockId, BlockPos, ChunkPos, ResourceId, WorldBounds};
-use ruda_world::Chunk;
+use ruda_world::{Chunk, ChunkLight};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
+
+/// Simulation steps per second.
+pub const TICK_RATE: u32 = 20;
+
+/// Ticks in a day: 20 minutes at 20 ticks a second. Time 0 is sunrise,
+/// a quarter of the day is noon, half is sunset and three quarters midnight.
+pub const DAY_LENGTH: u64 = 24_000;
 
 /// How far a player can reach to break or place blocks, measured in blocks
 /// from the eye to the block's centre. Clients aim within it and the server
@@ -47,28 +54,26 @@ pub enum ServerMessage {
         blocks: Vec<ResourceId>,
         spawn: DVec3,
         bounds: WorldBounds,
+        /// Ticks since the world began, see [`DAY_LENGTH`].
+        time: u64,
     },
     /// Closes the connection.
-    Disconnect {
-        reason: String,
-    },
-    Chunk {
-        pos: ChunkPos,
-        chunk: Chunk,
-    },
+    Disconnect { reason: String },
+    /// A chunk with its light. The server sends chunks only once their
+    /// light is final; later it changes only with [`ServerMessage::Light`].
+    Chunk { pos: ChunkPos, chunk: Chunk },
+    /// New light for a chunk the client has, after blocks changed nearby.
+    Light { pos: ChunkPos, light: ChunkLight },
+    /// The world's time, sent now and then so clocks don't drift apart.
+    Time(u64),
     /// The client should forget this chunk.
     UnloadChunk(ChunkPos),
     /// The block at `pos` is now `block`: someone changed it, or the server
     /// corrects an action of this client that it rejected.
-    BlockChanged {
-        pos: BlockPos,
-        block: BlockId,
-    },
+    BlockChanged { pos: BlockPos, block: BlockId },
     /// The server has handled action `seq`; anything it changed has already
     /// been sent as [`ServerMessage::BlockChanged`].
-    ActionDone {
-        seq: u32,
-    },
+    ActionDone { seq: u32 },
 }
 
 pub fn encode(message: &impl Serialize) -> Vec<u8> {
@@ -116,7 +121,13 @@ mod tests {
             blocks: vec!["ruda:air".parse().unwrap(), "base:stone".parse().unwrap()],
             spawn: DVec3::new(0.5, 70.0, 0.5),
             bounds: WorldBounds::DEFAULT,
+            time: 1234,
         });
+        round_trip(ServerMessage::Light {
+            pos: ChunkPos::new(1, 2, 3),
+            light: ChunkLight::uniform(ruda_core::Light::SKY),
+        });
+        round_trip(ServerMessage::Time(99));
     }
 
     #[test]
@@ -125,6 +136,7 @@ mod tests {
             blocks: vec!["base:stone".parse().unwrap()],
             spawn: DVec3::ZERO,
             bounds: WorldBounds::DEFAULT,
+            time: 0,
         };
         let mut bytes = encode(&message);
         let at = bytes.windows(5).position(|w| w == b"stone").unwrap();

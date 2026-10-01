@@ -2,7 +2,8 @@
 
 ## Block textures — Isabella II
 
-`content/base/textures/` (except `bedrock.png`, see below) comes from
+`content/base/textures/` (except `bedrock.png`, see below) and
+`content/base/sky/` come from
 [Isabella II](https://github.com/minetest-texture-packs/Isabella-II) (commit
 `8afe93927c69`), a texture pack by **Bonemouse**, licensed under the
 [Creative Commons Attribution 3.0 Unported License](https://creativecommons.org/licenses/by/3.0/).
@@ -16,6 +17,8 @@ Changes made for Ruda:
   over its stone texture;
 - `grass_side.png` is the pack's grass side overlay drawn over its dirt texture;
 - `bedrock.png` is the pack's cobblestone texture, darkened and with more contrast;
+- `lamp.png` is the pack's `default_meselamp.png`, and `sky/sun.png` and
+  `sky/moon.png` are its `misc/sun.png` and `misc/moon.png`, unchanged;
 - files are renamed to Ruda's block names.
 
 ## Font — Pixelify Sans

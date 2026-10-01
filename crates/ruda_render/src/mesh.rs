@@ -1,7 +1,8 @@
-//! Turning chunks into geometry: one packed quad per visible run of faces.
+//! Turning chunks into geometry: one packed quad per visible run of faces,
+//! with the light and ambient occlusion at each of its corners.
 
 use ruda_core::{
-    Appearance, BlockId, BlockRegistry, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, Face, LocalPos,
+    Appearance, BlockId, BlockRegistry, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, Face, Light, LocalPos,
     ResourceId,
 };
 use ruda_world::World;
@@ -13,10 +14,11 @@ const SIZE: usize = CHUNK_SIZE as usize;
 const PADDED: usize = SIZE + 2;
 
 /// For every block, the texture layer of each face, or `None` for blocks
-/// that are not drawn.
+/// that are not drawn, and whether it glows.
 #[derive(Clone, Debug, Default)]
 pub struct BlockFaces {
     faces: Vec<Option<[u16; 6]>>,
+    glowing: Vec<bool>,
 }
 
 impl BlockFaces {
@@ -31,7 +33,8 @@ impl BlockFaces {
                 }
             })
             .collect();
-        Self { faces }
+        let glowing = blocks.iter().map(|(_, def)| !def.light.is_dark()).collect();
+        Self { faces, glowing }
     }
 
     fn get(&self, id: BlockId) -> Option<[u16; 6]> {
@@ -44,66 +47,82 @@ impl BlockFaces {
     fn is_solid(&self, id: BlockId) -> bool {
         self.get(id).is_some()
     }
+
+    fn glows(&self, id: BlockId) -> bool {
+        self.glowing.get(id.index()).copied().unwrap_or(false)
+    }
 }
 
-/// A chunk's blocks with a one-block border copied from its six neighbours,
-/// enough to tell which faces touch air.
+/// A chunk's blocks and light with a one-block border copied from the 26
+/// chunks around it: enough to tell which faces touch air and how light
+/// and shadow fall on them.
 #[derive(Clone, Debug)]
 pub struct PaddedChunk {
     blocks: Box<[BlockId]>,
+    light: Box<[Light]>,
 }
 
 impl PaddedChunk {
     /// `None` if the chunk itself is not loaded. Neighbours that are not
-    /// loaded count as solid, so faces towards them stay hidden until they
-    /// arrive and the chunk is meshed again.
+    /// loaded count as solid and dark, so faces towards them stay hidden
+    /// until they arrive and the chunk is meshed again.
     pub fn gather(world: &World, pos: ChunkPos) -> Option<Self> {
         let chunk = world.chunk(pos)?;
-        let mut inner = vec![BlockId::AIR; CHUNK_VOLUME];
-        chunk.copy_to(&mut inner);
-        let mut blocks = vec![BlockId::AIR; PADDED * PADDED * PADDED].into_boxed_slice();
-        for (index, &block) in inner.iter().enumerate() {
+        let mut blocks = vec![BlockId::UNKNOWN; PADDED * PADDED * PADDED].into_boxed_slice();
+        let mut light = vec![Light::DARK; PADDED * PADDED * PADDED].into_boxed_slice();
+
+        let mut inner_blocks = vec![BlockId::AIR; CHUNK_VOLUME];
+        chunk.copy_to(&mut inner_blocks);
+        let mut inner_light = vec![Light::DARK; CHUNK_VOLUME];
+        chunk.light().copy_to(&mut inner_light);
+        for index in 0..CHUNK_VOLUME {
             let local = LocalPos::from_index(index);
-            blocks[padded_index([local.x(), local.y(), local.z()].map(|c| c as usize + 1))] = block;
+            let padded = padded_index([local.x(), local.y(), local.z()].map(|c| c as usize + 1));
+            blocks[padded] = inner_blocks[index];
+            light[padded] = inner_light[index];
         }
 
-        for face in Face::ALL {
-            let neighbour = world.chunk(pos.offset(face));
-            let axis = face.axis();
-            let (u_axis, v_axis) = plane_axes(axis);
-            // The neighbour's layer that touches this chunk, and where it goes
-            // in the border.
-            let (source, border) = if face.is_positive() {
-                (0, PADDED - 1)
-            } else {
-                (SIZE - 1, 0)
-            };
-            for v in 0..SIZE {
-                for u in 0..SIZE {
-                    let mut local = [0; 3];
-                    local[axis] = source;
-                    local[u_axis] = u;
-                    local[v_axis] = v;
-                    let block = neighbour.map_or(BlockId::UNKNOWN, |chunk| {
-                        chunk.get(LocalPos::new(
-                            local[0] as u32,
-                            local[1] as u32,
-                            local[2] as u32,
-                        ))
-                    });
-                    let mut padded = [0; 3];
-                    padded[axis] = border;
-                    padded[u_axis] = u + 1;
-                    padded[v_axis] = v + 1;
-                    blocks[padded_index(padded)] = block;
+        // The layers, edges and corners of the 26 neighbours that touch it.
+        let span = |d: i32| match d {
+            -1 => 0..1,
+            0 => 1..PADDED - 1,
+            _ => PADDED - 1..PADDED,
+        };
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    if (dx, dy, dz) == (0, 0, 0) {
+                        continue;
+                    }
+                    let Some(neighbour) =
+                        world.chunk(ChunkPos(pos.0 + glam::IVec3::new(dx, dy, dz)))
+                    else {
+                        continue;
+                    };
+                    for y in span(dy) {
+                        for z in span(dz) {
+                            for x in span(dx) {
+                                let [lx, ly, lz] =
+                                    [x, y, z].map(|c| ((c + SIZE - 1) % SIZE) as u32);
+                                let local = LocalPos::new(lx, ly, lz);
+                                let index = padded_index([x, y, z]);
+                                blocks[index] = neighbour.get(local);
+                                light[index] = neighbour.light().get(local);
+                            }
+                        }
+                    }
                 }
             }
         }
-        Some(Self { blocks })
+        Some(Self { blocks, light })
     }
 
     fn get(&self, padded: [usize; 3]) -> BlockId {
         self.blocks[padded_index(padded)]
+    }
+
+    fn light(&self, padded: [usize; 3]) -> Light {
+        self.light[padded_index(padded)]
     }
 }
 
@@ -121,23 +140,155 @@ fn plane_axes(axis: usize) -> (usize, usize) {
     }
 }
 
-/// A rectangle of identical faces, packed into two words for the GPU:
+/// A rectangle of identical faces, packed into four words for the GPU:
 ///
 /// - word 0: x, y, z of its first block (5 bits each), width − 1 and
-///   height − 1 along the face's u and v axes (5 bits each), face (3 bits);
-/// - word 1: texture layer (16 bits).
-pub type Quad = [u32; 2];
+///   height − 1 along the face's u and v axes (5 bits each), face (3 bits),
+///   whether to split it along the other diagonal (1 bit) and whether it
+///   glows (1 bit);
+/// - word 1: texture layer (10 bits), ambient occlusion of the four corners
+///   (2 bits each), and 14 bits the renderer fills in;
+/// - words 2 and 3: the light at the four corners, 16 bits each (see
+///   [`Light`]).
+///
+/// Corner `i` is at u = `i & 1`, v = `i >> 1` of the face.
+pub type Quad = [u32; 4];
 
-fn pack(block: [usize; 3], width: usize, height: usize, face: Face, layer: u16) -> Quad {
+/// Everything that has to match for neighbouring faces to merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FaceLook {
+    layer: u16,
+    glows: bool,
+    /// 0 (darkest) to 3 per corner.
+    occlusion: [u8; 4],
+    light: [Light; 4],
+}
+
+impl FaceLook {
+    /// Packs into a non-zero cell value for [`merge`].
+    fn to_cell(self) -> u128 {
+        let mut cell = 1u128 << 127 | u128::from(self.layer) | u128::from(self.glows) << 16;
+        for corner in 0..4 {
+            cell |= u128::from(self.occlusion[corner]) << (17 + 2 * corner);
+            cell |= u128::from(self.light[corner].to_raw()) << (32 + 16 * corner);
+        }
+        cell
+    }
+
+    fn from_cell(cell: u128) -> Self {
+        Self {
+            layer: cell as u16,
+            glows: cell >> 16 & 1 != 0,
+            occlusion: [0, 1, 2, 3].map(|corner| (cell >> (17 + 2 * corner) & 3) as u8),
+            light: [0, 1, 2, 3].map(|corner| Light::from_raw((cell >> (32 + 16 * corner)) as u16)),
+        }
+    }
+
+    /// How bright a corner looks, to pick the diagonal to split along.
+    fn brightness(&self, corner: usize) -> u32 {
+        let light = self.light[corner];
+        u32::from(self.occlusion[corner]) * 64
+            + (0..Light::CHANNELS)
+                .map(|c| u32::from(light.channel(c)))
+                .sum::<u32>()
+    }
+}
+
+fn pack(block: [usize; 3], width: usize, height: usize, face: Face, look: FaceLook) -> Quad {
     let [x, y, z] = block.map(|c| c as u32);
+    // Split along the diagonal whose corners are brighter, so a dark corner
+    // fades evenly instead of drawing a dark line across the face.
+    let flip = look.brightness(0) + look.brightness(3) > look.brightness(1) + look.brightness(2);
+    let occlusion = look
+        .occlusion
+        .iter()
+        .enumerate()
+        .fold(0u32, |bits, (corner, &ao)| {
+            bits | u32::from(ao) << (2 * corner)
+        });
+    let light = look.light.map(|light| u32::from(light.to_raw()));
     [
         x | y << 5
             | z << 10
             | (width as u32 - 1) << 15
             | (height as u32 - 1) << 20
-            | (face.index() as u32) << 25,
-        u32::from(layer),
+            | (face.index() as u32) << 25
+            | u32::from(flip) << 28
+            | u32::from(look.glows) << 29,
+        u32::from(look.layer) & 0x3ff | occlusion << 10,
+        light[0] | light[1] << 16,
+        light[2] | light[3] << 16,
     ]
+}
+
+/// How a face of the block at `padded` looks: the light of the open blocks
+/// in front of each corner and how much the blocks around shade it.
+fn face_look(
+    chunk: &PaddedChunk,
+    faces: &BlockFaces,
+    padded: [usize; 3],
+    face: Face,
+    layer: u16,
+) -> FaceLook {
+    let axis = face.axis();
+    let (u_axis, v_axis) = plane_axes(axis);
+    let mut front = padded;
+    front[axis] = if face.is_positive() {
+        front[axis] + 1
+    } else {
+        front[axis] - 1
+    };
+    let step = |mut cell: [usize; 3], axis: usize, up: bool| {
+        cell[axis] = if up { cell[axis] + 1 } else { cell[axis] - 1 };
+        cell
+    };
+    let open = |cell: [usize; 3]| !faces.is_solid(chunk.get(cell));
+
+    let mut occlusion = [0; 4];
+    let mut light = [Light::DARK; 4];
+    for corner in 0..4 {
+        let (up_u, up_v) = (corner & 1 == 1, corner >> 1 == 1);
+        let side_u = step(front, u_axis, up_u);
+        let side_v = step(front, v_axis, up_v);
+        let diagonal = step(side_u, v_axis, up_v);
+        let (open_u, open_v) = (open(side_u), open(side_v));
+        // Light can't squeeze between two blocks touching at an edge.
+        let open_diagonal = (open_u || open_v) && open(diagonal);
+        occlusion[corner] = if !open_u && !open_v {
+            0
+        } else {
+            u8::from(open_u) + u8::from(open_v) + u8::from(open_diagonal)
+        };
+
+        let mut sum = [0u32; Light::CHANNELS];
+        let mut count = 0;
+        for (cell, open) in [
+            (front, true),
+            (side_u, open_u),
+            (side_v, open_v),
+            (diagonal, open_diagonal),
+        ] {
+            if open {
+                let sample = chunk.light(cell);
+                for (channel, sum) in sum.iter_mut().enumerate() {
+                    *sum += u32::from(sample.channel(channel));
+                }
+                count += 1;
+            }
+        }
+        light[corner] = Light::new(
+            ((sum[0] * 2 + count) / (2 * count)) as u8,
+            ((sum[1] * 2 + count) / (2 * count)) as u8,
+            ((sum[2] * 2 + count) / (2 * count)) as u8,
+            ((sum[3] * 2 + count) / (2 * count)) as u8,
+        );
+    }
+    FaceLook {
+        layer,
+        glows: faces.glows(chunk.get(padded)),
+        occlusion,
+        light,
+    }
 }
 
 /// The geometry of one chunk.
@@ -166,8 +317,8 @@ impl ChunkMesh {
     }
 }
 
-/// Builds the chunk's visible faces, merging neighbouring faces with the
-/// same texture into larger rectangles (greedy meshing).
+/// Builds the chunk's visible faces, merging neighbouring faces that look
+/// the same into larger rectangles (greedy meshing).
 ///
 /// Visibility is found a whole column at a time: every column of the padded
 /// chunk along each axis becomes a 64-bit mask of solid blocks, and
@@ -193,15 +344,16 @@ pub fn mesh_chunk(chunk: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
 
     let mut quads = Vec::new();
     let mut face_counts = [0; 6];
-    // Per slice, texture layer + 1 of each visible face; 0 where there is none.
-    let mut planes = vec![[[0u16; SIZE]; SIZE]; SIZE];
     for face in Face::ALL {
         let before = quads.len();
         let axis = face.axis();
         let (u_axis, v_axis) = plane_axes(axis);
+        // visible[v][u]: bit s is set if the face of the block in slice s
+        // at (u, v) is visible.
+        let mut visible = [[0u32; SIZE]; SIZE];
         let mut slices_used = 0u32;
-        for v in 0..SIZE {
-            for u in 0..SIZE {
+        for (v, row) in visible.iter_mut().enumerate() {
+            for (u, visible) in row.iter_mut().enumerate() {
                 let column = columns[axis][(v + 1) * PADDED + u + 1];
                 let open = if face.is_positive() {
                     column & !(column >> 1)
@@ -209,29 +361,35 @@ pub fn mesh_chunk(chunk: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
                     column & !(column << 1)
                 };
                 // Padded coordinates 1..=32 are the chunk's own slices 0..32.
-                let mut visible = (open >> 1) as u32;
-                while visible != 0 {
-                    let slice = visible.trailing_zeros() as usize;
-                    visible &= visible - 1;
-                    let mut padded = [0; 3];
-                    padded[axis] = slice + 1;
-                    padded[u_axis] = u + 1;
-                    padded[v_axis] = v + 1;
-                    let layers = faces.get(chunk.get(padded)).unwrap_or_default();
-                    planes[slice][v][u] = layers[face.index()] + 1;
-                    slices_used |= 1 << slice;
-                }
+                *visible = (open >> 1) as u32;
+                slices_used |= *visible;
             }
         }
         while slices_used != 0 {
             let slice = slices_used.trailing_zeros() as usize;
             slices_used &= slices_used - 1;
-            merge(&mut planes[slice], |u, v, width, height, cell| {
+            // Per face, how it looks; 0 where there is none.
+            let mut plane = [[0u128; SIZE]; SIZE];
+            for v in 0..SIZE {
+                for u in 0..SIZE {
+                    if visible[v][u] >> slice & 1 == 0 {
+                        continue;
+                    }
+                    let mut padded = [0; 3];
+                    padded[axis] = slice + 1;
+                    padded[u_axis] = u + 1;
+                    padded[v_axis] = v + 1;
+                    let layers = faces.get(chunk.get(padded)).unwrap_or_default();
+                    plane[v][u] =
+                        face_look(chunk, faces, padded, face, layers[face.index()]).to_cell();
+                }
+            }
+            merge(&mut plane, |u, v, width, height, cell| {
                 let mut block = [0; 3];
                 block[axis] = slice;
                 block[u_axis] = u;
                 block[v_axis] = v;
-                quads.push(pack(block, width, height, face, cell - 1));
+                quads.push(pack(block, width, height, face, FaceLook::from_cell(cell)));
             });
         }
         face_counts[face.index()] = (quads.len() - before) as u32;
@@ -253,7 +411,7 @@ pub fn mesh_chunk(chunk: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
 
 /// Covers the non-zero cells with rectangles of equal cells, widest rows
 /// first, and clears them.
-fn merge(cells: &mut [[u16; SIZE]; SIZE], mut emit: impl FnMut(usize, usize, usize, usize, u16)) {
+fn merge(cells: &mut [[u128; SIZE]; SIZE], mut emit: impl FnMut(usize, usize, usize, usize, u128)) {
     for v in 0..SIZE {
         let mut u = 0;
         while u < SIZE {
@@ -318,20 +476,21 @@ mod tests {
             ((w >> 15) & 31) + 1,
             ((w >> 20) & 31) + 1,
             Face::ALL[(w >> 25) as usize & 7],
-            quad[1],
+            quad[1] & 0x3ff,
         )
     }
 
     /// A world with one chunk at the origin surrounded by air chunks.
     fn world_with(chunk: Chunk) -> World {
         let mut world = World::new();
-        world.insert_chunk(ChunkPos::new(0, 0, 0), chunk);
-        for face in Face::ALL {
-            world.insert_chunk(
-                ChunkPos::new(0, 0, 0).offset(face),
-                Chunk::filled(BlockId::AIR),
-            );
+        for y in -1..=1 {
+            for z in -1..=1 {
+                for x in -1..=1 {
+                    world.insert_chunk(ChunkPos::new(x, y, z), Chunk::filled(BlockId::AIR));
+                }
+            }
         }
+        world.insert_chunk(ChunkPos::new(0, 0, 0), chunk);
         world
     }
 
@@ -473,7 +632,14 @@ mod tests {
         world.insert_chunk(ChunkPos::new(0, 1, 0), Chunk::filled(BlockId::AIR));
         let padded = PaddedChunk::gather(&world, ChunkPos::new(0, 0, 0)).unwrap();
         let mesh = mesh_chunk(&padded, &f.faces);
-        assert_eq!(mesh.quads.len(), 1);
-        assert_eq!(unpack(mesh.quads[0]).3, Face::PosY);
+        // Only the top shows; its edges are shaded by the missing neighbours.
+        let area: u32 = mesh
+            .quads
+            .iter()
+            .map(|&quad| unpack(quad))
+            .inspect(|quad| assert_eq!(quad.3, Face::PosY))
+            .map(|(_, width, height, _, _)| width * height)
+            .sum();
+        assert_eq!(area, 32 * 32);
     }
 }

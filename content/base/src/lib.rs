@@ -11,7 +11,7 @@ use ruda_worldgen::{Ore, TerrainGenerator, TerrainSettings};
 pub const NAMESPACE: &str = "base";
 
 /// Blocks a player can place, in hotbar order.
-pub const HOTBAR: [&str; 9] = [
+pub const HOTBAR: [&str; 10] = [
     "stone",
     "cobblestone",
     "dirt",
@@ -21,7 +21,12 @@ pub const HOTBAR: [&str; 9] = [
     "planks",
     "copper_ore",
     "iron_ore",
+    "lamp",
 ];
+
+/// The sun and the moon, for the renderer's sky.
+pub const SUN: &[u8] = include_bytes!("../sky/sun.png");
+pub const MOON: &[u8] = include_bytes!("../sky/moon.png");
 
 macro_rules! textures {
     ($($name:literal),* $(,)?) => {
@@ -29,7 +34,7 @@ macro_rules! textures {
     };
 }
 
-const TEXTURES: [(&str, &[u8]); 11] = textures![
+const TEXTURES: [(&str, &[u8]); 12] = textures![
     "bedrock",
     "cobblestone",
     "copper_ore",
@@ -38,6 +43,7 @@ const TEXTURES: [(&str, &[u8]); 11] = textures![
     "grass_top",
     "gravel",
     "iron_ore",
+    "lamp",
     "planks",
     "sand",
     "stone",
@@ -77,6 +83,9 @@ pub fn register(content: &mut ContentBuilder) -> Result<(), ContentError> {
     content.add_block(BlockDef::new(id("grass")?, Appearance::Cube(grass)))?;
     let bedrock = CubeTextures::all(id("bedrock")?);
     content.add_block(BlockDef::new(id("bedrock")?, Appearance::Cube(bedrock)).unbreakable())?;
+    // A warm, amber light.
+    let lamp = CubeTextures::all(id("lamp")?);
+    content.add_block(BlockDef::new(id("lamp")?, Appearance::Cube(lamp)).emits_light(15, 12, 7))?;
     Ok(())
 }
 
@@ -169,5 +178,10 @@ mod tests {
         terrain(content.blocks(), 1, WorldBounds::DEFAULT).unwrap();
         let bedrock = content.blocks().id(&id("bedrock").unwrap()).unwrap();
         assert!(!content.blocks().is_breakable(bedrock));
+        let lamp = content.blocks().id(&id("lamp").unwrap()).unwrap();
+        assert!(!content.blocks().light(lamp).is_dark());
+        for png in [SUN, MOON] {
+            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
     }
 }

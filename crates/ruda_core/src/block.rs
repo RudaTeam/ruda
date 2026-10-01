@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{ContentError, Face, ResourceId};
+use crate::{ContentError, Face, Light, ResourceId};
 
 /// Numeric id of a registered block. Ids are only valid within one session:
 /// the server assigns them when content is registered and tells clients the
@@ -75,6 +75,8 @@ pub struct BlockDef {
     /// Whether players can break it. Unbreakable blocks can't be placed by
     /// players either.
     pub breakable: bool,
+    /// The light it gives off; its sky channel is unused.
+    pub light: Light,
 }
 
 impl BlockDef {
@@ -83,6 +85,7 @@ impl BlockDef {
             id,
             appearance,
             breakable: true,
+            light: Light::DARK,
         }
     }
 
@@ -91,10 +94,21 @@ impl BlockDef {
         self
     }
 
+    /// Makes the block give off light of this colour, each channel 0 to 15.
+    pub fn emits_light(mut self, red: u8, green: u8, blue: u8) -> Self {
+        self.light = Light::rgb(red, green, blue);
+        self
+    }
+
     /// Whether the block fills its whole cell: it hides the faces of its
     /// neighbours and stops movement.
     pub fn is_solid(&self) -> bool {
         matches!(self.appearance, Appearance::Cube(_))
+    }
+
+    /// Whether light can't pass through it.
+    pub fn is_opaque(&self) -> bool {
+        self.is_solid()
     }
 }
 
@@ -153,6 +167,15 @@ impl BlockRegistry {
 
     pub fn is_breakable(&self, id: BlockId) -> bool {
         self.get(id).breakable
+    }
+
+    pub fn is_opaque(&self, id: BlockId) -> bool {
+        self.get(id).is_opaque()
+    }
+
+    /// The light the block gives off.
+    pub fn light(&self, id: BlockId) -> Light {
+        self.get(id).light
     }
 
     pub fn len(&self) -> usize {

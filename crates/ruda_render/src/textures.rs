@@ -65,6 +65,17 @@ impl BlockTextures {
 }
 
 fn decode(png: &[u8]) -> Result<Vec<u8>> {
+    let (width, height, pixels) = decode_image(png, TEXTURE_SIZE)?;
+    ensure!(
+        (width, height) == (TEXTURE_SIZE, TEXTURE_SIZE),
+        "expected {TEXTURE_SIZE}×{TEXTURE_SIZE} pixels, got {width}×{height}"
+    );
+    Ok(pixels)
+}
+
+/// Width, height and RGBA pixels of a PNG image at most `max_size` pixels
+/// on a side.
+pub(crate) fn decode_image(png: &[u8], max_size: u32) -> Result<(u32, u32, Vec<u8>)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info()?;
@@ -72,13 +83,13 @@ fn decode(png: &[u8]) -> Result<Vec<u8>> {
     let mut pixels = vec![0; size];
     let frame = reader.next_frame(&mut pixels)?;
     ensure!(
-        (frame.width, frame.height) == (TEXTURE_SIZE, TEXTURE_SIZE),
-        "expected {TEXTURE_SIZE}×{TEXTURE_SIZE} pixels, got {}×{}",
+        frame.width <= max_size && frame.height <= max_size,
+        "images can be at most {max_size}×{max_size} pixels, this one is {}×{}",
         frame.width,
         frame.height
     );
     pixels.truncate(frame.buffer_size());
-    Ok(match frame.color_type {
+    let rgba = match frame.color_type {
         png::ColorType::Rgba => pixels,
         png::ColorType::Rgb => pixels
             .as_chunks::<3>()
@@ -94,7 +105,8 @@ fn decode(png: &[u8]) -> Result<Vec<u8>> {
             .collect(),
         png::ColorType::Grayscale => pixels.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         png::ColorType::Indexed => unreachable!("EXPAND turns palettes into RGB(A)"),
-    })
+    };
+    Ok((frame.width, frame.height, rgba))
 }
 
 fn missing_texture() -> Vec<u8> {

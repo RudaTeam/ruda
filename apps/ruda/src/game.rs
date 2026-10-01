@@ -6,11 +6,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
-use glam::{DVec3, Vec3};
+use glam::{DVec3, IVec3, Vec3};
 use ruda_client::{Client, Event};
-use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ContentBuilder, Face, WorldBounds};
+use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ContentBuilder, Light, WorldBounds};
 use ruda_input::{Action, Input};
-use ruda_protocol::REACH;
+use ruda_protocol::{DAY_LENGTH, REACH};
 use ruda_render::{Camera, ChunkMesher, Renderer, Scene};
 use ruda_server::ServerConfig;
 use ruda_world::{RayHit, raycast};
@@ -35,6 +35,8 @@ pub struct GameConfig {
     pub fov: f32,
     /// Where the camera starts instead of the spawn point.
     pub camera: Option<CameraStart>,
+    /// The time the world starts at, in ticks; see [`DAY_LENGTH`].
+    pub time: Option<u64>,
 }
 
 /// A camera position and direction, angles in degrees.
@@ -99,10 +101,14 @@ impl Game {
         let content = Arc::new(content.build());
         let bounds = WorldBounds::DEFAULT;
         let generator = Arc::new(ruda_base::terrain(content.blocks(), config.seed, bounds)?);
-        let server_config = ServerConfig {
+        let mut server_config = ServerConfig {
             view_distance: i32::from(MAX_VIEW_DISTANCE),
             bounds,
+            ..Default::default()
         };
+        if let Some(time) = config.time {
+            server_config.start_time = time;
+        }
         let (server, connection) =
             ruda_server::spawn_integrated(Arc::clone(&content), generator, server_config)
                 .context("failed to start the server")?;
@@ -111,6 +117,7 @@ impl Game {
         client.set_view_distance(config.view_distance);
 
         let faces = Arc::new(renderer.load_block_textures(&content));
+        renderer.set_sky_textures(ruda_base::SUN, ruda_base::MOON);
         let hotbar = ruda_base::HOTBAR
             .iter()
             .filter_map(|&name| Some((name, content.blocks().id(&ruda_base::id(name).ok()?)?)))
@@ -169,13 +176,17 @@ impl Game {
                     renderer.remove_chunk(pos);
                 }
                 Event::BlockChanged(pos) => {
-                    // A block on a chunk border also changes the neighbour's faces.
-                    self.mesher.mark_dirty(pos.chunk());
-                    for face in Face::ALL {
-                        let neighbour = pos.offset(face).chunk();
-                        if neighbour != pos.chunk() {
-                            self.mesher.mark_dirty(neighbour);
-                        }
+                    // A block next to a chunk border also changes the
+                    // neighbour's faces and the shading of their corners.
+                    for offset in (-1..=1).flat_map(|y| {
+                        (-1..=1).flat_map(move |z| (-1..=1).map(move |x| IVec3::new(x, y, z)))
+                    }) {
+                        self.mesher.mark_dirty(BlockPos(pos.0 + offset).chunk());
+                    }
+                }
+                Event::LightChanged(chunks) => {
+                    for pos in chunks {
+                        self.mesher.mark_dirty(pos);
                     }
                 }
                 Event::Disconnected { reason } => return Err(anyhow!("disconnected: {reason}")),
@@ -284,6 +295,8 @@ impl Game {
             target: self.target.map(|hit| hit.block),
             view_distance: self.view_distance,
             bounds: self.client.bounds(),
+            time_of_day: self.time_of_day(),
+            eye_light: self.eye_light(),
         }
     }
 
@@ -293,15 +306,35 @@ impl Game {
         self.joined && self.mesher.backlog() == 0 && self.last_change.elapsed() > LOAD_QUIET
     }
 
+    /// Fraction of the day gone: 0 sunrise, 0.25 noon, 0.5 sunset, 0.75
+    /// midnight.
+    fn time_of_day(&self) -> f32 {
+        let time = self.client.time().unwrap_or(0.0);
+        (time.rem_euclid(DAY_LENGTH as f64) / DAY_LENGTH as f64) as f32
+    }
+
+    /// The light where the camera is: open sky outside the loaded world.
+    fn eye_light(&self) -> Light {
+        let pos = BlockPos(self.camera.position.floor().as_ivec3());
+        self.client
+            .world()
+            .chunk(pos.chunk())
+            .map_or(Light::SKY, |chunk| chunk.light().get(pos.local()))
+    }
+
     /// Debug information for the window title.
     pub fn status(&self) -> String {
         let p = self.camera.position;
         let block = self.hotbar.get(self.selected).map_or("", |(name, _)| name);
+        // Sunrise is 6 o'clock.
+        let minutes = ((self.time_of_day() * 24.0 + 6.0) * 60.0) as u32 % (24 * 60);
         format!(
-            "{:.0} {:.0} {:.0} · {block} · {} chunks, {} meshing",
+            "{:.0} {:.0} {:.0} · {:02}:{:02} · {block} · {} chunks, {} meshing",
             p.x,
             p.y,
             p.z,
+            minutes / 60,
+            minutes % 60,
             self.client.world().chunk_count(),
             self.mesher.backlog()
         )

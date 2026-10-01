@@ -8,6 +8,7 @@ mod camera;
 mod culling;
 mod mesh;
 mod mesher;
+mod sky;
 mod textures;
 mod visibility;
 mod world_pass;
@@ -16,7 +17,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use ruda_core::{BlockPos, ChunkPos, Content, WorldBounds};
+use ruda_core::{BlockPos, ChunkPos, Content, Light, WorldBounds};
 use tracing::{info, warn};
 use wgpu::rwh::{HasDisplayHandle, HasWindowHandle};
 
@@ -63,6 +64,11 @@ pub struct Scene {
     pub view_distance: f32,
     /// The heights the world spans; above it there is only sky.
     pub bounds: Option<WorldBounds>,
+    /// Fraction of the day gone: 0 sunrise, 0.25 noon, 0.5 sunset,
+    /// 0.75 midnight.
+    pub time_of_day: f32,
+    /// The light where the camera is; from caves the sky looks dark.
+    pub eye_light: Light,
 }
 
 /// What the last frame drew.
@@ -342,6 +348,12 @@ impl Renderer {
         BlockFaces::new(content.blocks(), |id| textures.layer(id))
     }
 
+    /// The sun and moon images, PNG-encoded, up to 32 pixels square.
+    pub fn set_sky_textures(&mut self, sun: &[u8], moon: &[u8]) {
+        self.world
+            .set_sky_textures(&self.device, &self.queue, sun, moon);
+    }
+
     /// Replaces the geometry drawn for a chunk.
     pub fn upload_chunk(&mut self, pos: ChunkPos, mesh: &ChunkMesh) {
         self.world.upload(&self.device, &self.queue, pos, mesh);
@@ -575,14 +587,10 @@ impl Renderer {
         let format = self.config.format;
         let view = &target.create_view(&wgpu::TextureViewDescriptor::default());
         match backdrop {
-            Backdrop::World(scene) => self.world.draw(
-                &self.queue,
-                encoder,
-                view,
-                scene,
-                (width, height),
-                sky_color(format),
-            ),
+            Backdrop::World(scene) => {
+                self.world
+                    .draw(&self.queue, encoder, view, scene, (width, height))
+            }
             Backdrop::Color(rgb) => {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("backdrop"),
@@ -683,13 +691,6 @@ fn create_surface(
         .context("failed to create the window surface")
 }
 
-/// Sky blue as sRGB components.
-const SKY: [f64; 3] = [0.53, 0.81, 0.92];
-
-fn sky_color(format: wgpu::TextureFormat) -> wgpu::Color {
-    color(SKY, format)
-}
-
 /// An sRGB colour as the surface `format` expects it: sRGB surfaces take
 /// linear values and encode them on write.
 fn color(srgb: [f64; 3], format: wgpu::TextureFormat) -> wgpu::Color {
@@ -701,7 +702,7 @@ fn color(srgb: [f64; 3], format: wgpu::TextureFormat) -> wgpu::Color {
     wgpu::Color { r, g, b, a: 1.0 }
 }
 
-fn srgb_to_linear(c: f64) -> f64 {
+pub(crate) fn srgb_to_linear(c: f64) -> f64 {
     if c <= 0.04045 {
         c / 12.92
     } else {

@@ -14,7 +14,9 @@ What we're aiming for:
 - a modding API that can carry big tech mods: machines, power networks, their own UIs.
 
 It's very early. You can fly around a generated world with hills, caves and
-ore, and break and place blocks. The world is endless sideways and 256 blocks
+ore, break and place blocks, and light caves with lamps. Days and nights pass
+every 20 minutes, light spreads from the sky and from glowing blocks in colour,
+and corners are softly shaded. The world is endless sideways and 256 blocks
 tall, from −128 to +127, with sea level at 0 and unbreakable bedrock at the
 bottom. Single-player already runs on a local server
 inside the game; there's no survival, saving or network play yet.
@@ -44,13 +46,15 @@ In the game:
 | Space / Left Shift | Up / down |
 | Left Ctrl | Fly faster |
 | Left / right click | Break / place a block |
-| 1–9 | Pick the block to place |
+| 1–9, 0 | Pick the block to place |
 | Esc | Pause menu |
 
 The client takes a few options:
 
 - `--singleplayer` skips the menu and starts a world right away.
 - `--seed <N>` picks the world; without it every start is a new world.
+- `--time <TICKS>` starts at a time of day: 0 is sunrise, 6000 noon, 12000
+  sunset and 18000 midnight.
 - `--view-distance <CHUNKS>` overrides how far the world loads, in chunks of 32
   blocks, up to 32 (6 by default; try 2 or 3 on weak hardware).
 - `--gpu-backend <auto|vulkan|metal|dx12|gl>` overrides the graphics API. You

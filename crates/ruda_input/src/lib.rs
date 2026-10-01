@@ -19,7 +19,7 @@ pub enum Action {
     Sprint,
     Break,
     Place,
-    /// Select hotbar slot 0–8.
+    /// Select hotbar slot 0–9.
     Hotbar(u8),
     /// Open the pause menu.
     Pause,
@@ -53,7 +53,7 @@ impl Default for Bindings {
         .map(|(key, action)| (Button::Key(key), action))
         .collect();
         let digits = [
-            Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9,
+            Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9, Digit0,
         ];
         for (slot, key) in digits.into_iter().enumerate() {
             bindings.insert(Button::Key(key), Hotbar(slot as u8));

@@ -5,12 +5,13 @@
 //! either confirms them or sends back what the world really looks like.
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use glam::DVec3;
-use ruda_core::{BlockId, BlockPos, ChunkPos, Content, WorldBounds};
+use glam::{DVec3, IVec3};
+use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ChunkPos, Content, LocalPos, WorldBounds};
 use ruda_net::{ClientConnection, Disconnected, RecvError};
-use ruda_protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
-use ruda_world::World;
+use ruda_protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, TICK_RATE};
+use ruda_world::{ChunkLight, World};
 
 /// Something that happened since the last [`Client::update`].
 #[derive(Clone, Debug, PartialEq)]
@@ -23,6 +24,9 @@ pub enum Event {
     ChunkUnloaded(ChunkPos),
     /// A block changed, by this player's action or anybody else's.
     BlockChanged(BlockPos),
+    /// Light changed; these chunks look different now, as their own light
+    /// or that of blocks right next to them changed.
+    LightChanged(Vec<ChunkPos>),
     /// The connection is over; no events follow.
     Disconnected {
         reason: String,
@@ -36,6 +40,8 @@ pub struct Client {
     world: World,
     spawn: Option<DVec3>,
     bounds: Option<WorldBounds>,
+    /// The server's time and when it arrived.
+    time: Option<(u64, Instant)>,
     events: Vec<Event>,
     next_seq: u32,
     /// Actions the server has not answered yet.
@@ -61,6 +67,7 @@ impl Client {
             world: World::new(),
             spawn: None,
             bounds: None,
+            time: None,
             events: Vec::new(),
             next_seq: 0,
             pending: 0,
@@ -90,7 +97,9 @@ impl Client {
                 blocks,
                 spawn,
                 bounds,
+                time,
             } => {
+                self.time = Some((time, Instant::now()));
                 let ours = self.content.blocks().iter().map(|(_, def)| &def.id);
                 if !ours.eq(blocks.iter()) {
                     return self.disconnect("this game's content differs from the server's");
@@ -118,6 +127,16 @@ impl Client {
                     self.events.push(Event::BlockChanged(pos));
                 }
             }
+            ServerMessage::Light { pos, light } => {
+                if let Some(chunk) = self.world.chunk_mut(pos) {
+                    let affected = affected_by(pos, chunk.light(), &light);
+                    chunk.set_light(light);
+                    if !affected.is_empty() {
+                        self.events.push(Event::LightChanged(affected));
+                    }
+                }
+            }
+            ServerMessage::Time(time) => self.time = Some((time, Instant::now())),
             ServerMessage::ActionDone { .. } => self.pending = self.pending.saturating_sub(1),
         }
     }
@@ -216,6 +235,13 @@ impl Client {
         self.spawn
     }
 
+    /// The world's time in ticks, counting on smoothly between the server's
+    /// updates; see [`ruda_protocol::DAY_LENGTH`].
+    pub fn time(&self) -> Option<f64> {
+        let (time, at) = self.time?;
+        Some(time as f64 + at.elapsed().as_secs_f64() * f64::from(TICK_RATE))
+    }
+
     /// The heights blocks can exist at, once joined.
     pub fn bounds(&self) -> Option<WorldBounds> {
         self.bounds
@@ -228,5 +254,69 @@ impl Client {
 
     pub fn is_connected(&self) -> bool {
         self.connected
+    }
+}
+
+/// Chunks whose looks depend on light that changed from `old` to `new` in
+/// the chunk at `pos`: the chunk itself, and neighbours touching blocks
+/// whose light changed.
+fn affected_by(pos: ChunkPos, old: &ChunkLight, new: &ChunkLight) -> Vec<ChunkPos> {
+    if old == new {
+        return Vec::new();
+    }
+    let last = CHUNK_SIZE as u32 - 1;
+    let mut near = [false; 27];
+    for local in LocalPos::all() {
+        if old.get(local) == new.get(local) {
+            continue;
+        }
+        let range = |c: u32| (if c == 0 { -1 } else { 0 })..=(if c == last { 1 } else { 0 });
+        for y in range(local.y()) {
+            for z in range(local.z()) {
+                for x in range(local.x()) {
+                    near[((y + 1) * 9 + (z + 1) * 3 + (x + 1)) as usize] = true;
+                }
+            }
+        }
+    }
+    (0..27)
+        .filter(|&index| near[index])
+        .map(|index| {
+            let index = index as i32;
+            let offset = IVec3::new(index % 3 - 1, index / 9 - 1, index / 3 % 3 - 1);
+            ChunkPos(pos.0 + offset)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use ruda_core::Light;
+
+    use super::*;
+
+    #[test]
+    fn light_changes_reach_the_neighbours_they_touch() {
+        let pos = ChunkPos::new(2, 0, -1);
+        let old = ChunkLight::uniform(Light::DARK);
+
+        let mut middle = old.clone();
+        middle.set(LocalPos::new(10, 10, 10), Light::SKY);
+        assert_eq!(affected_by(pos, &old, &middle), vec![pos]);
+
+        let mut corner = old.clone();
+        corner.set(LocalPos::new(0, 31, 5), Light::SKY);
+        let mut affected = affected_by(pos, &old, &corner);
+        affected.sort_by_key(|p| (p.0.x, p.0.y, p.0.z));
+        assert_eq!(
+            affected,
+            vec![
+                ChunkPos::new(1, 0, -1),
+                ChunkPos::new(1, 1, -1),
+                pos,
+                ChunkPos::new(2, 1, -1),
+            ]
+        );
+        assert!(affected_by(pos, &old, &old).is_empty());
     }
 }

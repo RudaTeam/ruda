@@ -15,15 +15,18 @@ use tracing::warn;
 use crate::arena::{RangeAllocator, Slots};
 use crate::camera::Frustum;
 use crate::culling::visible_chunks;
+use crate::sky::SkyLook;
 use crate::textures::{BlockTextures, MIP_LEVELS, TEXTURE_SIZE};
 use crate::{ChunkMesh, RenderStats, Scene, Visibility};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 /// Bytes of the `Globals` uniform in `world.wgsl`.
-const GLOBALS_SIZE: u64 = 160;
-const QUAD_BYTES: u64 = 8;
+const GLOBALS_SIZE: u64 = 304;
+/// Edge length of the sun and moon images; smaller ones are centred.
+const SKY_TEXTURE_SIZE: u32 = 32;
+const QUAD_BYTES: u64 = 16;
 /// Quads per page: 8 MiB.
-const PAGE_QUADS: u32 = 1 << 20;
+const PAGE_QUADS: u32 = 1 << 19;
 /// Width and height of the chunk position texture, `ORIGINS_WIDTH` in
 /// `world.wgsl`. Its texels are the chunk slots.
 const ORIGINS_WIDTH: u32 = 128;
@@ -35,9 +38,15 @@ pub(crate) struct WorldPass {
     globals_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     block_textures: wgpu::TextureView,
+    /// The sun and the moon.
+    sky_textures: wgpu::TextureView,
+    /// Whether the target takes linear colours and encodes them as sRGB.
+    linear_output: bool,
     /// Position of each slot's chunk, as `Rgba32Sint` texels.
     origins: wgpu::Texture,
     origins_view: wgpu::TextureView,
+    sky_pipeline: wgpu::RenderPipeline,
+    celestial_pipeline: wgpu::RenderPipeline,
     chunk_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     crosshair_pipeline: wgpu::RenderPipeline,
@@ -133,6 +142,16 @@ impl WorldPass {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -161,13 +180,13 @@ impl WorldPass {
             view_formats: &[],
         });
         let origins_view = origins.create_view(&Default::default());
+        let sky_textures = upload_sky_textures(device, queue, [None, None]);
         let globals_group = Self::globals_group(
             device,
             &globals_layout,
             &globals,
             &sampler,
-            &block_textures,
-            &origins_view,
+            [&block_textures, &origins_view, &sky_textures],
         );
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -182,7 +201,8 @@ impl WorldPass {
                         buffers: &[Option<wgpu::VertexBufferLayout>],
                         topology,
                         cull_mode,
-                        depth: (bool, wgpu::CompareFunction)| {
+                        depth: (bool, wgpu::CompareFunction),
+                        blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
@@ -210,17 +230,21 @@ impl WorldPass {
                     module: &shader,
                     entry_point: Some(fragment),
                     compilation_options: Default::default(),
-                    targets: &[Some(color_format.into())],
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
                 }),
                 multiview_mask: None,
                 cache: None,
             })
         };
         let quad_buffer = wgpu::VertexBufferLayout {
-            array_stride: 8,
+            array_stride: QUAD_BYTES,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &[wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Uint32x2,
+                format: wgpu::VertexFormat::Uint32x4,
                 offset: 0,
                 shader_location: 0,
             }],
@@ -234,6 +258,29 @@ impl WorldPass {
             wgpu::PrimitiveTopology::TriangleStrip,
             Some(wgpu::Face::Back),
             (true, wgpu::CompareFunction::Less),
+            None,
+        );
+        let sky_pipeline = pipeline(
+            "sky",
+            &layout,
+            "sky_vertex",
+            "sky_fragment",
+            &[],
+            wgpu::PrimitiveTopology::TriangleList,
+            None,
+            (false, wgpu::CompareFunction::Always),
+            None,
+        );
+        let celestial_pipeline = pipeline(
+            "sun and moon",
+            &layout,
+            "celestial_vertex",
+            "celestial_fragment",
+            &[],
+            wgpu::PrimitiveTopology::TriangleList,
+            None,
+            (false, wgpu::CompareFunction::Always),
+            Some(wgpu::BlendState::ALPHA_BLENDING),
         );
         let outline_pipeline = pipeline(
             "block outline",
@@ -244,6 +291,7 @@ impl WorldPass {
             wgpu::PrimitiveTopology::LineList,
             None,
             (false, wgpu::CompareFunction::LessEqual),
+            None,
         );
         let crosshair_pipeline = pipeline(
             "crosshair",
@@ -254,6 +302,7 @@ impl WorldPass {
             wgpu::PrimitiveTopology::TriangleList,
             None,
             (false, wgpu::CompareFunction::Always),
+            None,
         );
 
         Self {
@@ -262,8 +311,12 @@ impl WorldPass {
             globals_group,
             sampler,
             block_textures,
+            sky_textures,
+            linear_output: color_format.is_srgb(),
             origins,
             origins_view,
+            sky_pipeline,
+            celestial_pipeline,
             chunk_pipeline,
             outline_pipeline,
             crosshair_pipeline,
@@ -285,13 +338,34 @@ impl WorldPass {
         textures: &BlockTextures,
     ) {
         self.block_textures = upload_textures(device, queue, textures);
+        self.rebuild_globals_group(device);
+    }
+
+    /// The sun and moon images, PNG-encoded, at most 32 pixels square.
+    pub(crate) fn set_sky_textures(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sun: &[u8],
+        moon: &[u8],
+    ) {
+        let decode = |png: &[u8], name: &str| {
+            crate::textures::decode_image(png, SKY_TEXTURE_SIZE)
+                .inspect_err(|error| warn!("broken {name} image: {error:#}"))
+                .ok()
+        };
+        self.sky_textures =
+            upload_sky_textures(device, queue, [decode(sun, "sun"), decode(moon, "moon")]);
+        self.rebuild_globals_group(device);
+    }
+
+    fn rebuild_globals_group(&mut self, device: &wgpu::Device) {
         self.globals_group = Self::globals_group(
             device,
             &self.globals_layout,
             &self.globals,
             &self.sampler,
-            &self.block_textures,
-            &self.origins_view,
+            [&self.block_textures, &self.origins_view, &self.sky_textures],
         );
     }
 
@@ -361,7 +435,9 @@ impl WorldPass {
         let bytes: Vec<u8> = mesh
             .quads
             .iter()
-            .flat_map(|&[shape, layer]| [shape, layer | slot << 16])
+            .flat_map(|&[shape, look, light_a, light_b]| {
+                [shape, look | slot << 18, light_a, light_b]
+            })
             .flat_map(u32::to_le_bytes)
             .collect();
         queue.write_buffer(
@@ -438,7 +514,6 @@ impl WorldPass {
         target: &wgpu::TextureView,
         scene: &Scene,
         (width, height): (u32, u32),
-        sky: wgpu::Color,
     ) {
         let camera = scene.camera.position;
         let view_proj = scene
@@ -499,45 +574,40 @@ impl WorldPass {
         let camera_block = camera.floor();
         let camera_fract = (camera - camera_block).as_vec3();
         let camera_block = camera_block.as_ivec3();
-        let mut globals = [0u8; GLOBALS_SIZE as usize];
-        write_floats(&mut globals[..64], &view_proj.to_cols_array());
-        write_floats(
-            &mut globals[64..],
-            &[
-                sky.r as f32,
-                sky.g as f32,
-                sky.b as f32,
-                1.0,
-                scene.view_distance * 0.6,
-                scene.view_distance * 0.95,
-                0.0,
-                0.0,
-            ],
-        );
-        let selection = selection.unwrap_or(Vec3::ZERO);
-        write_floats(
-            &mut globals[96..],
-            &[
-                selection.x,
-                selection.y,
-                selection.z,
-                0.0,
-                width as f32,
-                height as f32,
-                0.0,
-                0.0,
-            ],
-        );
-        for (bytes, value) in globals[128..144]
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(camera_block.to_array())
-        {
-            *bytes = value.to_le_bytes();
+        let mut sky = SkyLook::at(scene.time_of_day, scene.eye_light);
+        if self.linear_output {
+            sky = sky.to_linear();
         }
-        write_floats(&mut globals[144..], &camera_fract.extend(0.0).to_array());
-        queue.write_buffer(&self.globals, 0, &globals);
+        let selection = selection.unwrap_or(Vec3::ZERO);
+        let mut globals = Std140::default();
+        globals.matrix(view_proj);
+        globals.matrix(view_proj.inverse());
+        globals.floats([sky.fog.x, sky.fog.y, sky.fog.z, 1.0]);
+        globals.floats([
+            scene.view_distance * 0.6,
+            scene.view_distance * 0.95,
+            0.0,
+            0.0,
+        ]);
+        globals.floats(selection.extend(0.0).to_array());
+        globals.floats([width as f32, height as f32, 0.0, 0.0]);
+        globals.ints(camera_block.extend(0).to_array());
+        globals.floats(camera_fract.extend(0.0).to_array());
+        globals.floats(sky.sky_light.extend(sky.ambient).to_array());
+        globals.floats(sky.sun.extend(sky.day).to_array());
+        globals.floats(sky.zenith.extend(sky.stars).to_array());
+        // The horizon's w is how visible the sun and moon are: not from caves.
+        let eye = scene.eye_light.sky() as f32 / 15.0;
+        globals.floats(sky.horizon.extend(eye).to_array());
+        globals.floats(sky.glow.extend(0.0).to_array());
+        debug_assert_eq!(globals.0.len() as u64, GLOBALS_SIZE);
+        queue.write_buffer(&self.globals, 0, &globals.0);
+        let clear = wgpu::Color {
+            r: f64::from(sky.fog.x),
+            g: f64::from(sky.fog.y),
+            b: f64::from(sky.fog.z),
+            a: 1.0,
+        };
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("world"),
@@ -546,7 +616,7 @@ impl WorldPass {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(sky),
+                    load: wgpu::LoadOp::Clear(clear),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -561,6 +631,11 @@ impl WorldPass {
             ..Default::default()
         });
         pass.set_bind_group(0, &self.globals_group, &[]);
+
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.draw(0..3, 0..1);
+        pass.set_pipeline(&self.celestial_pipeline);
+        pass.draw(0..12, 0..1);
 
         pass.set_pipeline(&self.chunk_pipeline);
         let mut bound = None;
@@ -585,8 +660,7 @@ impl WorldPass {
         layout: &wgpu::BindGroupLayout,
         globals: &wgpu::Buffer,
         sampler: &wgpu::Sampler,
-        textures: &wgpu::TextureView,
-        origins: &wgpu::TextureView,
+        [textures, origins, sky]: [&wgpu::TextureView; 3],
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("world globals"),
@@ -607,6 +681,10 @@ impl WorldPass {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(origins),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(sky),
                 },
             ],
         })
@@ -706,10 +784,80 @@ fn push_draw(draws: &mut Vec<Draw>, page: usize, quads: Range<u32>) {
     draws.push(Draw { page, quads });
 }
 
-fn write_floats(out: &mut [u8], values: &[f32]) {
-    for (bytes, value) in out.as_chunks_mut::<4>().0.iter_mut().zip(values) {
-        *bytes = value.to_le_bytes();
+/// Uniform data laid out in 16-byte rows, as WGSL expects it.
+#[derive(Default)]
+struct Std140(Vec<u8>);
+
+impl Std140 {
+    fn floats(&mut self, values: [f32; 4]) {
+        self.0.extend(values.into_iter().flat_map(f32::to_le_bytes));
     }
+
+    fn ints(&mut self, values: [i32; 4]) {
+        self.0.extend(values.into_iter().flat_map(i32::to_le_bytes));
+    }
+
+    fn matrix(&mut self, matrix: glam::Mat4) {
+        for column in matrix.to_cols_array_2d() {
+            self.floats(column);
+        }
+    }
+}
+
+/// The sun and moon as two layers of a texture array; missing ones are
+/// left transparent.
+fn upload_sky_textures(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    images: [Option<(u32, u32, Vec<u8>)>; 2],
+) -> wgpu::TextureView {
+    let size = SKY_TEXTURE_SIZE;
+    let mut pixels = vec![0u8; (size * size * 4 * 2) as usize];
+    for (layer, image) in images.iter().enumerate() {
+        let Some((width, height, rgba)) = image else {
+            continue;
+        };
+        let (left, top) = ((size - width) / 2, (size - height) / 2);
+        for y in 0..*height {
+            for x in 0..*width {
+                let from = ((y * width + x) * 4) as usize;
+                let to = (((layer as u32 * size + top + y) * size + left + x) * 4) as usize;
+                pixels[to..to + 4].copy_from_slice(&rgba[from..from + 4]);
+            }
+        }
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sun and moon"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 2,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        texture.as_image_copy(),
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(size * 4),
+            rows_per_image: Some(size),
+        },
+        wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 2,
+        },
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]

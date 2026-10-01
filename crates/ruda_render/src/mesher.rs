@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use ruda_core::{ChunkPos, Face};
+use ruda_core::ChunkPos;
 use ruda_world::World;
 
 use crate::{BlockFaces, ChunkMesh, PaddedChunk, mesh_chunk};
@@ -41,11 +41,14 @@ impl ChunkMesher {
     }
 
     /// A newly loaded chunk: its neighbours' faces towards it may have
-    /// appeared or disappeared too.
+    /// appeared or disappeared too, and the shading of their corners changed.
     pub fn chunk_loaded(&mut self, pos: ChunkPos) {
-        self.mark_dirty(pos);
-        for face in Face::ALL {
-            self.mark_dirty(pos.offset(face));
+        for y in -1..=1 {
+            for z in -1..=1 {
+                for x in -1..=1 {
+                    self.mark_dirty(ChunkPos(pos.0 + glam::IVec3::new(x, y, z)));
+                }
+            }
         }
     }
 

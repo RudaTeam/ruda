@@ -4,7 +4,7 @@
 //! Needs a GPU; without one the test only says so and passes.
 
 use glam::DVec3;
-use ruda_core::{BlockId, BlockPos, ChunkPos, ContentBuilder, Face, WorldBounds};
+use ruda_core::{BlockId, BlockPos, ChunkPos, ContentBuilder, Face, Light, WorldBounds};
 use ruda_render::{Backdrop, Camera, PaddedChunk, Renderer, Scene, mesh_chunk};
 use ruda_world::World;
 
@@ -63,6 +63,8 @@ fn culling_hides_nothing_that_can_be_seen() {
             target: None,
             view_distance: (RADIUS * 32) as f32,
             bounds: Some(bounds),
+            time_of_day: 0.25,
+            eye_light: Light::SKY,
         };
         renderer.set_culling(true);
         let (_, _, culled) = renderer.capture(Backdrop::World(&scene), None).unwrap();
@@ -71,10 +73,13 @@ fn culling_hides_nothing_that_can_be_seen() {
         let (_, _, all) = renderer.capture(Backdrop::World(&scene), None).unwrap();
         let all_quads = renderer.stats().quads;
 
+        // Faces overlap by a hair to close cracks, so where two meet the one
+        // drawn first wins; that can shift a pixel's shade a little, but a
+        // chunk wrongly skipped changes what the pixel shows altogether.
         let different = culled
             .chunks(4)
             .zip(all.chunks(4))
-            .filter(|(a, b)| a.iter().zip(b.iter()).any(|(a, b)| a.abs_diff(*b) > 2))
+            .filter(|(a, b)| a.iter().zip(b.iter()).any(|(a, b)| a.abs_diff(*b) > 16))
             .count();
         assert_eq!(
             different, 0,

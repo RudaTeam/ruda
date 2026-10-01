@@ -8,6 +8,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use ruda_core::{ChunkPos, ContentBuilder, WorldBounds};
 use ruda_render::{BlockFaces, PaddedChunk, mesh_chunk};
 use ruda_world::World;
+use ruda_world::light::LightEngine;
 
 /// A 4×4 patch of chunks at height `y` with all their neighbours loaded.
 fn terrain(y: i32) -> (World, Vec<ChunkPos>, BlockFaces) {
@@ -46,7 +47,7 @@ fn meshing(c: &mut Criterion) {
         println!(
             "{name}: {} quads per chunk on average, {} KiB of geometry",
             quads / chunks.len(),
-            quads * 8 / chunks.len() / 1024
+            quads * 16 / chunks.len() / 1024
         );
 
         let mut next = chunks.iter().cycle();
@@ -60,5 +61,40 @@ fn meshing(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, meshing);
+/// Lighting a 3×3 patch of whole chunk columns, top down, as the server
+/// does when the world loads.
+fn lighting(c: &mut Criterion) {
+    let mut content = ContentBuilder::new();
+    ruda_base::register(&mut content).unwrap();
+    let content = content.build();
+    let bounds = WorldBounds::DEFAULT;
+    let generator = ruda_base::terrain(content.blocks(), 2024, bounds).unwrap();
+    let mut world = World::new();
+    let mut order = Vec::new();
+    for y in ((bounds.min_y >> 5)..=(bounds.max_y >> 5)).rev() {
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let pos = ChunkPos::new(x, y, z);
+                world.insert_chunk(pos, generator.generate(pos));
+                order.push(pos);
+            }
+        }
+    }
+    println!("lighting: {} chunks per run", order.len());
+    c.bench_function("light 3x3 columns", |b| {
+        b.iter_batched(
+            || world.clone(),
+            |mut world| {
+                let mut engine = LightEngine::new(content.blocks(), bounds);
+                for &pos in &order {
+                    engine.light_chunk(&mut world, pos);
+                }
+                world
+            },
+            criterion::BatchSize::LargeInput,
+        )
+    });
+}
+
+criterion_group!(benches, meshing, lighting);
 criterion_main!(benches);

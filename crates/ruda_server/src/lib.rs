@@ -14,16 +14,18 @@ use std::time::{Duration, Instant};
 use glam::{DVec3, IVec3};
 use ruda_core::{BlockId, BlockPos, ChunkPos, Content, WorldBounds};
 use ruda_net::{ClientConnection, RecvError, ServerConnection, local_pair};
-use ruda_protocol::{ClientMessage, PROTOCOL_VERSION, REACH, ServerMessage};
+pub use ruda_protocol::TICK_RATE;
+use ruda_protocol::{ClientMessage, DAY_LENGTH, PROTOCOL_VERSION, REACH, ServerMessage};
+use ruda_world::light::LightEngine;
 use ruda_world::{Chunk, Generator, World};
 use tracing::{info, warn};
 
-/// Simulation steps per second.
-pub const TICK_RATE: u32 = 20;
 const TICK: Duration = Duration::from_millis(1000 / TICK_RATE as u64);
 
 /// Most chunks sent to one client in a tick.
 const CHUNKS_PER_TICK: usize = 64;
+/// Time a tick may spend lighting new chunks.
+const LIGHT_BUDGET: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug)]
 pub struct ServerConfig {
@@ -32,6 +34,8 @@ pub struct ServerConfig {
     pub view_distance: i32,
     /// Blocks exist only between these heights.
     pub bounds: WorldBounds,
+    /// The time the world starts at, in ticks; see [`DAY_LENGTH`].
+    pub start_time: u64,
 }
 
 impl Default for ServerConfig {
@@ -39,6 +43,8 @@ impl Default for ServerConfig {
         Self {
             view_distance: 16,
             bounds: WorldBounds::DEFAULT,
+            // Early morning.
+            start_time: DAY_LENGTH / 24,
         }
     }
 }
@@ -64,12 +70,19 @@ pub struct Server {
     max_generating: usize,
     generated_tx: Sender<(ChunkPos, Chunk)>,
     generated_rx: Receiver<(ChunkPos, Chunk)>,
+    light: LightEngine,
+    /// Generated chunks waiting for their light.
+    unlit: HashSet<ChunkPos>,
+    /// Chunks whose light changed since clients last heard.
+    light_changed: HashSet<ChunkPos>,
     clients: Vec<RemoteClient>,
     /// Offsets of the chunks streamed around a player, nearest first, by
     /// view distance.
     views: HashMap<i32, Arc<[IVec3]>>,
     spawn: DVec3,
     ticks: u64,
+    /// Ticks since the world began.
+    time: u64,
 }
 
 struct RemoteClient {
@@ -100,6 +113,10 @@ impl Server {
         let (generated_tx, generated_rx) = mpsc::channel();
         Self {
             views: HashMap::new(),
+            light: LightEngine::new(content.blocks(), config.bounds),
+            unlit: HashSet::new(),
+            light_changed: HashSet::new(),
+            time: config.start_time,
             config,
             content,
             generator,
@@ -145,18 +162,91 @@ impl Server {
         while let Ok((pos, chunk)) = self.generated_rx.try_recv() {
             self.generating.remove(&pos);
             self.world.insert_chunk(pos, chunk);
+            self.unlit.insert(pos);
         }
         for index in 0..self.clients.len() {
             self.handle_messages(index);
         }
         self.clients.retain(|client| client.connected);
+        self.light_chunks();
         for index in 0..self.clients.len() {
             self.stream_chunks(index);
         }
+        self.send_light_changes();
         self.ticks += 1;
+        self.time += 1;
         if self.ticks.is_multiple_of(u64::from(TICK_RATE)) {
+            let time = self.time;
+            for client in self.clients.iter_mut().filter(|c| c.name.is_some()) {
+                client.send(ServerMessage::Time(time));
+            }
             self.unload_unused_chunks();
         }
+    }
+
+    /// The world's time, in ticks since it began.
+    pub fn time(&self) -> u64 {
+        self.time
+    }
+
+    /// Lights generated chunks whose chunk above is lit, top down, for as
+    /// long as the tick's budget allows, and asks for the chunks above the
+    /// others.
+    fn light_chunks(&mut self) {
+        let deadline = Instant::now() + LIGHT_BUDGET;
+        loop {
+            let mut ready: Vec<ChunkPos> = self
+                .unlit
+                .iter()
+                .filter(|&&pos| self.light.can_light(&self.world, pos))
+                .copied()
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            // Higher chunks first: they let the ones below be lit.
+            ready.sort_by_key(|pos| std::cmp::Reverse(pos.0.y));
+            for pos in ready {
+                if Instant::now() > deadline {
+                    return;
+                }
+                self.unlit.remove(&pos);
+                let changed = self.light.light_chunk(&mut self.world, pos);
+                self.light_changed.extend(changed);
+            }
+        }
+        let missing: Vec<ChunkPos> = self
+            .unlit
+            .iter()
+            .filter_map(|&pos| self.light.needs_above(pos))
+            .filter(|above| self.world.chunk(*above).is_none())
+            .collect();
+        for above in missing {
+            self.generate(above);
+        }
+    }
+
+    /// Sends new light to the clients that have the chunks it changed in.
+    fn send_light_changes(&mut self) {
+        for pos in std::mem::take(&mut self.light_changed) {
+            let Some(chunk) = self.world.chunk(pos) else {
+                continue;
+            };
+            for client in &mut self.clients {
+                if client.sent.contains(&pos) {
+                    client.send(ServerMessage::Light {
+                        pos,
+                        light: chunk.light().clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Whether a chunk's light is final: it and every chunk around it that
+    /// is inside the world are lit.
+    fn is_complete(&self, pos: ChunkPos) -> bool {
+        around(pos).all(|near| !self.config.bounds.contains_chunk(near) || self.light.is_lit(near))
     }
 
     /// Runs at [`TICK_RATE`] until every client has left.
@@ -210,6 +300,7 @@ impl Server {
                     blocks,
                     spawn: self.spawn,
                     bounds: self.config.bounds,
+                    time: self.time,
                 });
             }
             _ if !greeted => self.kick(index, "expected a hello first"),
@@ -258,8 +349,9 @@ impl Server {
         let allowed =
             (breaking || placeable) && in_reach && self.config.bounds.contains(pos) && target_ok;
 
-        if allowed {
-            self.world.set_block(pos, block);
+        if allowed && let Some(old) = self.world.set_block(pos, block) {
+            let changed = self.light.block_changed(&mut self.world, pos, old);
+            self.light_changed.extend(changed);
             self.modified.insert(pos.chunk());
             for client in &mut self.clients {
                 if client.sent.contains(&pos.chunk()) {
@@ -292,20 +384,29 @@ impl Server {
             if !self.config.bounds.contains_chunk(pos) || self.clients[index].sent.contains(&pos) {
                 continue;
             }
-            match self.world.chunk(pos) {
-                Some(_) if budget == 0 => {}
-                Some(chunk) => {
-                    budget -= 1;
-                    let message = ServerMessage::Chunk {
-                        pos,
-                        chunk: chunk.clone(),
-                    };
-                    let client = &mut self.clients[index];
-                    client.sent.insert(pos);
-                    client.send(message);
+            if !self.is_complete(pos) {
+                // It and its neighbours need generating or lighting first.
+                for near in around(pos) {
+                    if self.config.bounds.contains_chunk(near) && self.world.chunk(near).is_none() {
+                        self.generate(near);
+                    }
                 }
-                None => self.generate(pos),
+                continue;
             }
+            if budget == 0 {
+                continue;
+            }
+            let Some(chunk) = self.world.chunk(pos) else {
+                continue;
+            };
+            budget -= 1;
+            let message = ServerMessage::Chunk {
+                pos,
+                chunk: chunk.clone(),
+            };
+            let client = &mut self.clients[index];
+            client.sent.insert(pos);
+            client.send(message);
         }
 
         // One chunk of slack, so walking along a border doesn't make chunks
@@ -345,15 +446,15 @@ impl Server {
     }
 
     /// Drops generated chunks nobody is near, unless players changed them.
+    /// Whole columns stay: light comes down from their top.
     fn unload_unused_chunks(&mut self) {
         // Each player's area, with a margin.
-        let areas: Vec<(ChunkPos, i32, i32)> = self
+        let areas: Vec<(ChunkPos, i32)> = self
             .clients
             .iter()
             .filter_map(|client| {
                 let center = BlockPos(client.position?.floor().as_ivec3()).chunk();
-                let radius = client.view_distance;
-                Some((center, radius + 2, vertical_view_distance(radius) + 2))
+                Some((center, client.view_distance + 2))
             })
             .collect();
         let unused: Vec<ChunkPos> = self
@@ -362,13 +463,15 @@ impl Server {
             .map(|(pos, _)| pos)
             .filter(|pos| {
                 !self.modified.contains(pos)
-                    && !areas.iter().any(|&(center, radius, vertical)| {
-                        in_view(pos.0 - center.0, radius, vertical)
-                    })
+                    && !areas
+                        .iter()
+                        .any(|&(center, radius)| in_view(pos.0 - center.0, radius, i32::MAX))
             })
             .collect();
         for pos in unused {
             self.world.remove_chunk(pos);
+            self.light.forget(pos);
+            self.unlit.remove(&pos);
         }
     }
 
@@ -421,6 +524,13 @@ pub fn spawn_integrated(
     Ok((thread, client))
 }
 
+/// The chunk and the 26 around it.
+fn around(pos: ChunkPos) -> impl Iterator<Item = ChunkPos> {
+    (-1..=1).flat_map(move |y| {
+        (-1..=1).flat_map(move |z| (-1..=1).map(move |x| ChunkPos(pos.0 + IVec3::new(x, y, z))))
+    })
+}
+
 fn in_view(offset: IVec3, radius: i32, vertical: i32) -> bool {
     offset.x * offset.x + offset.z * offset.z <= radius * radius && offset.y.abs() <= vertical
 }
@@ -443,7 +553,9 @@ fn view_offsets(radius: i32, vertical: i32) -> Vec<IVec3> {
 
 #[cfg(test)]
 mod tests {
-    use ruda_core::{Appearance, BlockDef, ContentBuilder, CubeTextures, LocalPos, ResourceId};
+    use ruda_core::{
+        Appearance, BlockDef, ContentBuilder, CubeTextures, Light, LocalPos, ResourceId,
+    };
 
     use super::*;
 
@@ -505,6 +617,7 @@ mod tests {
                     min_y: -32,
                     max_y: 31,
                 },
+                ..Default::default()
             };
             let mut server = Server::new(
                 Arc::new(content.build()),
@@ -644,6 +757,52 @@ mod tests {
         });
         harness.expect(|m| matches!(m, ServerMessage::ActionDone { seq: 3 }));
         assert_eq!(harness.server.world().block(open), Some(BlockId::AIR));
+    }
+
+    #[test]
+    fn sends_chunks_lit_and_their_light_when_it_changes() {
+        let mut harness = Harness::new();
+        harness.join();
+        let sky = ChunkPos::new(0, 0, 0);
+        let ServerMessage::Chunk { chunk, .. } =
+            harness.expect(|m| matches!(m, ServerMessage::Chunk { pos, .. } if *pos == sky))
+        else {
+            unreachable!()
+        };
+        assert_eq!(chunk.light().get(LocalPos::new(5, 0, 5)), Light::SKY);
+
+        // A roof over (5, 2, 5) shades it: sky light only comes in sideways.
+        harness.send(ClientMessage::PlaceBlock {
+            pos: BlockPos::new(5, 3, 5),
+            block: harness.stone,
+            seq: 1,
+        });
+        let ServerMessage::Light { light, .. } =
+            harness.expect(|m| matches!(m, ServerMessage::Light { pos, .. } if *pos == sky))
+        else {
+            unreachable!()
+        };
+        assert_eq!(light.get(LocalPos::new(5, 2, 5)).sky(), 14);
+        assert_eq!(light.get(LocalPos::new(6, 2, 5)), Light::SKY);
+    }
+
+    #[test]
+    fn keeps_the_time_of_day() {
+        let mut harness = Harness::new();
+        harness.send(ClientMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            name: "tester".into(),
+        });
+        let ServerMessage::Welcome { time, .. } =
+            harness.expect(|m| matches!(m, ServerMessage::Welcome { .. }))
+        else {
+            unreachable!()
+        };
+        let ServerMessage::Time(later) = harness.expect(|m| matches!(m, ServerMessage::Time(_)))
+        else {
+            unreachable!()
+        };
+        assert!(later > time);
     }
 
     /// Waits for `count` chunks, then for a few more ticks in case there are
