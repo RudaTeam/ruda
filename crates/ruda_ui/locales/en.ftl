@@ -17,6 +17,7 @@ settings-fov = Field of view
 settings-fov-value = { $degrees }°
 settings-vsync = Vertical sync
 settings-fullscreen = Fullscreen
+settings-clouds = Clouds
 settings-lod = Far terrain
 settings-lod-off = Off
 settings-lod-value = { $blocks } blocks

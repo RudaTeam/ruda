@@ -49,6 +49,7 @@ pub struct Client {
     bounds: Option<WorldBounds>,
     /// The server's time and when it arrived.
     time: Option<(u64, Instant)>,
+    sky_seed: u64,
     events: Vec<Event>,
     next_seq: u32,
     /// Actions the server has not answered yet.
@@ -76,6 +77,7 @@ impl Client {
             spawn: None,
             bounds: None,
             time: None,
+            sky_seed: 0,
             events: Vec::new(),
             next_seq: 0,
             pending: 0,
@@ -106,8 +108,10 @@ impl Client {
                 spawn,
                 bounds,
                 time,
+                sky_seed,
             } => {
                 self.time = Some((time, Instant::now()));
+                self.sky_seed = sky_seed;
                 let ours = self.content.blocks().iter().map(|(_, def)| &def.id);
                 if !ours.eq(blocks.iter()) {
                     return self.disconnect("this game's content differs from the server's");
@@ -283,6 +287,11 @@ impl Client {
     pub fn time(&self) -> Option<f64> {
         let (time, at) = self.time?;
         Some(time as f64 + at.elapsed().as_secs_f64() * f64::from(TICK_RATE))
+    }
+
+    /// Decides the clouds, once joined.
+    pub fn sky_seed(&self) -> u64 {
+        self.sky_seed
     }
 
     /// The heights blocks can exist at, once joined.

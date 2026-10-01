@@ -34,6 +34,7 @@ pub struct Graphics {
     pub fullscreen: bool,
     /// Shadows cast by the sun and moon; costly, so off by default.
     pub shadows: bool,
+    pub clouds: bool,
     /// Takes effect on the next start.
     pub gpu_api: GpuApi,
 }
@@ -47,6 +48,7 @@ impl Default for Graphics {
             vsync: true,
             fullscreen: false,
             shadows: false,
+            clouds: true,
             gpu_api: GpuApi::Auto,
         }
     }

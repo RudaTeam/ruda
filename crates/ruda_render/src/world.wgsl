@@ -39,6 +39,15 @@ struct Globals {
     // x: distance where the far cascade takes over; y: where shadows end;
     // z: unused; w: size of a shadow map texel in texture coordinates.
     shadow: vec4<f32>,
+    // xyz: the first cell of the clouds near the camera, its bottom corner,
+    // relative to the camera; w: edge length of a cell.
+    cloud_origin: vec4<f32>,
+    // x: how thick clouds are; y: 1 with clouds, 0 without; z, w: where
+    // they start and finish fading out with distance.
+    cloud: vec4<f32>,
+    // rgb: colour of a cloud's lit top; w: how much a cloud dims the
+    // sunlight under it.
+    cloud_color: vec4<f32>,
 }
 
 // Width of `chunk_origins`, whose texels are chunk slots.
@@ -54,6 +63,11 @@ const ORIGINS_WIDTH = 128u;
 // Depth from the light, a layer per cascade.
 @group(0) @binding(5) var shadow_map: texture_depth_2d_array;
 @group(0) @binding(6) var shadow_sampler: sampler_comparison;
+// Where clouds are, a cell per texel from the first cell; see `clouds.rs`.
+@group(0) @binding(7) var cloud_mask: texture_2d<f32>;
+@group(0) @binding(8) var smooth_sampler: sampler;
+// Width of `cloud_mask`, in cells.
+const CLOUD_MASK_SIZE = 256.0;
 // The light space of the cascade being drawn into the shadow map.
 @group(1) @binding(0) var<uniform> shadow_pass: mat4x4<f32>;
 
@@ -66,12 +80,11 @@ fn brightness(level: vec4<f32>) -> vec4<f32> {
 struct ChunkVertex {
     @builtin(position) clip: vec4<f32>,
     // Relative to the camera.
-    @location(7) position: vec3<f32>,
-    @location(8) @interpolate(flat) normal: vec3<f32>,
+    @location(3) position: vec3<f32>,
+    @location(7) @interpolate(flat) normal: vec3<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) layer: u32,
     @location(2) shade: f32,
-    @location(3) distance: f32,
     // Sky, red, green and blue light, each from 0 to 1.
     @location(4) light: vec4<f32>,
     // 0 where the corner is darkest, 1 where nothing shades it.
@@ -191,7 +204,6 @@ fn chunk_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>
     out.uv = corner.uv;
     out.layer = quad.y & 0x3ffu;
     out.shade = face_shade(corner.face);
-    out.distance = length(position);
     let lights = select(quad.z, quad.w, corner.index >= 2u) >> (16u * (corner.index & 1u));
     out.light = unpack_light(lights);
     out.occlusion = f32((quad.y >> (10u + 2u * corner.index)) & 3u) / 3.0;
@@ -224,7 +236,6 @@ fn model_vertex(@location(0) vertex: vec4<u32>) -> ChunkVertex {
     out.uv = vec2<f32>(f32(vertex.y & 31u), f32((vertex.y >> 5u) & 31u)) / 16.0;
     out.layer = (vertex.y >> 10u) & 255u;
     out.shade = face_shade(face);
-    out.distance = length(position);
     out.light = unpack_light(vertex.z & 0xffffu);
     out.occlusion = 1.0;
     out.glows = (vertex.x >> 30u) & 1u;
@@ -258,6 +269,79 @@ fn chunk_fragment(in: ChunkVertex) -> @location(0) vec4<f32> {
     return shade(in);
 }
 
+// A corner of the `face` of the box from `start` of `size`, counter-clockwise
+// from outside, and the axes the face spans.
+struct BoxCorner {
+    local: vec3<f32>,
+    u_axis: u32,
+    v_axis: u32,
+}
+
+fn box_corner(start: vec3<f32>, size: vec3<f32>, face: u32, vertex: u32) -> BoxCorner {
+    let axis = face / 2u;
+    var out: BoxCorner;
+    out.u_axis = 0u;
+    out.v_axis = 2u;
+    if axis == 0u {
+        out.u_axis = 2u;
+        out.v_axis = 1u;
+    } else if axis == 2u {
+        out.v_axis = 1u;
+    }
+    var cu = vertex & 1u;
+    var cv = vertex >> 1u;
+    if face == 0u || face == 2u || face == 5u {
+        let swap = cu;
+        cu = cv;
+        cv = swap;
+    }
+    out.local = start
+        + unit(axis) * select(0.0, size[axis], face % 2u == 0u)
+        + unit(out.u_axis) * (f32(cu) * size[out.u_axis])
+        + unit(out.v_axis) * (f32(cv) * size[out.v_axis]);
+    return out;
+}
+
+struct CloudVertex {
+    // The same in the depth and the colour pass, so the depth test between
+    // them is exact.
+    @builtin(position) @invariant clip: vec4<f32>,
+    // Relative to the camera. Distances are taken per pixel: a cloud can be
+    // hundreds of blocks across, and its corners say little about its middle.
+    @location(0) position: vec3<f32>,
+    @location(1) @interpolate(flat) shade: f32,
+}
+
+// Cloud boxes; see `CloudMesh` in `clouds.rs`.
+@vertex
+fn cloud_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) -> CloudVertex {
+    let cell = globals.cloud_origin.w;
+    let start = vec3<f32>(f32(quad.x & 1023u), 0.0, f32((quad.x >> 10u) & 1023u)) * cell;
+    let size = vec3<f32>(
+        f32((quad.y & 1023u) + 1u) * cell,
+        globals.cloud.x,
+        f32(((quad.y >> 10u) & 1023u) + 1u) * cell,
+    );
+    let face = (quad.x >> 20u) & 7u;
+    let position = globals.cloud_origin.xyz + box_corner(start, size, face, vertex).local;
+
+    var out: CloudVertex;
+    out.clip = globals.view_proj * vec4<f32>(position, 1.0);
+    out.position = position;
+    // Lit from above, darker underneath.
+    var shades = array<f32, 6>(0.86, 0.86, 1.0, 0.7, 0.86, 0.86);
+    out.shade = shades[face];
+    return out;
+}
+
+@fragment
+fn cloud_fragment(in: CloudVertex) -> @location(0) vec4<f32> {
+    let fog = smoothstep(globals.fog.x, globals.fog.y, length(in.position));
+    let color = mix(globals.cloud_color.rgb * in.shade, globals.fog_color.rgb, fog);
+    let fade = 1.0 - smoothstep(globals.cloud.z, globals.cloud.w, length(in.position.xz));
+    return vec4<f32>(color, 0.8 * fade);
+}
+
 // Far-away terrain; see `LodQuad` in `lod.rs`. A tile's position comes from
 // the chunk position texture, like a chunk's.
 @vertex
@@ -270,27 +354,8 @@ fn lod_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) 
     let high = f32(bitcast<i32>(quad.z) >> 16u);
     let start = vec3<f32>(first.x, low, first.z);
     let size = vec3<f32>(cells.x * 4.0, high - low, cells.z * 4.0);
-    let axis = face / 2u;
-
-    var u_axis = 0u;
-    var v_axis = 2u;
-    if axis == 0u {
-        u_axis = 2u;
-        v_axis = 1u;
-    } else if axis == 2u {
-        v_axis = 1u;
-    }
-    var cu = vertex & 1u;
-    var cv = vertex >> 1u;
-    if face == 0u || face == 2u || face == 5u {
-        let swap = cu;
-        cu = cv;
-        cv = swap;
-    }
-    var local = start
-        + unit(axis) * select(0.0, size[axis], face % 2u == 0u)
-        + unit(u_axis) * (f32(cu) * size[u_axis])
-        + unit(v_axis) * (f32(cv) * size[v_axis]);
+    let corner = box_corner(start, size, face, vertex);
+    var local = corner.local;
     // A little below the chunks drawn in full, so where both are drawn,
     // those win.
     local.y -= 0.5;
@@ -301,10 +366,13 @@ fn lod_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) 
     out.position = position;
     out.normal = face_normal(face);
     // One texture per block, upright on walls.
-    out.uv = select(vec2<f32>(local[u_axis], -local[v_axis]), local.xz, axis == 1u);
+    out.uv = select(
+        vec2<f32>(local[corner.u_axis], -local[corner.v_axis]),
+        local.xz,
+        face / 2u == 1u,
+    );
     out.layer = quad.y & 0x3ffu;
     out.shade = face_shade(face);
-    out.distance = length(position);
     out.light = vec4<f32>(1.0, 0.0, 0.0, 0.0);
     out.occlusion = 1.0;
     out.glows = 0u;
@@ -321,6 +389,9 @@ fn lod_fragment(in: ChunkVertex) -> @location(0) vec4<f32> {
 }
 
 fn shade(in: ChunkVertex) -> vec4<f32> {
+    // Per pixel: far-away tops are up to a tile across, too big to take
+    // their corners' distances.
+    let distance = length(in.position);
     let texel = textureSample(block_textures, block_sampler, in.uv, in.layer).rgb;
     let level = brightness(in.light);
     // With shadows, part of sky light comes straight from the sun or moon
@@ -328,16 +399,25 @@ fn shade(in: ChunkVertex) -> vec4<f32> {
     var direction = in.shade;
     if globals.shadow_light.w > 0.0 {
         let facing = max(dot(in.normal, globals.shadow_light.xyz), 0.0);
-        let direct = facing * sunlit(in.position, in.normal, in.distance);
+        let direct = facing * sunlit(in.position, in.normal, distance);
         direction = mix(in.shade, 0.5 * in.shade + 0.65 * direct, globals.shadow_light.w);
     }
-    let sky = globals.sky_light.rgb * level.x * direction;
+    var sky = globals.sky_light.rgb * level.x * direction;
+    // Clouds shade what lies under them, along the light.
+    let toward = globals.shadow_light.xyz;
+    let height = globals.cloud_origin.y + globals.cloud.x * 0.5 - in.position.y;
+    if globals.cloud.y > 0.0 && toward.y > 0.02 && height > 0.0 {
+        let through = in.position + toward * (height / toward.y);
+        let cell = (through.xz - globals.cloud_origin.xz) / globals.cloud_origin.w;
+        let cover = textureSampleLevel(cloud_mask, smooth_sampler, cell / CLOUD_MASK_SIZE, 0.0).r;
+        sky *= 1.0 - globals.cloud_color.w * cover * smoothstep(0.02, 0.2, toward.y);
+    }
     let light = max(max(sky, level.yzw * in.shade), vec3<f32>(globals.sky_light.w * in.shade));
     var color = texel * light * mix(0.45, 1.0, in.occlusion);
     if in.glows == 1u {
         color = texel;
     }
-    let fog = smoothstep(globals.fog.x, globals.fog.y, in.distance);
+    let fog = smoothstep(globals.fog.x, globals.fog.y, distance);
     return vec4<f32>(mix(color, globals.fog_color.rgb, fog), 1.0);
 }
 

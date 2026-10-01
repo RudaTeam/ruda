@@ -24,6 +24,7 @@ settings-fov = Поле зрения
 settings-fov-value = { $degrees }°
 settings-vsync = Вертикальная синхронизация
 settings-fullscreen = Полноэкранный режим
+settings-clouds = Облака
 settings-lod = Дальняя прорисовка
 settings-lod-off = Выкл
 settings-lod-value = { $blocks } { $blocks ->

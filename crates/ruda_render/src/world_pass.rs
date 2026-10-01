@@ -14,6 +14,7 @@ use tracing::warn;
 
 use crate::arena::{RangeAllocator, Slots};
 use crate::camera::Frustum;
+use crate::clouds::{CLOUD_BOTTOM, CLOUD_CELL, CLOUD_THICKNESS, CloudField, CloudMesh, MASK_SIZE};
 use crate::culling::visible_chunks;
 use crate::shadows::{Cascades, NEAR_CASCADE, SHADOW_MAP_SIZE, cascades};
 use crate::sky::SkyLook;
@@ -23,7 +24,7 @@ use ruda_world::lod::{LOD_TILE_SIZE, LodTilePos};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 /// Bytes of the `Globals` uniform in `world.wgsl`.
-const GLOBALS_SIZE: u64 = 464;
+const GLOBALS_SIZE: u64 = 512;
 const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Edge length of the sun and moon images; smaller ones are centred.
 const SKY_TEXTURE_SIZE: u32 = 32;
@@ -46,6 +47,7 @@ pub(crate) struct WorldPass {
     /// Whether the target takes linear colours and encodes them as sRGB.
     linear_output: bool,
     shadows: ShadowMap,
+    clouds: CloudLayer,
     /// Position of each slot's chunk, as `Rgba32Sint` texels.
     origins: wgpu::Texture,
     origins_view: wgpu::TextureView,
@@ -90,6 +92,24 @@ struct GpuChunk {
 struct Page {
     buffer: wgpu::Buffer,
     space: RangeAllocator,
+}
+
+/// The clouds near the camera.
+struct CloudLayer {
+    field: CloudField,
+    /// Box faces, as `CloudMesh::quads`; `None` before the first mesh.
+    buffer: Option<wgpu::Buffer>,
+    count: u32,
+    /// Where clouds are, for their shadows on the ground.
+    mask: wgpu::Texture,
+    mask_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    /// Cloud-space cell of the first cell.
+    origin: glam::IVec2,
+    /// Fills the depth buffer, so the colour pass only draws the cloud
+    /// surface nearest the camera and clouds don't show through each other.
+    depth_pipeline: wgpu::RenderPipeline,
+    color_pipeline: wgpu::RenderPipeline,
 }
 
 /// Sun shadows: off by default, as they draw the world once more per cascade.
@@ -203,6 +223,22 @@ impl WorldPass {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -233,20 +269,25 @@ impl WorldPass {
         let origins_view = origins.create_view(&Default::default());
         let sky_textures = upload_sky_textures(device, queue, [None, None]);
         let shadows = ShadowMap::new(device, &shader, &globals, &origins_view);
-        let globals_group = Self::globals_group(
-            device,
-            &globals_layout,
-            &globals,
-            &sampler,
-            [&block_textures, &origins_view, &sky_textures, &shadows.view],
-            &shadows.sampler,
-        );
-
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("world"),
             bind_group_layouts: &[Some(&globals_layout)],
             immediate_size: 0,
         });
+        let clouds = CloudLayer::new(device, &shader, &layout, color_format);
+        let globals_group = Self::globals_group(
+            device,
+            &globals_layout,
+            &globals,
+            [
+                &block_textures,
+                &origins_view,
+                &sky_textures,
+                &shadows.view,
+                &clouds.mask_view,
+            ],
+            [&sampler, &shadows.sampler, &clouds.sampler],
+        );
         let pipeline = |label,
                         layout,
                         vertex,
@@ -397,6 +438,7 @@ impl WorldPass {
             block_textures,
             sky_textures,
             shadows,
+            clouds,
             linear_output: color_format.is_srgb(),
             origins,
             origins_view,
@@ -453,14 +495,14 @@ impl WorldPass {
             device,
             &self.globals_layout,
             &self.globals,
-            &self.sampler,
             [
                 &self.block_textures,
                 &self.origins_view,
                 &self.sky_textures,
                 &self.shadows.view,
+                &self.clouds.mask_view,
             ],
-            &self.shadows.sampler,
+            [&self.sampler, &self.shadows.sampler, &self.clouds.sampler],
         );
     }
 
@@ -659,6 +701,15 @@ impl WorldPass {
         self.stats
     }
 
+    /// Where blocks of `chunk` reach the clouds; see `CloudField`.
+    pub(crate) fn set_cloud_obstacles(&mut self, chunk: ChunkPos, columns: u64) {
+        self.clouds.field.set_chunk(chunk, columns);
+    }
+
+    pub(crate) fn set_far_cloud_obstacles(&mut self, tile: LodTilePos, rows: Option<[u64; 64]>) {
+        self.clouds.field.set_tile(tile, rows);
+    }
+
     pub(crate) fn set_culling(&mut self, culling: bool) {
         self.culling = culling;
     }
@@ -666,6 +717,7 @@ impl WorldPass {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
@@ -734,7 +786,15 @@ impl WorldPass {
         let camera_block = camera.floor();
         let camera_fract = (camera - camera_block).as_vec3();
         let camera_block = camera_block.as_ivec3();
-        let mut sky = SkyLook::at(scene.time_of_day, scene.eye_light);
+        let cover = scene.clouds.map_or(0.0, |clouds| clouds.cover);
+        let mut sky = SkyLook::at(scene.time_of_day, scene.eye_light, cover);
+        // Clouds reach as far as the view, but no farther than their mask.
+        let cloud_reach = far.min(((MASK_SIZE as i32 - 1) / 2 - 1) as f32 * CLOUD_CELL as f32);
+        if let Some(clouds) = &scene.clouds
+            && let Some(mesh) = self.clouds.field.update(camera, clouds, cloud_reach)
+        {
+            self.clouds.upload(device, queue, &mesh);
+        }
         if self.linear_output {
             sky = sky.to_linear();
         }
@@ -789,6 +849,23 @@ impl WorldPass {
             0.0,
             1.0 / SHADOW_MAP_SIZE as f32,
         ]);
+        let cloud_origin = scene.clouds.map_or(DVec3::ZERO, |clouds| {
+            let drift = clouds.drift();
+            let cell = f64::from(CLOUD_CELL);
+            DVec3::new(
+                f64::from(self.clouds.origin.x) * cell + drift.x,
+                f64::from(CLOUD_BOTTOM),
+                f64::from(self.clouds.origin.y) * cell + drift.y,
+            ) - camera
+        });
+        globals.floats(cloud_origin.as_vec3().extend(CLOUD_CELL as f32).to_array());
+        globals.floats([
+            CLOUD_THICKNESS as f32,
+            if scene.clouds.is_some() { 1.0 } else { 0.0 },
+            cloud_reach * 0.7,
+            cloud_reach * 0.95,
+        ]);
+        globals.floats(sky.cloud.extend(sky.cloud_shadow).to_array());
         debug_assert_eq!(globals.0.len() as u64, GLOBALS_SIZE);
         queue.write_buffer(&self.globals, 0, &globals.0);
         let clear = wgpu::Color {
@@ -892,6 +969,17 @@ impl WorldPass {
             }
         }
 
+        if scene.clouds.is_some()
+            && let Some(buffer) = &self.clouds.buffer
+            && self.clouds.count > 0
+        {
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.set_pipeline(&self.clouds.depth_pipeline);
+            pass.draw(0..4, 0..self.clouds.count);
+            pass.set_pipeline(&self.clouds.color_pipeline);
+            pass.draw(0..4, 0..self.clouds.count);
+        }
+
         if scene.target.is_some() {
             pass.set_pipeline(&self.outline_pipeline);
             pass.draw(0..24, 0..1);
@@ -964,9 +1052,8 @@ impl WorldPass {
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         globals: &wgpu::Buffer,
-        sampler: &wgpu::Sampler,
-        [textures, origins, sky, shadows]: [&wgpu::TextureView; 4],
-        shadow_sampler: &wgpu::Sampler,
+        [textures, origins, sky, shadows, clouds]: [&wgpu::TextureView; 5],
+        [sampler, shadow_sampler, smooth_sampler]: [&wgpu::Sampler; 3],
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("world globals"),
@@ -999,6 +1086,14 @@ impl WorldPass {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::Sampler(shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(clouds),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(smooth_sampler),
                 },
             ],
         })
@@ -1096,6 +1191,136 @@ fn push_draw(draws: &mut Vec<Draw>, page: usize, quads: Range<u32>) {
         return;
     }
     draws.push(Draw { page, quads });
+}
+
+impl CloudLayer {
+    fn new(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout,
+        color_format: wgpu::TextureFormat,
+    ) -> Self {
+        let mask = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cloud mask"),
+            size: wgpu::Extent3d {
+                width: MASK_SIZE,
+                height: MASK_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mask_view = mask.create_view(&Default::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("cloud mask"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let pipeline = |label, depth_write: bool, writes: wgpu::ColorWrites| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("cloud_vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: QUAD_BYTES,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32x4,
+                            offset: 0,
+                            shader_location: 0,
+                        }],
+                    })],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    // Seen from inside a cloud too.
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("cloud_fragment"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: writes,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        Self {
+            field: CloudField::default(),
+            buffer: None,
+            count: 0,
+            mask,
+            mask_view,
+            sampler,
+            origin: glam::IVec2::ZERO,
+            depth_pipeline: pipeline("cloud depth", true, wgpu::ColorWrites::empty()),
+            color_pipeline: pipeline("clouds", false, wgpu::ColorWrites::ALL),
+        }
+    }
+
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &CloudMesh) {
+        let bytes: Vec<u8> = mesh
+            .quads
+            .iter()
+            .flatten()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let fits = self
+            .buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.size() >= bytes.len() as u64);
+        if !fits {
+            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("clouds"),
+                size: (bytes.len() as u64).next_power_of_two().max(QUAD_BYTES),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        if let Some(buffer) = &self.buffer
+            && !bytes.is_empty()
+        {
+            queue.write_buffer(buffer, 0, &bytes);
+        }
+        self.count = mesh.quads.len() as u32;
+        self.origin = mesh.origin;
+        queue.write_texture(
+            self.mask.as_image_copy(),
+            &mesh.mask,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(MASK_SIZE),
+                rows_per_image: Some(MASK_SIZE),
+            },
+            wgpu::Extent3d {
+                width: MASK_SIZE,
+                height: MASK_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
 }
 
 impl ShadowMap {

@@ -41,6 +41,8 @@ pub struct ServerConfig {
     pub start_time: u64,
     /// The farthest, in blocks, that the far-away look of the world is sent.
     pub max_lod_distance: i32,
+    /// Decides the clouds; see [`ServerMessage::Welcome`].
+    pub sky_seed: u64,
 }
 
 impl Default for ServerConfig {
@@ -51,6 +53,7 @@ impl Default for ServerConfig {
             // Early morning.
             start_time: DAY_LENGTH / 24,
             max_lod_distance: 2048,
+            sky_seed: 0,
         }
     }
 }
@@ -58,10 +61,17 @@ impl Default for ServerConfig {
 /// View distance of a player who hasn't asked for one.
 const DEFAULT_VIEW_DISTANCE: i32 = 6;
 
-/// Worlds are far wider than they are tall, so the streamed area is half as
-/// high as it is wide.
-fn vertical_view_distance(radius: i32) -> i32 {
-    (radius / 2).max(1)
+/// How many chunks up and down a player gets the world around it. Worlds
+/// are far wider than they are tall, so normally half as many as sideways;
+/// but in a world only a few chunks tall, all of it, or flying high would
+/// show holes where low ground isn't loaded.
+fn vertical_view_distance(radius: i32, bounds: WorldBounds) -> i32 {
+    let height = (bounds.max_y >> 5) - (bounds.min_y >> 5) + 1;
+    if height <= 16 {
+        height
+    } else {
+        (radius / 2).max(1)
+    }
 }
 
 pub struct Server {
@@ -334,6 +344,7 @@ impl Server {
                     spawn: self.spawn,
                     bounds: self.config.bounds,
                     time: self.time,
+                    sky_seed: self.config.sky_seed,
                 });
             }
             _ if !greeted => self.kick(index, "expected a hello first"),
@@ -476,7 +487,10 @@ impl Server {
 
         // One chunk of slack, so walking along a border doesn't make chunks
         // load and unload over and over.
-        let (radius, vertical) = (radius + 1, vertical_view_distance(radius) + 1);
+        let (radius, vertical) = (
+            radius + 1,
+            vertical_view_distance(radius, self.config.bounds) + 1,
+        );
         let client = &mut self.clients[index];
         let far: Vec<ChunkPos> = client
             .sent
@@ -491,10 +505,11 @@ impl Server {
     }
 
     fn view(&mut self, radius: i32) -> Arc<[IVec3]> {
+        let bounds = self.config.bounds;
         Arc::clone(
-            self.views
-                .entry(radius)
-                .or_insert_with(|| view_offsets(radius, vertical_view_distance(radius)).into()),
+            self.views.entry(radius).or_insert_with(|| {
+                view_offsets(radius, vertical_view_distance(radius, bounds)).into()
+            }),
         )
     }
 

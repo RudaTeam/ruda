@@ -20,6 +20,12 @@ const SUN_GLOW: Vec3 = Vec3::new(1.0, 0.52, 0.24);
 const DAYLIGHT: Vec3 = Vec3::new(1.0, 1.0, 1.0);
 const DUSK_LIGHT: Vec3 = Vec3::new(1.0, 0.78, 0.62);
 const MOONLIGHT: Vec3 = Vec3::new(0.16, 0.19, 0.30);
+/// Clouds: white by day, dark grey-blue by night, lit warm at dusk.
+const DAY_CLOUD: Vec3 = Vec3::new(1.0, 1.0, 1.0);
+const NIGHT_CLOUD: Vec3 = Vec3::new(0.07, 0.08, 0.12);
+const DUSK_CLOUD: Vec3 = Vec3::new(1.0, 0.62, 0.42);
+/// How much a cloud dims the sunlight under it.
+const CLOUD_SHADOW: f32 = 0.4;
 /// The least light anything gets, so caves aren't pitch black.
 const AMBIENT: f32 = 0.02;
 
@@ -41,13 +47,17 @@ pub(crate) struct SkyLook {
     /// Colour and strength of full sky light, linear.
     pub sky_light: Vec3,
     pub ambient: f32,
+    /// Colour of a cloud's lit top.
+    pub cloud: Vec3,
+    pub cloud_shadow: f32,
 }
 
 impl SkyLook {
     /// `time_of_day` is the fraction of the day gone: 0 sunrise, 0.25 noon,
     /// 0.5 sunset, 0.75 midnight. `eye` is the light where the camera is:
-    /// underground, the sky and fog darken.
-    pub(crate) fn at(time_of_day: f32, eye: Light) -> Self {
+    /// underground, the sky and fog darken. `cover` is how much of the sky
+    /// clouds cover, from 0 to 1: the more, the duller the light.
+    pub(crate) fn at(time_of_day: f32, eye: Light, cover: f32) -> Self {
         let angle = time_of_day.rem_euclid(1.0) * TAU;
         // East to west, tilted a little to the south.
         let sun = Vec3::new(angle.cos(), angle.sin(), 0.25).normalize();
@@ -63,6 +73,18 @@ impl SkyLook {
         let sky_light = MOONLIGHT
             .lerp(DAYLIGHT, day)
             .lerp(DUSK_LIGHT, dusk * 0.5 * day);
+        let cloud = NIGHT_CLOUD
+            .lerp(DAY_CLOUD, day)
+            .lerp(DUSK_CLOUD, dusk * 0.6 * smoothstep(-0.25, 0.0, sun.y));
+
+        // An overcast sky is greyer and its light weaker.
+        let cover = cover.clamp(0.0, 1.0);
+        let grey =
+            |color: Vec3| color.lerp(Vec3::splat(color.dot(Vec3::splat(1.0 / 3.0))), cover * 0.5);
+        let zenith = grey(zenith);
+        let horizon = grey(horizon);
+        let sky_light = sky_light * (1.0 - 0.3 * cover);
+        let cloud = grey(cloud) * (1.0 - 0.35 * cover * cover);
 
         // Seen from a cave, the sky and fog go dark.
         let eye = 0.06 + 0.94 * brightness(f32::from(eye.sky()) / f32::from(Light::MAX));
@@ -78,6 +100,8 @@ impl SkyLook {
             stars: (1.0 - day) * eye,
             sky_light,
             ambient: AMBIENT,
+            cloud: cloud * eye,
+            cloud_shadow: CLOUD_SHADOW,
         }
     }
 
@@ -88,6 +112,7 @@ impl SkyLook {
         self.horizon = linear(self.horizon);
         self.glow = linear(self.glow);
         self.fog = linear(self.fog);
+        self.cloud = linear(self.cloud);
         self
     }
 }
@@ -109,26 +134,40 @@ mod tests {
 
     #[test]
     fn noon_is_bright_and_midnight_dark() {
-        let noon = SkyLook::at(0.25, Light::SKY);
+        let noon = SkyLook::at(0.25, Light::SKY, 0.0);
         assert!(noon.sun.y > 0.9);
         assert_eq!(noon.day, 1.0);
         assert_eq!(noon.sky_light, DAYLIGHT);
         assert!(noon.stars < 0.01);
 
-        let midnight = SkyLook::at(0.75, Light::SKY);
+        let midnight = SkyLook::at(0.75, Light::SKY, 0.0);
         assert!(midnight.sun.y < -0.9);
         assert_eq!(midnight.day, 0.0);
         assert!(midnight.sky_light.max_element() < 0.35);
         assert!(midnight.stars > 0.99);
 
-        let sunset = SkyLook::at(0.5, Light::SKY);
+        let sunset = SkyLook::at(0.5, Light::SKY, 0.0);
         assert!(sunset.glow.x > 0.9);
+        assert!(
+            sunset.cloud.x > sunset.cloud.z,
+            "clouds glow warm at sunset"
+        );
+        assert!(midnight.cloud.max_element() < 0.2);
+    }
+
+    #[test]
+    fn an_overcast_sky_dims_the_light() {
+        let clear = SkyLook::at(0.25, Light::SKY, 0.0);
+        let overcast = SkyLook::at(0.25, Light::SKY, 1.0);
+        assert!(overcast.sky_light.x < clear.sky_light.x * 0.8);
+        let saturation = |c: Vec3| c.max_element() - c.min_element();
+        assert!(saturation(overcast.zenith) < saturation(clear.zenith));
     }
 
     #[test]
     fn caves_darken_the_fog() {
-        let outside = SkyLook::at(0.25, Light::SKY);
-        let cave = SkyLook::at(0.25, Light::DARK);
+        let outside = SkyLook::at(0.25, Light::SKY, 0.0);
+        let cave = SkyLook::at(0.25, Light::DARK, 0.0);
         assert!(cave.fog.max_element() < outside.fog.max_element() * 0.1);
     }
 }

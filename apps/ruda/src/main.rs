@@ -84,6 +84,10 @@ struct Args {
     /// Turn on sun shadows, whatever the settings say.
     #[arg(long)]
     shadows: bool,
+
+    /// Draw no clouds, whatever the settings say.
+    #[arg(long)]
+    no_clouds: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -332,6 +336,7 @@ impl App {
             camera: self.args.camera,
             time: self.args.time,
             lod_distance: self.args.lod_distance.unwrap_or(graphics.lod_distance),
+            clouds: graphics.clouds && !self.args.no_clouds,
         };
         self.game = Some(Game::start(config, renderer)?);
         self.resume();
@@ -413,6 +418,9 @@ impl App {
             }
             if new.lod_distance != old.lod_distance {
                 game.set_lod_distance(new.lod_distance);
+            }
+            if new.clouds != old.clouds {
+                game.set_clouds(new.clouds);
             }
         }
         self.i18n

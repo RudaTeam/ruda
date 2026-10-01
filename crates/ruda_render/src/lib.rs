@@ -5,6 +5,7 @@
 
 mod arena;
 mod camera;
+mod clouds;
 mod culling;
 mod lod;
 mod mesh;
@@ -24,6 +25,10 @@ use tracing::{info, warn};
 use wgpu::rwh::{HasDisplayHandle, HasWindowHandle};
 
 pub use camera::{Camera, Frustum};
+pub use clouds::{
+    CLOUD_BOTTOM, CLOUD_CELL, CLOUD_THICKNESS, CloudSky, WIND, cloud_at, cloud_obstacles,
+    far_cloud_obstacles,
+};
 pub use lod::{LodMesh, LodQuad, mesh_lod};
 pub use mesh::{BlockFaces, ChunkMesh, ModelVertex, PaddedChunk, Quad, mesh_chunk};
 pub use mesher::ChunkMesher;
@@ -75,6 +80,8 @@ pub struct Scene {
     /// How far the far-away look of the world reaches, in blocks; 0 for
     /// none.
     pub lod_distance: f32,
+    /// `None` for a sky without clouds.
+    pub clouds: Option<CloudSky>,
 }
 
 /// What the last frame drew.
@@ -384,6 +391,22 @@ impl Renderer {
         self.world.remove_lod(pos);
     }
 
+    /// Where the blocks of a chunk reach up into the clouds, which part
+    /// around them; see [`cloud_obstacles`].
+    pub fn set_cloud_obstacles(&mut self, chunk: ChunkPos, columns: u64) {
+        self.world.set_cloud_obstacles(chunk, columns);
+    }
+
+    /// The same for far-away terrain, see [`far_cloud_obstacles`]; `None`
+    /// once the tile is gone.
+    pub fn set_far_cloud_obstacles(
+        &mut self,
+        tile: ruda_world::lod::LodTilePos,
+        rows: Option<[u64; ruda_world::lod::LOD_TILE_CELLS]>,
+    ) {
+        self.world.set_far_cloud_obstacles(tile, rows);
+    }
+
     /// Forgets every chunk, for leaving a world.
     pub fn clear_chunks(&mut self) {
         self.world.clear();
@@ -614,10 +637,14 @@ impl Renderer {
         let format = self.config.format;
         let view = &target.create_view(&wgpu::TextureViewDescriptor::default());
         match backdrop {
-            Backdrop::World(scene) => {
-                self.world
-                    .draw(&self.queue, encoder, view, scene, (width, height))
-            }
+            Backdrop::World(scene) => self.world.draw(
+                &self.device,
+                &self.queue,
+                encoder,
+                view,
+                scene,
+                (width, height),
+            ),
             Backdrop::Color(rgb) => {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("backdrop"),

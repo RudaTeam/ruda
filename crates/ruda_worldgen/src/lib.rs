@@ -26,6 +26,8 @@ pub struct TerrainSettings {
     /// nothing below it.
     pub floor: BlockId,
     pub min_y: i32,
+    /// The top of the world; mountains stay a little below it.
+    pub max_y: i32,
 }
 
 /// An ore that replaces stone in small clusters within a band of heights.
@@ -47,6 +49,8 @@ pub struct TerrainGenerator {
     continents: Fbm<OpenSimplex>,
     hills: Fbm<OpenSimplex>,
     ridges: Fbm<OpenSimplex>,
+    /// Where mountain ranges rise.
+    ranges: Fbm<OpenSimplex>,
     caves: Fbm<OpenSimplex>,
     ores: Vec<OpenSimplex>,
 }
@@ -59,6 +63,24 @@ const CAVE_STEP: usize = 4;
 const CAVE_GRID: usize = CHUNK_SIZE as usize / CAVE_STEP + 1;
 const CAVE_THRESHOLD: f64 = 0.38;
 const ORE_FREQUENCY: f64 = 1.0 / 4.0;
+/// Range noise where mountains start to rise, and where they are at full
+/// height.
+const RANGE_START: f64 = 0.15;
+const RANGE_FULL: f64 = 0.6;
+/// Height of the highest crests above the land around them.
+const MOUNTAIN_HEIGHT: f64 = 92.0;
+/// Above about this height mountains are bare rock.
+const ROCK_LINE: i32 = 80;
+
+/// Where rock starts in a column: a few blocks up or down, so its edge
+/// isn't drawn with a ruler.
+fn rock_line(x: i32, z: i32) -> i32 {
+    let mut h = (x as u32).wrapping_mul(0x9e37_79b1) ^ (z as u32).wrapping_mul(0x85eb_ca77);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2c1b_3c6d);
+    h ^= h >> 13;
+    ROCK_LINE + (h % 7) as i32 - 3
+}
 
 impl TerrainGenerator {
     pub fn new(seed: u64, settings: TerrainSettings) -> Self {
@@ -81,6 +103,10 @@ impl TerrainGenerator {
                 .iter()
                 .map(|_| OpenSimplex::new(seeds.next()))
                 .collect(),
+            // Last, so the other noises stay as they were for a seed.
+            ranges: Fbm::new(seeds.next())
+                .set_octaves(3)
+                .set_frequency(1.0 / 1100.0),
             settings,
         }
     }
@@ -94,14 +120,14 @@ impl TerrainGenerator {
         let hills = sample(&self.hills, point);
         // Close to 1 along sharp crests.
         let ridge = 1.0 - sample(&self.ridges, point).abs();
-        // Mountain ranges only rise from higher ground.
-        let highland = ((continent + 0.2) / 1.2).clamp(0.0, 1.0);
+        // 0 on the plains, 1 in the heart of a mountain range.
+        let range = smoothstep(RANGE_START, RANGE_FULL, sample(&self.ranges, point));
         let height = f64::from(self.settings.sea_level)
             + 6.0
             + continent * 20.0
-            + hills * 9.0
-            + ridge.powi(3) * highland * highland * 70.0;
-        height.floor() as i32
+            + hills * 9.0 * (1.0 + range)
+            + range * (12.0 + ridge * ridge * MOUNTAIN_HEIGHT);
+        (height.floor() as i32).min(self.settings.max_y - 8)
     }
 
     pub fn generate(&self, pos: ChunkPos) -> Chunk {
@@ -137,7 +163,9 @@ impl TerrainGenerator {
                 continue;
             }
             let beach = height <= self.settings.sea_level + 1;
+            let rock = height >= rock_line(world.x, world.z);
             *block = match depth {
+                0..=3 if rock => self.settings.stone,
                 0 if beach => self.settings.sand,
                 0 => self.settings.grass,
                 1..=3 if beach => self.settings.sand,
@@ -200,14 +228,20 @@ impl Generator for TerrainGenerator {
 
     fn surface(&self, x: i32, z: i32) -> Option<(i32, BlockId)> {
         let height = TerrainGenerator::surface_height(self, x, z);
-        let beach = height <= self.settings.sea_level + 1;
-        let top = if beach {
+        let top = if height >= rock_line(x, z) {
+            self.settings.stone
+        } else if height <= self.settings.sea_level + 1 {
             self.settings.sand
         } else {
             self.settings.grass
         };
         Some((height, top))
     }
+}
+
+fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Noise scaled to roughly -1..1: the library's generators stay within about
@@ -272,6 +306,7 @@ mod tests {
                 }],
                 floor: FLOOR,
                 min_y: -1024,
+                max_y: 1023,
             },
         )
     }

@@ -9,10 +9,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow};
 use glam::{DVec3, IVec3, Vec3};
 use ruda_client::{Client, Event};
-use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ContentBuilder, Light, WorldBounds};
+use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ChunkPos, ContentBuilder, Light, WorldBounds};
 use ruda_input::{Action, Input};
-use ruda_protocol::{DAY_LENGTH, REACH};
-use ruda_render::{BlockFaces, Camera, ChunkMesher, Renderer, Scene, mesh_lod};
+use ruda_protocol::{DAY_LENGTH, REACH, TICK_RATE};
+use ruda_render::{
+    BlockFaces, Camera, ChunkMesher, CloudSky, Renderer, Scene, cloud_obstacles,
+    far_cloud_obstacles, mesh_lod,
+};
 use ruda_server::ServerConfig;
 use ruda_world::lod::LodTilePos;
 use ruda_world::{RayHit, raycast};
@@ -23,6 +26,8 @@ const SPEED: f64 = 12.0;
 const SPRINT_SPEED: f64 = 40.0;
 /// Radians of camera turn per unit of mouse movement.
 const MOUSE_SENSITIVITY: f32 = 0.0025;
+/// How much of the sky clouds cover, until weather decides it.
+const CLOUD_COVER: f32 = 0.35;
 /// Far-away tiles turned into geometry per frame.
 const LOD_TILES_PER_FRAME: usize = 2;
 /// See [`Game::is_loaded`].
@@ -44,6 +49,7 @@ pub struct GameConfig {
     /// How far the far-away look of the world reaches, in blocks; 0 for
     /// none.
     pub lod_distance: u16,
+    pub clouds: bool,
 }
 
 /// A camera position and direction, angles in degrees.
@@ -100,6 +106,7 @@ pub struct Game {
     lod_distance: f32,
     /// Far-away tiles that arrived and still need geometry, oldest first.
     lod_waiting: VecDeque<LodTilePos>,
+    clouds: bool,
     joined: bool,
     start: Option<CameraStart>,
     /// When chunks last arrived, left or got new geometry.
@@ -116,6 +123,11 @@ impl Game {
         let mut server_config = ServerConfig {
             view_distance: i32::from(MAX_VIEW_DISTANCE),
             bounds,
+            // Mixed, so the seed itself isn't given away.
+            sky_seed: config
+                .seed
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left(29),
             ..Default::default()
         };
         if let Some(time) = config.time {
@@ -145,6 +157,7 @@ impl Game {
             faces,
             lod_distance: f32::from(config.lod_distance),
             lod_waiting: VecDeque::new(),
+            clouds: config.clouds,
             input: Input::default(),
             camera,
             hotbar,
@@ -165,6 +178,8 @@ impl Game {
         cursor_grabbed: bool,
         renderer: &mut Renderer,
     ) -> Result<Control> {
+        // Chunks whose blocks may reach the clouds differently now.
+        let mut reaching = Vec::new();
         for event in self.client.update() {
             if matches!(event, Event::ChunkLoaded(_) | Event::ChunkUnloaded(_)) {
                 self.last_change = Instant::now();
@@ -186,12 +201,17 @@ impl Game {
                     }
                     self.joined = true;
                 }
-                Event::ChunkLoaded(pos) => self.mesher.chunk_loaded(pos),
+                Event::ChunkLoaded(pos) => {
+                    self.mesher.chunk_loaded(pos);
+                    reaching.push(pos);
+                }
                 Event::ChunkUnloaded(pos) => {
                     self.mesher.forget(pos);
                     renderer.remove_chunk(pos);
+                    renderer.set_cloud_obstacles(pos, 0);
                 }
                 Event::BlockChanged(pos) => {
+                    reaching.push(pos.chunk());
                     // A block next to a chunk border also changes the
                     // neighbour's faces and the shading of their corners.
                     for offset in (-1..=1).flat_map(|y| {
@@ -213,9 +233,13 @@ impl Game {
                 Event::LodUnloaded(pos) => {
                     self.lod_waiting.retain(|&waiting| waiting != pos);
                     renderer.remove_lod(pos);
+                    renderer.set_far_cloud_obstacles(pos, None);
                 }
                 Event::Disconnected { reason } => return Err(anyhow!("disconnected: {reason}")),
             }
+        }
+        for pos in reaching {
+            self.update_cloud_obstacles(pos, renderer);
         }
 
         let look = self.input.take_look();
@@ -275,6 +299,7 @@ impl Game {
             };
             if let Some(tile) = self.client.lod(pos) {
                 renderer.upload_lod(pos, &mesh_lod(tile, &self.faces));
+                renderer.set_far_cloud_obstacles(pos, Some(far_cloud_obstacles(tile)));
                 self.last_change = Instant::now();
             }
         }
@@ -330,6 +355,19 @@ impl Game {
         self.client.set_view_distance(chunks);
     }
 
+    /// Tells the renderer where a chunk's blocks reach the clouds.
+    fn update_cloud_obstacles(&self, pos: ChunkPos, renderer: &mut Renderer) {
+        if let Some(chunk) = self.client.world().chunk(pos) {
+            let blocks = self.client.content().blocks();
+            let columns = cloud_obstacles(pos, chunk, |block| blocks.is_solid(block));
+            renderer.set_cloud_obstacles(pos, columns);
+        }
+    }
+
+    pub fn set_clouds(&mut self, clouds: bool) {
+        self.clouds = clouds;
+    }
+
     /// How far the far-away look of the world reaches, in blocks; 0 for
     /// none.
     pub fn set_lod_distance(&mut self, blocks: u16) {
@@ -351,6 +389,11 @@ impl Game {
             time_of_day: self.time_of_day(),
             eye_light: self.eye_light(),
             lod_distance: self.lod_distance,
+            clouds: self.clouds.then(|| CloudSky {
+                seed: self.client.sky_seed(),
+                cover: CLOUD_COVER,
+                time: self.client.time().unwrap_or(0.0) / f64::from(TICK_RATE),
+            }),
         }
     }
 

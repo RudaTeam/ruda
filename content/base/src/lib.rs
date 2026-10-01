@@ -134,6 +134,7 @@ pub fn terrain(
         ],
         floor: block("bedrock")?,
         min_y: bounds.min_y,
+        max_y: bounds.max_y,
     };
     Ok(TerrainGenerator::new(seed, settings))
 }

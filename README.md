@@ -13,10 +13,11 @@ What we're aiming for:
 - smooth play on weak hardware, with a Raspberry Pi 4 as the low bar;
 - a modding API that can carry big tech mods: machines, power networks, their own UIs.
 
-It's very early. You can fly around a generated world with hills, caves and
-ore, break and place blocks, and light caves with lamps and torches. Days and nights pass
+It's very early. You can fly around a generated world with hills, rocky
+mountains, caves and ore, break and place blocks, and light caves with lamps and torches. Days and nights pass
 every 20 minutes, light spreads from the sky and from glowing blocks in colour,
-and corners are softly shaded. The world is endless sideways and 256 blocks
+and corners are softly shaded. Blocky clouds drift with the wind at the height
+of the mountain tops, shade the ground and part around the peaks. The world is endless sideways and 256 blocks
 tall, from −128 to +127, with sea level at 0 and unbreakable bedrock at the
 bottom. Single-player already runs on a local server
 inside the game; there's no survival, saving or network play yet.
@@ -33,7 +34,7 @@ cargo run -p ruda-server   # dedicated server (a stub until network play lands)
 
 The game opens on the main menu. Settings has the view distance, how far
 simplified far terrain reaches beyond it, field of view, vertical sync,
-fullscreen, sun shadows (off by default: they cost a
+fullscreen, clouds, sun shadows (off by default: they cost a
 second drawing of the world), graphics API and language (English or
 Russian; the system language by default). They are saved to `settings.toml`
 in `~/.config/ruda` on Linux, `~/Library/Application Support/Ruda` on macOS
@@ -70,8 +71,9 @@ The client takes a few options:
   `--screenshot <PATH>` saves the last one. CI uses them as a smoke test.
 - `--benchmark <SECONDS>` starts a world, waits until it has loaded, then
   measures frame times for that long and prints them. Add `--no-vsync` to
-  draw as fast as possible, `--shadows` to turn sun shadows on, and `--seed` and `--camera` to measure the same
-  view every time.
+  draw as fast as possible, `--shadows` to turn sun shadows on, `--no-clouds`
+  to turn clouds off, and `--seed` and `--camera` to measure the same view
+  every time.
 
 Logging is controlled with `RUST_LOG`, for example `RUST_LOG=debug`. To profile
 with [Tracy](https://github.com/wolfpld/tracy), build with `--features tracy`.

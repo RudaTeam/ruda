@@ -216,6 +216,10 @@ impl Menu {
                                 ui.checkbox(&mut graphics.fullscreen, "");
                                 ui.end_row();
 
+                                ui.label(t("settings-clouds"));
+                                ui.checkbox(&mut graphics.clouds, "");
+                                ui.end_row();
+
                                 ui.label(t("settings-shadows"));
                                 ui.checkbox(&mut graphics.shadows, "")
                                     .on_hover_text(t("settings-shadows-note"));

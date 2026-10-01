@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Simulation steps per second.
 pub const TICK_RATE: u32 = 20;
@@ -60,6 +60,9 @@ pub enum ServerMessage {
         bounds: WorldBounds,
         /// Ticks since the world began, see [`DAY_LENGTH`].
         time: u64,
+        /// Decides the clouds; derived from the world's seed, which it
+        /// doesn't give away.
+        sky_seed: u64,
     },
     /// Closes the connection.
     Disconnect { reason: String },
@@ -130,6 +133,7 @@ mod tests {
             spawn: DVec3::new(0.5, 70.0, 0.5),
             bounds: WorldBounds::DEFAULT,
             time: 1234,
+            sky_seed: 99,
         });
         round_trip(ServerMessage::Light {
             pos: ChunkPos::new(1, 2, 3),
@@ -152,6 +156,7 @@ mod tests {
             spawn: DVec3::ZERO,
             bounds: WorldBounds::DEFAULT,
             time: 0,
+            sky_seed: 0,
         };
         let mut bytes = encode(&message);
         let at = bytes.windows(5).position(|w| w == b"stone").unwrap();
