@@ -31,6 +31,8 @@ fn clouds_shade_the_ground_and_part_around_a_pillar() {
             return;
         }
     };
+    // The pictures are compared with each other.
+    renderer.fix_exposure(Some(0.6));
     let mut content = ContentBuilder::new();
     ruda_base::register(&mut content).unwrap();
     let content = content.build();

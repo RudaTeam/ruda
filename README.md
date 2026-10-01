@@ -16,7 +16,9 @@ What we're aiming for:
 It's very early. You can fly around a generated world with hills, rocky
 mountains, caves and ore, break and place blocks, and light caves with lamps and torches. Days and nights pass
 every 20 minutes, light spreads from the sky and from glowing blocks in colour,
-and corners are softly shaded. Blocky clouds drift with the wind at the height
+and corners are softly shaded. The sky, sunsets and the haze over distant land
+come from how air scatters sunlight; the sun lights faces turned to it, and
+bright light blooms while the exposure adapts the way eyes do. Blocky clouds drift with the wind at the height
 of the mountain tops, slowly form and fade away, thin out around the peaks
 and shade the ground. The world is endless sideways and 256 blocks
 tall, from −128 to +127, with sea level at 0 and unbreakable bedrock at the
