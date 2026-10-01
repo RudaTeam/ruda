@@ -1,6 +1,7 @@
 //! Game client. For now (M0) it opens a window and clears it every frame.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, ValueEnum};
@@ -19,7 +20,7 @@ struct Args {
     #[arg(long, value_enum, default_value_t, env = "RUDA_GPU_BACKEND")]
     gpu_backend: GpuBackendArg,
 
-    /// Exit after rendering this many frames (smoke tests, benchmarks).
+    /// Exit after presenting this many frames (smoke tests, benchmarks).
     #[arg(long, value_name = "N")]
     exit_after_frames: Option<u64>,
 }
@@ -58,6 +59,7 @@ fn main() -> Result<()> {
         window: None,
         renderer: None,
         frames: 0,
+        first_frame_at: None,
         occluded: false,
         zero_sized: false,
         error: None,
@@ -86,7 +88,9 @@ struct App {
     display: OwnedDisplayHandle,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// Frames that actually reached the screen.
     frames: u64,
+    first_frame_at: Option<Instant>,
     occluded: bool,
     /// Minimized on Windows: the surface cannot be configured at 0×0.
     zero_sized: bool,
@@ -125,17 +129,31 @@ impl App {
             return Ok(());
         };
         let _span = tracing::info_span!("frame").entered();
-        renderer.render(|| window.pre_present_notify())?;
-        #[cfg(feature = "tracy")]
-        tracing_tracy::client::frame_mark();
+        if renderer.render(|| window.pre_present_notify())? {
+            self.frames += 1;
+            self.first_frame_at.get_or_insert_with(Instant::now);
+            #[cfg(feature = "tracy")]
+            tracing_tracy::client::frame_mark();
+        }
 
-        self.frames += 1;
         if self
             .args
             .exit_after_frames
             .is_some_and(|n| self.frames >= n)
         {
-            info!(frames = self.frames, "frame limit reached, exiting");
+            let elapsed = self
+                .first_frame_at
+                .map_or(0.0, |at| at.elapsed().as_secs_f64());
+            let fps = if elapsed > 0.0 {
+                self.frames.saturating_sub(1) as f64 / elapsed
+            } else {
+                0.0
+            };
+            info!(
+                frames = self.frames,
+                fps = %format_args!("{fps:.1}"),
+                "frame limit reached, exiting"
+            );
             event_loop.exit();
         } else if !self.occluded && !self.zero_sized {
             window.request_redraw();
