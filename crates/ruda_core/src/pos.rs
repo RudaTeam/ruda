@@ -13,6 +13,11 @@ const LOCAL_MASK: i32 = CHUNK_SIZE - 1;
 
 /// Position of a block in the world.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(transparent)
+)]
 pub struct BlockPos(pub IVec3);
 
 impl BlockPos {
@@ -39,6 +44,11 @@ impl BlockPos {
 
 /// Position of a chunk, counted in chunks: chunk (1, 0, 0) starts at block (32, 0, 0).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(transparent)
+)]
 pub struct ChunkPos(pub IVec3);
 
 impl ChunkPos {

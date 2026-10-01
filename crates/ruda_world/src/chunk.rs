@@ -168,6 +168,87 @@ impl Paletted {
     }
 }
 
+/// Chunks travel as their palette plus the packed indices as little-endian
+/// bytes. Incoming chunks are validated in full, so a malformed one is
+/// rejected instead of panicking later.
+#[cfg(feature = "serde")]
+mod wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+
+    use super::*;
+
+    #[derive(Serialize, Deserialize)]
+    enum ChunkWire {
+        Uniform(BlockId),
+        Paletted {
+            palette: Vec<BlockId>,
+            bits: u32,
+            indices: Vec<u8>,
+        },
+    }
+
+    impl Serialize for Chunk {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let wire = match &self.storage {
+                Storage::Uniform(id) => ChunkWire::Uniform(*id),
+                Storage::Paletted(paletted) => ChunkWire::Paletted {
+                    palette: paletted.palette.clone(),
+                    bits: paletted.bits,
+                    indices: paletted
+                        .words
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .collect(),
+                },
+            };
+            wire.serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Chunk {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let storage = match ChunkWire::deserialize(deserializer)? {
+                ChunkWire::Uniform(id) => Storage::Uniform(id),
+                ChunkWire::Paletted {
+                    palette,
+                    bits,
+                    indices,
+                } => {
+                    Storage::Paletted(paletted(palette, bits, &indices).map_err(D::Error::custom)?)
+                }
+            };
+            Ok(Chunk { storage })
+        }
+    }
+
+    fn paletted(
+        palette: Vec<BlockId>,
+        bits: u32,
+        indices: &[u8],
+    ) -> Result<Paletted, &'static str> {
+        if !INDEX_BITS.contains(&bits) {
+            return Err("unsupported palette index width");
+        }
+        if palette.is_empty() || palette.len() as u64 > 1u64 << bits {
+            return Err("palette does not match its index width");
+        }
+        if indices.len() != words_for(bits) * 8 {
+            return Err("wrong amount of palette index data");
+        }
+        let (words, _) = indices.as_chunks::<8>();
+        let words = words.iter().copied().map(u64::from_le_bytes).collect();
+        let paletted = Paletted {
+            palette,
+            bits,
+            words,
+        };
+        if (0..CHUNK_VOLUME).any(|index| paletted.index_at(index) >= paletted.palette.len()) {
+            return Err("palette index out of range");
+        }
+        Ok(paletted)
+    }
+}
+
 fn words_for(bits: u32) -> usize {
     CHUNK_VOLUME * bits as usize / 64
 }
@@ -207,6 +288,26 @@ mod tests {
             assert_eq!(chunk.get(pos), id(n as u32 + 10));
         }
         assert_eq!(chunk.get(LocalPos::new(31, 31, 31)), BlockId::AIR);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serializes_and_rejects_malformed_chunks() {
+        let mut chunk = Chunk::filled(id(1));
+        for (n, pos) in LocalPos::all().step_by(13).enumerate() {
+            chunk.set(pos, id(n as u32 % 5));
+        }
+        let bytes = postcard::to_allocvec(&chunk).unwrap();
+        assert_eq!(postcard::from_bytes::<Chunk>(&bytes).unwrap(), chunk);
+
+        let uniform = postcard::to_allocvec(&Chunk::filled(id(3))).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<Chunk>(&uniform).unwrap(),
+            Chunk::filled(id(3))
+        );
+
+        // Truncated index data must be rejected, not panic later.
+        assert!(postcard::from_bytes::<Chunk>(&bytes[..bytes.len() / 2]).is_err());
     }
 
     #[test]

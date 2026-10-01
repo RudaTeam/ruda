@@ -1,6 +1,6 @@
 [package]
-name = "ruda_core"
-description = "Content identifiers, block coordinates and registries"
+name = "ruda_server"
+description = "The authoritative game server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,14 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[features]
-serde = ["dep:serde", "glam/serde"]
-
 [dependencies]
 glam.workspace = true
-serde = { workspace = true, optional = true }
-thiserror.workspace = true
+rayon.workspace = true
+ruda_core.workspace = true
+ruda_net.workspace = true
+ruda_protocol.workspace = true
+ruda_world.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

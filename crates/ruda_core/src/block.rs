@@ -6,6 +6,11 @@ use crate::{ContentError, Face, ResourceId};
 /// the server assigns them when content is registered and tells clients the
 /// mapping, while saves and the content API use [`ResourceId`]s.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(transparent)
+)]
 pub struct BlockId(u32);
 
 impl BlockId {

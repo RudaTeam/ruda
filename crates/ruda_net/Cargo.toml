@@ -1,6 +1,6 @@
 [package]
-name = "ruda_core"
-description = "Content identifiers, block coordinates and registries"
+name = "ruda_net"
+description = "Connections between the client and the server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,12 +8,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[features]
-serde = ["dep:serde", "glam/serde"]
-
 [dependencies]
-glam.workspace = true
-serde = { workspace = true, optional = true }
+ruda_protocol.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [lints]

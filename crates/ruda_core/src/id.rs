@@ -66,6 +66,22 @@ impl fmt::Debug for ResourceId {
     }
 }
 
+/// Serialized as the `namespace:path` string; deserializing validates it.
+#[cfg(feature = "serde")]
+impl serde::Serialize for ResourceId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for ResourceId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
     "invalid resource id `{0}`: expected `namespace:path` made of lowercase letters, \

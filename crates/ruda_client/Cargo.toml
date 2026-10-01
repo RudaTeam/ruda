@@ -1,6 +1,6 @@
 [package]
-name = "ruda_world"
-description = "Chunk storage, the block world and ray casting"
+name = "ruda_client"
+description = "Client-side game state"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,16 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[features]
-serde = ["dep:serde", "ruda_core/serde"]
-
 [dependencies]
 glam.workspace = true
 ruda_core.workspace = true
-serde = { workspace = true, optional = true }
+ruda_net.workspace = true
+ruda_protocol.workspace = true
+ruda_world.workspace = true
 
 [dev-dependencies]
-postcard.workspace = true
+ruda_base.workspace = true
+ruda_server.workspace = true
 
 [lints]
 workspace = true

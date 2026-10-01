@@ -6,7 +6,7 @@
 
 use noise::{Fbm, MultiFractal, NoiseFn, OpenSimplex};
 use ruda_core::{BlockId, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos};
-use ruda_world::Chunk;
+use ruda_world::{Chunk, Generator};
 
 /// What a terrain is made of.
 #[derive(Clone, Debug)]
@@ -176,6 +176,16 @@ impl TerrainGenerator {
                 (ore.min_y..=ore.max_y).contains(&y) && sample(noise, point) > ore.threshold
             })
             .map_or(self.settings.stone, |(ore, _)| ore.block)
+    }
+}
+
+impl Generator for TerrainGenerator {
+    fn generate(&self, pos: ChunkPos) -> Chunk {
+        TerrainGenerator::generate(self, pos)
+    }
+
+    fn surface_height(&self, x: i32, z: i32) -> Option<i32> {
+        Some(TerrainGenerator::surface_height(self, x, z))
     }
 }
 
