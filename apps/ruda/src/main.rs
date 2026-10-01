@@ -1,4 +1,4 @@
-//! Game client. For now (M0) it opens a window and clears it every frame.
+//! Game client. For now it opens a window and clears it every frame.
 
 use std::sync::Arc;
 use std::time::Instant;

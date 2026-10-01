@@ -1,7 +1,7 @@
-//! Renderer on top of wgpu (ADR-0004).
+//! Renderer on top of wgpu.
 //!
-//! wgpu types never leave this crate (ADR-0002): the rest of the engine sees
-//! only [`Renderer`] and [`GpuBackend`].
+//! wgpu types never leave this crate: the rest of the engine sees only
+//! [`Renderer`] and [`GpuBackend`].
 
 use std::fmt;
 use std::sync::Arc;
@@ -104,7 +104,8 @@ impl Renderer {
             .await
             .context("no compatible GPU adapter")?;
 
-        // Base render tier: everything has to fit WebGL2-level limits (ADR-0004).
+        // Gameplay must run on WebGL2-class hardware, so ask for exactly those
+        // limits and let wgpu reject anything that goes beyond them.
         let required_limits =
             wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
         let (device, queue) = adapter

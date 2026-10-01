@@ -34,17 +34,17 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      # Licenses, advisories, sources, and the wgpu/winit wrapper bans (ADR-0002, ADR-0003).
+      # Licenses, advisories, sources, and the wgpu/winit wrapper bans.
       - run: cargo deny check
       # deny.toml cannot express "not even transitively", so check the server tree directly.
       - name: Dedicated server has no graphics or windowing
         run: |
           if cargo tree -p ruda-server -e normal --target all --prefix none | grep -E '^(wgpu|winit) '; then
-            echo "::error::ruda-server depends on graphics or windowing crates (ADR-0002)"
+            echo "::error::ruda-server must not depend on graphics or windowing crates"
             exit 1
           fi
 
-  # Tier 1 platforms (ADR-0005): lint and test natively.
+  # Lint and test natively on every supported platform.
   test:
     name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -79,7 +79,7 @@ jobs:
           target: ${{ matrix.target }}
       - run: cargo build --workspace --target ${{ matrix.target }}
 
-  # M0: the client opens a window and presents frames on every tier 1 platform.
+  # The client must open a window and present frames on every platform.
   # Runners have no GPU, so Linux renders with Mesa (lavapipe, llvmpipe) under
   # Xvfb and Windows with WARP.
   smoke:

@@ -1,7 +1,7 @@
-# Dependency policy (ADR-0003) and crate boundaries (ADR-0002), checked in CI.
+# Dependency policy and crate boundaries, checked in CI.
 
 [graph]
-# Tier 1 and tier 2 platforms (ADR-0005).
+# Every platform we build for.
 targets = [
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",
@@ -19,8 +19,8 @@ all-features = true
 unmaintained = "workspace"
 
 [licenses]
-# Permissive only, so that Ruda binaries stay distributable under Apache-2.0
-# (ADR-0003). MPL-2.0 needs a case-by-case decision and goes into `exceptions`.
+# Permissive only, so that Ruda binaries stay distributable under Apache-2.0.
+# MPL-2.0 needs a case-by-case decision and goes into `exceptions`.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -44,7 +44,7 @@ wildcards = "deny"
 # Internal path dependencies between our own crates have no version.
 allow-wildcard-paths = true
 deny = [
-    # Graphics and windowing stay out of the server (ADR-0002, ADR-0004).
+    # Graphics and windowing stay out of the dedicated server.
     { crate = "wgpu", wrappers = ["ruda_render"] },
     { crate = "winit", wrappers = ["ruda"] },
 ]
