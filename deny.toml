@@ -1,0 +1,59 @@
+# Dependency policy (ADR-0003) and crate boundaries (ADR-0002), checked in CI.
+
+[graph]
+# Tier 1 and tier 2 platforms (ADR-0005).
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+# Optional dependencies (e.g. Tracy) are shipped too.
+all-features = true
+
+[advisories]
+# Vulnerabilities fail the build for any crate; "unmaintained" only for our
+# direct dependencies, since transitive ones are not ours to replace.
+unmaintained = "workspace"
+
+[licenses]
+# Permissive only: compatible with whatever project license we choose later.
+# MPL-2.0 needs a case-by-case decision and goes into `exceptions`.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+# The allow list documents the policy; not every license has to be in use.
+unused-allowed-license = "allow"
+exceptions = []
+
+[licenses.private]
+# Our own crates are unpublished and carry no license yet.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path dependencies between our own crates have no version.
+allow-wildcard-paths = true
+deny = [
+    # Graphics and windowing stay out of the server (ADR-0002, ADR-0004).
+    { crate = "wgpu", wrappers = ["ruda_render"] },
+    { crate = "winit", wrappers = ["ruda"] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
