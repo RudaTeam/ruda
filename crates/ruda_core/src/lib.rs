@@ -14,7 +14,7 @@ mod pos;
 
 pub use block::{Appearance, BlockDef, BlockId, BlockRegistry, CubeTextures, Mount};
 pub use bounds::WorldBounds;
-pub use content::{Content, ContentBuilder, ContentError};
+pub use content::{Content, ContentBuilder, ContentError, TextureMaps};
 pub use face::Face;
 pub use id::{InvalidId, ResourceId};
 pub use light::Light;

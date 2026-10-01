@@ -4,7 +4,7 @@
 
 use ruda_core::{
     Appearance, BlockDef, BlockRegistry, ContentBuilder, ContentError, CubeTextures, ResourceId,
-    WorldBounds,
+    TextureMaps, WorldBounds,
 };
 use ruda_worldgen::{Ore, TerrainGenerator, TerrainSettings};
 
@@ -51,6 +51,33 @@ const TEXTURES: [(&str, &[u8]); 13] = textures![
     "torch",
 ];
 
+macro_rules! maps {
+    ($($name:literal),* $(,)?) => {
+        [$((
+            $name,
+            include_bytes!(concat!("../textures/", $name, "_n.png")) as &[u8],
+            include_bytes!(concat!("../textures/", $name, "_s.png")) as &[u8],
+        )),*]
+    };
+}
+
+/// How textures take light: `<name>_n.png` and `<name>_s.png`, see
+/// [`TextureMaps`]. The torch has none.
+const MAPS: [(&str, &[u8], &[u8]); 12] = maps![
+    "bedrock",
+    "cobblestone",
+    "copper_ore",
+    "dirt",
+    "grass_side",
+    "grass_top",
+    "gravel",
+    "iron_ore",
+    "lamp",
+    "planks",
+    "sand",
+    "stone",
+];
+
 /// Blocks that look the same from every side, with a texture of the same name.
 const PLAIN_BLOCKS: [&str; 8] = [
     "stone",
@@ -72,6 +99,13 @@ pub fn id(path: &str) -> Result<ResourceId, ContentError> {
 pub fn register(content: &mut ContentBuilder) -> Result<(), ContentError> {
     for (name, png) in TEXTURES {
         content.add_texture(id(name)?, png)?;
+    }
+    for (name, normal, specular) in MAPS {
+        let maps = TextureMaps {
+            normal: normal.into(),
+            specular: specular.into(),
+        };
+        content.add_texture_maps(id(name)?, maps)?;
     }
     for name in PLAIN_BLOCKS {
         let textures = CubeTextures::all(id(name)?);
@@ -176,12 +210,20 @@ mod tests {
     }
 
     #[test]
-    fn textures_are_16_pixel_pngs() {
-        for (name, png) in TEXTURES {
-            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{name}");
+    fn textures_are_square_pngs_with_maps_to_match() {
+        let size = |png: &[u8]| {
+            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
             let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
             let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
-            assert_eq!((width, height), (16, 16), "{name}");
+            (width, height)
+        };
+        for (name, png) in TEXTURES {
+            let (width, height) = size(png);
+            assert!(width == height && [16, 32, 64].contains(&width), "{name}");
+            if let Some((_, normal, specular)) = MAPS.iter().find(|(map, ..)| *map == name) {
+                assert_eq!(size(normal), (width, height), "{name}");
+                assert_eq!(size(specular), (width, height), "{name}");
+            }
         }
     }
 

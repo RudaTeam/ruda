@@ -46,7 +46,9 @@ pub(crate) struct WorldPass {
     globals_layout: wgpu::BindGroupLayout,
     globals_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
-    block_textures: wgpu::TextureView,
+    /// Colours, normal maps and the rest of how blocks take light; see
+    /// `BlockTextures`.
+    block_textures: [wgpu::TextureView; 3],
     /// The sun and the moon.
     sky_textures: wgpu::TextureView,
     shadows: ShadowMap,
@@ -182,6 +184,16 @@ impl WorldPass {
             },
             count: None,
         };
+        let maps = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+            count: None,
+        };
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("world globals"),
             entries: &[
@@ -266,6 +278,8 @@ impl WorldPass {
                 table(9, wgpu::ShaderStages::VERTEX_FRAGMENT),
                 table(10, wgpu::ShaderStages::FRAGMENT),
                 table(11, wgpu::ShaderStages::FRAGMENT),
+                maps(12),
+                maps(13),
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -308,7 +322,7 @@ impl WorldPass {
             &globals_layout,
             &globals,
             [
-                &block_textures,
+                &block_textures[0],
                 &origins_view,
                 &sky_textures,
                 &shadows.view,
@@ -316,6 +330,8 @@ impl WorldPass {
                 &tables.transmittance,
                 &tables.sky,
                 &tables.ambient,
+                &block_textures[1],
+                &block_textures[2],
             ],
             [&sampler, &shadows.sampler, &clouds.sampler],
         );
@@ -515,7 +531,7 @@ impl WorldPass {
             &self.globals_layout,
             &self.globals,
             [
-                &self.block_textures,
+                &self.block_textures[0],
                 &self.origins_view,
                 &self.sky_textures,
                 &self.shadows.view,
@@ -523,6 +539,8 @@ impl WorldPass {
                 &self.tables.transmittance,
                 &self.tables.sky,
                 &self.tables.ambient,
+                &self.block_textures[1],
+                &self.block_textures[2],
             ],
             [&self.sampler, &self.shadows.sampler, &self.clouds.sampler],
         );
@@ -1086,7 +1104,9 @@ impl WorldPass {
             transmittance,
             sky_view,
             ambient,
-        ]: [&wgpu::TextureView; 8],
+            normals,
+            speculars,
+        ]: [&wgpu::TextureView; 10],
         [sampler, shadow_sampler, smooth_sampler]: [&wgpu::Sampler; 3],
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1141,6 +1161,14 @@ impl WorldPass {
                     binding: 11,
                     resource: wgpu::BindingResource::TextureView(ambient),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(normals),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(speculars),
+                },
             ],
         })
     }
@@ -1150,47 +1178,66 @@ fn upload_textures(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     textures: &BlockTextures,
-) -> wgpu::TextureView {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("block textures"),
-        size: wgpu::Extent3d {
-            width: TEXTURE_SIZE,
-            height: TEXTURE_SIZE,
-            depth_or_array_layers: textures.layers,
-        },
-        mip_level_count: MIP_LEVELS,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    for (level, pixels) in textures.mips.iter().enumerate() {
-        let size = TEXTURE_SIZE >> level;
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: level as u32,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(size * 4),
-                rows_per_image: Some(size),
-            },
-            wgpu::Extent3d {
-                width: size,
-                height: size,
+) -> [wgpu::TextureView; 3] {
+    let upload = |label, format, mips: &[Vec<u8>]| {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: TEXTURE_SIZE,
+                height: TEXTURE_SIZE,
                 depth_or_array_layers: textures.layers,
             },
-        );
-    }
-    texture.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(wgpu::TextureViewDimension::D2Array),
-        ..Default::default()
-    })
+            mip_level_count: MIP_LEVELS,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (level, pixels) in mips.iter().enumerate() {
+            let size = TEXTURE_SIZE >> level;
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size * 4),
+                    rows_per_image: Some(size),
+                },
+                wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: textures.layers,
+                },
+            );
+        }
+        texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        })
+    };
+    [
+        upload(
+            "block textures",
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            &textures.mips,
+        ),
+        upload(
+            "block normal maps",
+            wgpu::TextureFormat::Rgba8Unorm,
+            &textures.normal_mips,
+        ),
+        upload(
+            "block specular maps",
+            wgpu::TextureFormat::Rgba8Unorm,
+            &textures.specular_mips,
+        ),
+    ]
 }
 
 fn depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {

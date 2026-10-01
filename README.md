@@ -96,7 +96,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 Apache-2.0, see [LICENSE](LICENSE). If you fork Ruda, keep the attribution
 from [NOTICE](NOTICE).
 
-Block textures are from [Isabella II](https://github.com/minetest-texture-packs/Isabella-II)
-by Bonemouse, licensed under CC BY 3.0, and the interface font is
+Block textures are from [Faithful 32x](https://faithfulpack.net) by the Faithful
+team with material maps from
+[Faithful PBR 32x](https://www.curseforge.com/minecraft/texture-packs/faithful-pbr-32x)
+by PapaChefCool, used with permission; the torch, sun and moon are from
+[Isabella II](https://github.com/minetest-texture-packs/Isabella-II) by
+Bonemouse, licensed under CC BY 3.0; and the interface font is
 [Pixelify Sans](https://github.com/eifetx/Pixelify-Sans), licensed under the SIL
 Open Font License 1.1; see [assets/CREDITS.md](assets/CREDITS.md).

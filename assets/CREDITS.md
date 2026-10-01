@@ -1,26 +1,38 @@
 # Third-party assets
 
-## Block textures — Isabella II
+## Block textures — Faithful 32x and Faithful PBR 32x
 
-`content/base/textures/` (except `bedrock.png`, see below) and
-`content/base/sky/` come from
+`content/base/textures/`, except `torch.png`, come from
+[Faithful 32x](https://faithfulpack.net) by **the Faithful team**
+([license](https://faithfulpack.net/license)), with the material maps
+(`*_n.png` and `*_s.png`, laid out as in labPBR 1.3) from
+[Faithful PBR 32x](https://www.curseforge.com/minecraft/texture-packs/faithful-pbr-32x)
+version 1.11 by **PapaChefCool**. They are used in Ruda with permission.
+
+Changes made for Ruda:
+
+- `stone`, `dirt`, `sand`, `grass_top`, `grass_side`, `copper_ore` and
+  `iron_ore` put the pack's four variants of each texture (its OptiFine
+  "repeat" tiles) together into one 64×64 texture that covers two blocks by
+  two, maps alike;
+- `cobblestone`, `gravel`, `planks` (the pack's oak planks), `bedrock` and
+  `lamp` (its glowstone) are repeated two by two into 64×64;
+- `grass_top` and the grass edge of `grass_side` are tinted plains green
+  (`#91BD59`); the edge is drawn over the side's earth, and where it covers
+  it, its maps replace the earth's;
+- files are renamed to Ruda's block names.
+
+## Torch, sun and moon — Isabella II
+
+`content/base/textures/torch.png` and `content/base/sky/` come from
 [Isabella II](https://github.com/minetest-texture-packs/Isabella-II) (commit
 `8afe93927c69`), a texture pack by **Bonemouse**, licensed under the
 [Creative Commons Attribution 3.0 Unported License](https://creativecommons.org/licenses/by/3.0/).
 Original thread: http://www.minecraftforum.net/topic/242175-Isabella/
 
 The pack's `About Isabella.txt` is included unmodified next to the textures.
-
-Changes made for Ruda:
-
-- `copper_ore.png` and `iron_ore.png` are the pack's mineral overlays drawn
-  over its stone texture;
-- `grass_side.png` is the pack's grass side overlay drawn over its dirt texture;
-- `bedrock.png` is the pack's cobblestone texture, darkened and with more contrast;
-- `torch.png` is the pack's `default_torch_on_floor.png`, unchanged;
-- `lamp.png` is the pack's `default_meselamp.png`, and `sky/sun.png` and
-  `sky/moon.png` are its `misc/sun.png` and `misc/moon.png`, unchanged;
-- files are renamed to Ruda's block names.
+`torch.png` is the pack's `default_torch_on_floor.png`, and `sky/sun.png` and
+`sky/moon.png` are its `misc/sun.png` and `misc/moon.png`, all unchanged.
 
 ## Font — Pixelify Sans
 

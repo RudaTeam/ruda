@@ -77,6 +77,9 @@ fn cloud_opacity(density: f32) -> f32 {
 @group(0) @binding(9) var transmittance: texture_2d<f32>;
 @group(0) @binding(10) var sky_view: texture_2d<f32>;
 @group(0) @binding(11) var ambient: texture_2d<f32>;
+// How each block texture takes light, layer for layer; see `textures.rs`.
+@group(0) @binding(12) var block_normals: texture_2d_array<f32>;
+@group(0) @binding(13) var block_speculars: texture_2d_array<f32>;
 // The light space of the cascade being drawn into the shadow map.
 @group(1) @binding(0) var<uniform> shadow_pass: mat4x4<f32>;
 
@@ -253,13 +256,13 @@ fn quad_corner(quad: vec4<u32>, vertex: u32) -> Corner {
         + unit(u_axis) * (f32(cu) * width + (f32(cu) * 2.0 - 1.0) * overlap)
         + unit(v_axis) * (f32(cv) * height + (f32(cv) * 2.0 - 1.0) * overlap);
     out.index = cu + 2u * cv;
-    // Image rows run downwards, so side faces flip v to keep textures upright.
-    // Texture coordinates beyond 1 repeat the texture across merged faces.
-    out.uv = select(
-        vec2<f32>(f32(cu) * width, f32(cv) * height),
-        vec2<f32>(f32(cu) * width, (1.0 - f32(cv)) * height),
-        axis != 1u,
-    );
+    // In blocks along the face, from the chunk's corner: chunks start at
+    // even blocks, so patterns spanning two blocks line up across chunks.
+    // Image rows run downwards, so on side faces v runs down to keep
+    // textures upright.
+    let u = block[u_axis] + f32(cu) * width;
+    let v = block[v_axis] + f32(cv) * height;
+    out.uv = select(vec2<f32>(u, v), vec2<f32>(u, -v), axis != 1u);
     out.face = face;
     return out;
 }
@@ -512,40 +515,142 @@ fn lod_fragment(in: ChunkVertex) -> @location(0) vec4<f32> {
     return shade(in);
 }
 
+// A surface as its textures describe it.
+struct Surface {
+    albedo: vec3<f32>,
+    normal: vec3<f32>,
+    // How open each pixel is to light from around, from the normal map.
+    occlusion: f32,
+    roughness: f32,
+    // How much light it reflects straight back.
+    reflectance: vec3<f32>,
+    metal: f32,
+    glow: f32,
+    // Whether the texture has maps at all.
+    mapped: bool,
+}
+
+// The directions in the world in which a face's texture runs: right along
+// its rows, and down along its columns. See `quad_corner`.
+fn texture_axes(normal: vec3<f32>) -> mat2x3<f32> {
+    if abs(normal.y) > 0.5 {
+        return mat2x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0));
+    }
+    if abs(normal.x) > 0.5 {
+        return mat2x3<f32>(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, -1.0, 0.0));
+    }
+    return mat2x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, -1.0, 0.0));
+}
+
+fn surface(in: ChunkVertex) -> Surface {
+    // A texture covers two blocks by two.
+    let uv = in.uv * 0.5;
+    let normal = textureSample(block_normals, block_sampler, uv, in.layer);
+    let specular = textureSample(block_speculars, block_sampler, uv, in.layer);
+    var out: Surface;
+    out.albedo = textureSample(block_textures, block_sampler, uv, in.layer).rgb;
+    // labPBR's normal maps point y down the image, as the face's second
+    // axis does.
+    let tilt = normal.xy * 2.0 - 1.0;
+    let axes = texture_axes(in.normal);
+    out.normal = normalize(
+        axes[0] * tilt.x + axes[1] * tilt.y + in.normal * sqrt(max(1.0 - dot(tilt, tilt), 0.0)),
+    );
+    out.occlusion = normal.z;
+    out.mapped = normal.w > 0.5;
+    let smoothness = specular.r;
+    out.roughness = max((1.0 - smoothness) * (1.0 - smoothness), 0.03);
+    // Up to 229 is how much light comes straight back, linearly; from 230
+    // it's a metal, which reflects in its own colour.
+    out.metal = select(0.0, 1.0, specular.g * 255.0 >= 229.5);
+    out.reflectance = mix(vec3<f32>(specular.g), out.albedo, out.metal);
+    out.glow = specular.a * 255.0 / 254.0;
+    return out;
+}
+
+// How much of the light a smooth enough surface reflects into the camera
+// rather than scattering: Cook-Torrance with GGX, the way most games do.
+fn specular_light(
+    n: vec3<f32>,
+    toward_light: vec3<f32>,
+    toward_eye: vec3<f32>,
+    roughness: f32,
+    reflectance: vec3<f32>,
+) -> vec3<f32> {
+    let h = normalize(toward_light + toward_eye);
+    let n_l = max(dot(n, toward_light), 0.0);
+    let n_v = max(dot(n, toward_eye), 1e-3);
+    let n_h = max(dot(n, h), 0.0);
+    let a = roughness * roughness;
+    let a2 = a * a;
+    let d = a2 / (PI * pow(n_h * n_h * (a2 - 1.0) + 1.0, 2.0));
+    let k = a * 0.5;
+    let visibility = 0.25 / ((n_l * (1.0 - k) + k) * (n_v * (1.0 - k) + k));
+    let fresnel = reflectance + (vec3<f32>(1.0) - reflectance) * pow(1.0 - max(dot(h, toward_eye), 0.0), 5.0);
+    return fresnel * d * visibility * n_l;
+}
+
+// How much of the light from all around a surface reflects rather than
+// scatters, averaged over its roughness: Karis' fit for mobile games.
+fn reflected_share(reflectance: vec3<f32>, roughness: f32, n_v: f32) -> vec3<f32> {
+    let c0 = vec4<f32>(-1.0, -0.0275, -0.572, 0.022);
+    let c1 = vec4<f32>(1.0, 0.0425, 1.04, -0.04);
+    let r = roughness * c0 + c1;
+    let a004 = min(r.x * r.x, exp2(-9.28 * n_v)) * r.x + r.y;
+    let ab = vec2<f32>(-1.04, 1.04) * a004 + r.zw;
+    return reflectance * ab.x + ab.y;
+}
+
 fn shade(in: ChunkVertex) -> vec4<f32> {
     // Per pixel: far-away tops are up to a tile across, too big to take
     // their corners' distances.
     let distance = length(in.position);
-    let albedo = textureSample(block_textures, block_sampler, in.uv, in.layer).rgb;
+    let surface = surface(in);
     let level = brightness(in.light);
-    if in.glows == 1u {
-        return vec4<f32>(through_air(albedo * GLOW, in.position, distance), 1.0);
+    if in.glows == 1u && !surface.mapped {
+        return vec4<f32>(through_air(surface.albedo * GLOW, in.position, distance), 1.0);
     }
-    let occlusion = mix(0.45, 1.0, in.occlusion);
+    let occlusion = mix(0.45, 1.0, in.occlusion) * surface.occlusion;
+    let toward_eye = -in.position / max(distance, 1e-4);
+    let n = surface.normal;
     // Straight from the sun or moon, on faces turned to it, unless
     // something stands in between: the shadow map where there is one,
     // and where there isn't, how open the sky above is.
     let toward = globals.shadow_light.xyz;
-    let facing = max(dot(in.normal, toward), 0.0);
     var seen = smoothstep(0.55, 1.0, level.x);
     if globals.shadow_light.w > 0.0 {
         let shadowed = mix(1.0, sunlit(in.position, in.normal, distance), globals.shadow_light.w);
         seen = shadowed * smoothstep(0.0, 0.4, level.x);
     }
     seen *= 1.0 - CLOUD_SHADOW * cloud_cover(in.position, toward);
-    let sun = direct_light();
-    let direct = sun * facing * seen;
+    // Light only reaches faces turned to it, whatever their maps say.
+    seen *= step(0.0, dot(in.normal, toward));
+    let sun = direct_light() * seen;
+    let diffuse = surface.albedo * (1.0 - surface.metal) / PI;
+    let direct = sun * (diffuse * max(dot(n, toward), 0.0)
+        + specular_light(n, toward, toward_eye, surface.roughness, surface.reflectance));
     // From the whole sky: most on tops, less on walls, and on walls and
     // undersides some thrown back by the ground. How much of the sky
     // reaches a point is its sky light.
     let sky = skylight();
-    let up = in.normal.y;
+    let up = n.y;
     let around = sky * (0.55 + 0.45 * up)
-        + (sun * max(toward.y, 0.0) + sky) * GROUND * (0.5 - 0.5 * up);
-    let ambient = around * level.x * occlusion;
-    let blocks = BLOCK * level.yzw * occlusion;
-    let least = vec3<f32>(globals.sky.z) * occlusion;
-    let color = albedo * ((direct + ambient) / PI + blocks + least);
+        + (direct_light() * max(toward.y, 0.0) + sky) * GROUND * (0.5 - 0.5 * up);
+    let open = level.x * occlusion;
+    // Smooth surfaces mirror the sky; rough ones see it all blurred into
+    // its average.
+    let n_v = max(dot(n, toward_eye), 1e-3);
+    let mirrored = reflect(-toward_eye, n);
+    let sky_seen = mix(sky_color(normalize(vec3<f32>(mirrored.x, max(mirrored.y, 0.02), mirrored.z))), sky / PI, surface.roughness);
+    let reflected = sky_seen * reflected_share(surface.reflectance, surface.roughness, n_v);
+    let ambient = (diffuse * around + reflected) * open;
+    let blocks = surface.albedo * BLOCK * level.yzw * occlusion;
+    let least = surface.albedo * globals.sky.z * occlusion;
+    var glow = surface.glow;
+    if in.glows == 1u {
+        glow = max(glow, 0.15);
+    }
+    let color = direct + ambient + blocks + least + surface.albedo * glow * GLOW;
     return vec4<f32>(through_air(color, in.position, distance), 1.0);
 }
 
