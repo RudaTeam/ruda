@@ -1,0 +1,17 @@
+[package]
+name = "ruda_worldgen"
+description = "Terrain generation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+noise.workspace = true
+ruda_core.workspace = true
+ruda_world.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "ruda_world"
+description = "Chunk storage, the block world and ray casting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+glam.workspace = true
+ruda_core.workspace = true
+
+[lints]
+workspace = true

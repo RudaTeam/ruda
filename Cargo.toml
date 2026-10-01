@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/*", "crates/*"]
+members = ["apps/*", "content/*", "crates/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,12 +11,19 @@ repository = "https://github.com/RudaTeam/ruda"
 publish = false
 
 [workspace.dependencies]
+ruda_base = { path = "content/base" }
+ruda_core = { path = "crates/ruda_core" }
 ruda_render = { path = "crates/ruda_render" }
+ruda_world = { path = "crates/ruda_world" }
+ruda_worldgen = { path = "crates/ruda_worldgen" }
 
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+glam = "0.33.11"
+noise = "0.9.0"
 png = "0.18.1"
 pollster = "1.0.1"
+thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-tracy = "0.12.0"

@@ -1,0 +1,16 @@
+[package]
+name = "ruda_base"
+description = "The base game: blocks, textures and terrain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ruda_core.workspace = true
+ruda_worldgen.workspace = true
+
+[lints]
+workspace = true
