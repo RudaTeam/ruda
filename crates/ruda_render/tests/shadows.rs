@@ -87,6 +87,7 @@ fn a_pillar_casts_a_shadow() {
         bounds: Some(bounds),
         time_of_day: TIME_OF_DAY,
         eye_light: Light::SKY,
+        lod_distance: 0.0,
     };
 
     let mut brightness = |shadows: bool| {

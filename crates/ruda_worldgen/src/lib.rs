@@ -197,6 +197,17 @@ impl Generator for TerrainGenerator {
     fn surface_height(&self, x: i32, z: i32) -> Option<i32> {
         Some(TerrainGenerator::surface_height(self, x, z))
     }
+
+    fn surface(&self, x: i32, z: i32) -> Option<(i32, BlockId)> {
+        let height = TerrainGenerator::surface_height(self, x, z);
+        let beach = height <= self.settings.sea_level + 1;
+        let top = if beach {
+            self.settings.sand
+        } else {
+            self.settings.grass
+        };
+        Some((height, top))
+    }
 }
 
 /// Noise scaled to roughly -1..1: the library's generators stay within about

@@ -100,6 +100,7 @@ fn coloured_lamps_light_their_side_of_a_room() {
         bounds: Some(bounds),
         time_of_day: 0.75,
         eye_light: Light::DARK,
+        lod_distance: 0.0,
     };
     let (width, height, pixels) = renderer.capture(Backdrop::World(&scene), None).unwrap();
     if let Some(dir) = std::env::var_os("RUDA_TEST_IMAGES") {

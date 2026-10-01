@@ -11,6 +11,9 @@ use glam::{DVec3, IVec3};
 use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ChunkPos, Content, LocalPos, WorldBounds};
 use ruda_net::{ClientConnection, Disconnected, RecvError};
 use ruda_protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, TICK_RATE};
+use std::collections::HashMap;
+
+use ruda_world::lod::{LodTile, LodTilePos};
 use ruda_world::{ChunkLight, World};
 
 /// Something that happened since the last [`Client::update`].
@@ -27,6 +30,9 @@ pub enum Event {
     /// Light changed; these chunks look different now, as their own light
     /// or that of blocks right next to them changed.
     LightChanged(Vec<ChunkPos>),
+    /// The far-away look of a tile arrived, or changed.
+    LodLoaded(LodTilePos),
+    LodUnloaded(LodTilePos),
     /// The connection is over; no events follow.
     Disconnected {
         reason: String,
@@ -38,6 +44,7 @@ pub struct Client {
     connection: ClientConnection,
     content: Arc<Content>,
     world: World,
+    lod: HashMap<LodTilePos, LodTile>,
     spawn: Option<DVec3>,
     bounds: Option<WorldBounds>,
     /// The server's time and when it arrived.
@@ -65,6 +72,7 @@ impl Client {
             connection,
             content,
             world: World::new(),
+            lod: HashMap::new(),
             spawn: None,
             bounds: None,
             time: None,
@@ -137,6 +145,18 @@ impl Client {
                 }
             }
             ServerMessage::Time(time) => self.time = Some((time, Instant::now())),
+            ServerMessage::LodTile { pos, tile } => {
+                if !tile.is_complete() {
+                    return self.disconnect("the server sent a malformed tile");
+                }
+                self.lod.insert(pos, tile);
+                self.events.push(Event::LodLoaded(pos));
+            }
+            ServerMessage::UnloadLod(pos) => {
+                if self.lod.remove(&pos).is_some() {
+                    self.events.push(Event::LodUnloaded(pos));
+                }
+            }
             ServerMessage::ActionDone { .. } => self.pending = self.pending.saturating_sub(1),
         }
     }
@@ -156,6 +176,17 @@ impl Client {
     /// chunks.
     pub fn set_view_distance(&mut self, chunks: u8) {
         self.send(&ClientMessage::ViewDistance(chunks));
+    }
+
+    /// Asks the server for the far-away look of the world this far around
+    /// the player, in blocks; 0 for none.
+    pub fn set_lod_distance(&mut self, blocks: u16) {
+        self.send(&ClientMessage::LodDistance(blocks));
+    }
+
+    /// The far-away look of a tile, if the server sent it.
+    pub fn lod(&self, pos: LodTilePos) -> Option<&LodTile> {
+        self.lod.get(&pos)
     }
 
     /// Breaks a block. Returns false if there is nothing that can be broken.

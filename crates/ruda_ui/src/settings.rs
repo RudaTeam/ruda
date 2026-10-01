@@ -6,6 +6,8 @@ use crate::Language;
 
 /// View distances offered in the settings, in chunks of 32 blocks.
 pub const VIEW_DISTANCES: RangeInclusive<u8> = 2..=16;
+/// How far the far-away look of the world can reach, in blocks; 0 is off.
+pub const LOD_DISTANCES: [u16; 4] = [0, 512, 1024, 2048];
 /// Vertical fields of view offered in the settings, in degrees.
 pub const FIELDS_OF_VIEW: RangeInclusive<u8> = 50..=110;
 
@@ -23,6 +25,9 @@ pub struct Settings {
 pub struct Graphics {
     /// In chunks of 32 blocks.
     pub view_distance: u8,
+    /// How far simplified far-away terrain is drawn past the chunks, in
+    /// blocks; 0 for none.
+    pub lod_distance: u16,
     /// Vertical field of view in degrees.
     pub fov: u8,
     pub vsync: bool,
@@ -37,6 +42,7 @@ impl Default for Graphics {
     fn default() -> Self {
         Self {
             view_distance: 6,
+            lod_distance: 1024,
             fov: 70,
             vsync: true,
             fullscreen: false,
@@ -94,6 +100,11 @@ impl Settings {
         graphics.fov = graphics
             .fov
             .clamp(*FIELDS_OF_VIEW.start(), *FIELDS_OF_VIEW.end());
+        // The nearest of the offered distances.
+        graphics.lod_distance = LOD_DISTANCES
+            .into_iter()
+            .min_by_key(|&distance| distance.abs_diff(graphics.lod_distance))
+            .expect("there are distances");
         Ok(settings)
     }
 

@@ -6,12 +6,13 @@
 
 use glam::DVec3;
 use ruda_core::{BlockId, BlockPos, ChunkPos, ResourceId, WorldBounds};
+use ruda_world::lod::{LodTile, LodTilePos};
 use ruda_world::{Chunk, ChunkLight};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Simulation steps per second.
 pub const TICK_RATE: u32 = 20;
@@ -35,6 +36,9 @@ pub enum ClientMessage {
     /// How far, in chunks, the client wants the world around it. The server
     /// may send less.
     ViewDistance(u8),
+    /// How far, in blocks, the client wants the far-away look of the world;
+    /// 0 for none. The server may send less.
+    LodDistance(u16),
     /// Asks to break the block at `pos`. The server answers with
     /// [`ServerMessage::ActionDone`] carrying the same `seq`.
     BreakBlock { pos: BlockPos, seq: u32 },
@@ -66,6 +70,10 @@ pub enum ServerMessage {
     Light { pos: ChunkPos, light: ChunkLight },
     /// The world's time, sent now and then so clocks don't drift apart.
     Time(u64),
+    /// The far-away look of a tile of the world.
+    LodTile { pos: LodTilePos, tile: LodTile },
+    /// The client should forget this tile's far-away look.
+    UnloadLod(LodTilePos),
     /// The client should forget this chunk.
     UnloadChunk(ChunkPos),
     /// The block at `pos` is now `block`: someone changed it, or the server
@@ -128,6 +136,13 @@ mod tests {
             light: ChunkLight::uniform(ruda_core::Light::SKY),
         });
         round_trip(ServerMessage::Time(99));
+        round_trip(ServerMessage::LodTile {
+            pos: LodTilePos::new(-3, 4),
+            tile: LodTile {
+                heights: vec![-5, 120],
+                blocks: vec![BlockId::from_raw(4), BlockId::AIR],
+            },
+        });
     }
 
     #[test]

@@ -5,6 +5,7 @@
 mod chunk;
 mod generator;
 pub mod light;
+pub mod lod;
 mod palette;
 mod raycast;
 mod world;

@@ -1,6 +1,7 @@
 //! The game itself: an integrated server, the client talking to it, and the
 //! player's camera and controls.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -11,8 +12,9 @@ use ruda_client::{Client, Event};
 use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ContentBuilder, Light, WorldBounds};
 use ruda_input::{Action, Input};
 use ruda_protocol::{DAY_LENGTH, REACH};
-use ruda_render::{Camera, ChunkMesher, Renderer, Scene};
+use ruda_render::{BlockFaces, Camera, ChunkMesher, Renderer, Scene, mesh_lod};
 use ruda_server::ServerConfig;
+use ruda_world::lod::LodTilePos;
 use ruda_world::{RayHit, raycast};
 use tracing::{info, warn};
 
@@ -21,6 +23,8 @@ const SPEED: f64 = 12.0;
 const SPRINT_SPEED: f64 = 40.0;
 /// Radians of camera turn per unit of mouse movement.
 const MOUSE_SENSITIVITY: f32 = 0.0025;
+/// Far-away tiles turned into geometry per frame.
+const LOD_TILES_PER_FRAME: usize = 2;
 /// See [`Game::is_loaded`].
 const LOAD_QUIET: Duration = Duration::from_secs(1);
 /// The farthest the integrated server streams the world, in chunks.
@@ -37,6 +41,9 @@ pub struct GameConfig {
     pub camera: Option<CameraStart>,
     /// The time the world starts at, in ticks; see [`DAY_LENGTH`].
     pub time: Option<u64>,
+    /// How far the far-away look of the world reaches, in blocks; 0 for
+    /// none.
+    pub lod_distance: u16,
 }
 
 /// A camera position and direction, angles in degrees.
@@ -88,6 +95,11 @@ pub struct Game {
     selected: usize,
     target: Option<RayHit>,
     view_distance: f32,
+    faces: Arc<BlockFaces>,
+    /// In blocks.
+    lod_distance: f32,
+    /// Far-away tiles that arrived and still need geometry, oldest first.
+    lod_waiting: VecDeque<LodTilePos>,
     joined: bool,
     start: Option<CameraStart>,
     /// When chunks last arrived, left or got new geometry.
@@ -115,6 +127,7 @@ impl Game {
         let mut client = Client::connect(connection, Arc::clone(&content), "player")
             .map_err(|_| anyhow!("the server stopped before the game started"))?;
         client.set_view_distance(config.view_distance);
+        client.set_lod_distance(config.lod_distance);
 
         let faces = Arc::new(renderer.load_block_textures(&content));
         renderer.set_sky_textures(ruda_base::SUN, ruda_base::MOON);
@@ -128,7 +141,10 @@ impl Game {
         Ok(Self {
             client,
             server: Some(server),
-            mesher: ChunkMesher::new(faces),
+            mesher: ChunkMesher::new(Arc::clone(&faces)),
+            faces,
+            lod_distance: f32::from(config.lod_distance),
+            lod_waiting: VecDeque::new(),
             input: Input::default(),
             camera,
             hotbar,
@@ -189,6 +205,15 @@ impl Game {
                         self.mesher.mark_dirty(pos);
                     }
                 }
+                Event::LodLoaded(pos) => {
+                    if !self.lod_waiting.contains(&pos) {
+                        self.lod_waiting.push_back(pos);
+                    }
+                }
+                Event::LodUnloaded(pos) => {
+                    self.lod_waiting.retain(|&waiting| waiting != pos);
+                    renderer.remove_lod(pos);
+                }
                 Event::Disconnected { reason } => return Err(anyhow!("disconnected: {reason}")),
             }
         }
@@ -243,6 +268,16 @@ impl Game {
             renderer.upload_chunk(pos, &mesh);
             self.last_change = Instant::now();
         }
+        // A couple of far-away tiles a frame keeps loading smooth.
+        for _ in 0..LOD_TILES_PER_FRAME {
+            let Some(pos) = self.lod_waiting.pop_front() else {
+                break;
+            };
+            if let Some(tile) = self.client.lod(pos) {
+                renderer.upload_lod(pos, &mesh_lod(tile, &self.faces));
+                self.last_change = Instant::now();
+            }
+        }
         Ok(control)
     }
 
@@ -295,6 +330,13 @@ impl Game {
         self.client.set_view_distance(chunks);
     }
 
+    /// How far the far-away look of the world reaches, in blocks; 0 for
+    /// none.
+    pub fn set_lod_distance(&mut self, blocks: u16) {
+        self.lod_distance = f32::from(blocks);
+        self.client.set_lod_distance(blocks);
+    }
+
     /// Vertical field of view in degrees.
     pub fn set_fov(&mut self, degrees: f32) {
         self.camera.fov_y = degrees.to_radians();
@@ -308,6 +350,7 @@ impl Game {
             bounds: self.client.bounds(),
             time_of_day: self.time_of_day(),
             eye_light: self.eye_light(),
+            lod_distance: self.lod_distance,
         }
     }
 

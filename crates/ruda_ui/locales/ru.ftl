@@ -24,6 +24,14 @@ settings-fov = Поле зрения
 settings-fov-value = { $degrees }°
 settings-vsync = Вертикальная синхронизация
 settings-fullscreen = Полноэкранный режим
+settings-lod = Дальняя прорисовка
+settings-lod-off = Выкл
+settings-lod-value = { $blocks } { $blocks ->
+    [one] блок
+    [few] блока
+    [many] блоков
+   *[other] блока
+}
 settings-shadows = Тени от солнца
 settings-shadows-note = Мир рисуется ещё раз со стороны солнца — для мощных видеокарт
 settings-gpu-api = Графический API

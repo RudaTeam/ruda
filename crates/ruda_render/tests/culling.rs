@@ -65,6 +65,7 @@ fn culling_hides_nothing_that_can_be_seen() {
             bounds: Some(bounds),
             time_of_day: 0.25,
             eye_light: Light::SKY,
+            lod_distance: 0.0,
         };
         renderer.set_culling(true);
         let (_, _, culled) = renderer.capture(Backdrop::World(&scene), None).unwrap();

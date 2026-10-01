@@ -18,7 +18,8 @@ use crate::culling::visible_chunks;
 use crate::shadows::{Cascades, NEAR_CASCADE, SHADOW_MAP_SIZE, cascades};
 use crate::sky::SkyLook;
 use crate::textures::{BlockTextures, MIP_LEVELS, TEXTURE_SIZE};
-use crate::{ChunkMesh, RenderStats, Scene, Visibility};
+use crate::{ChunkMesh, LodMesh, RenderStats, Scene, Visibility};
+use ruda_world::lod::{LOD_TILE_SIZE, LodTilePos};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 /// Bytes of the `Globals` uniform in `world.wgsl`.
@@ -52,9 +53,11 @@ pub(crate) struct WorldPass {
     celestial_pipeline: wgpu::RenderPipeline,
     chunk_pipeline: wgpu::RenderPipeline,
     model_pipeline: wgpu::RenderPipeline,
+    lod_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     crosshair_pipeline: wgpu::RenderPipeline,
     chunks: HashMap<ChunkPos, ChunkEntry>,
+    lods: HashMap<LodTilePos, GpuLod>,
     pages: Vec<Page>,
     slots: Slots,
     depth: wgpu::TextureView,
@@ -101,6 +104,15 @@ struct ShadowMap {
     /// The globals and chunk positions, without the shadow map itself.
     globals_group: wgpu::BindGroup,
     cascades: [(wgpu::Buffer, wgpu::BindGroup); 2],
+}
+
+/// A tile of far-away terrain on the GPU.
+struct GpuLod {
+    slot: u32,
+    page: usize,
+    space: Range<u32>,
+    /// Lowest to highest point.
+    heights: Range<i32>,
 }
 
 /// A run of quads in one page.
@@ -299,6 +311,17 @@ impl WorldPass {
                 shader_location: 0,
             }],
         };
+        let lod_pipeline = pipeline(
+            "far terrain",
+            &layout,
+            "lod_vertex",
+            "lod_fragment",
+            &[Some(quad_buffer.clone())],
+            wgpu::PrimitiveTopology::TriangleStrip,
+            Some(wgpu::Face::Back),
+            (true, wgpu::CompareFunction::Less),
+            None,
+        );
         let model_pipeline = pipeline(
             "block models",
             &layout,
@@ -381,9 +404,11 @@ impl WorldPass {
             celestial_pipeline,
             chunk_pipeline,
             model_pipeline,
+            lod_pipeline,
             outline_pipeline,
             crosshair_pipeline,
             chunks: HashMap::new(),
+            lods: HashMap::new(),
             pages: Vec::new(),
             slots: Slots::new(MAX_SLOTS),
             depth: depth_view(device, width, height),
@@ -485,7 +510,31 @@ impl WorldPass {
             warn!(?pos, "too many chunks with geometry, not drawing this one");
             return None;
         };
-        let len = (mesh.quads.len() + mesh.models.len()) as u32;
+        let units: Vec<[u32; 4]> = mesh.quads.iter().chain(&mesh.models).copied().collect();
+        let (page, space) = self.store(device, queue, slot, &units);
+        self.write_origin(queue, slot, pos.origin().0);
+        let quads_end = space.start + mesh.quads.len() as u32;
+        Some(GpuChunk {
+            slot,
+            page,
+            quads: space.start..quads_end,
+            models: quads_end..space.end,
+            space,
+            face_counts: mesh.face_counts,
+        })
+    }
+
+    /// Puts 16-byte units into a page, with the slot in bits 18 to 31 of
+    /// their second word, as quads, model vertices and far-away quads all
+    /// expect.
+    fn store(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: u32,
+        units: &[[u32; 4]],
+    ) -> (usize, Range<u32>) {
+        let len = units.len() as u32;
         let found = self
             .pages
             .iter_mut()
@@ -496,7 +545,7 @@ impl WorldPass {
             None => {
                 let size = PAGE_QUADS.max(len);
                 let mut space = RangeAllocator::new(size);
-                let quads = space.allocate(len).expect("a new page fits the mesh");
+                let units = space.allocate(len).expect("a new page fits the mesh");
                 self.pages.push(Page {
                     buffer: device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("chunk quads"),
@@ -506,16 +555,11 @@ impl WorldPass {
                     }),
                     space,
                 });
-                (self.pages.len() - 1, quads)
+                (self.pages.len() - 1, units)
             }
         };
-
-        // Quads and model vertices both carry the slot in bits 18 to 31 of
-        // their second word.
-        let bytes: Vec<u8> = mesh
-            .quads
+        let bytes: Vec<u8> = units
             .iter()
-            .chain(&mesh.models)
             .flat_map(|&[a, b, c, d]| [a, b | slot << 18, c, d])
             .flat_map(u32::to_le_bytes)
             .collect();
@@ -524,8 +568,10 @@ impl WorldPass {
             u64::from(space.start) * QUAD_BYTES,
             &bytes,
         );
-        let quads_end = space.start + mesh.quads.len() as u32;
-        let origin = pos.origin().0;
+        (page, space)
+    }
+
+    fn write_origin(&self, queue: &wgpu::Queue, slot: u32, origin: glam::IVec3) {
         let texel: Vec<u8> = [origin.x, origin.y, origin.z, 0]
             .into_iter()
             .flat_map(i32::to_le_bytes)
@@ -549,14 +595,42 @@ impl WorldPass {
                 depth_or_array_layers: 1,
             },
         );
-        Some(GpuChunk {
-            slot,
-            page,
-            quads: space.start..quads_end,
-            models: quads_end..space.end,
-            space,
-            face_counts: mesh.face_counts,
-        })
+    }
+
+    pub(crate) fn upload_lod(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pos: LodTilePos,
+        mesh: &LodMesh,
+    ) {
+        self.remove_lod(pos);
+        if mesh.quads.is_empty() {
+            return;
+        }
+        let Some(slot) = self.slots.take() else {
+            warn!(?pos, "too many chunks with geometry, not drawing this tile");
+            return;
+        };
+        let (page, space) = self.store(device, queue, slot, &mesh.quads);
+        let (x, z) = pos.origin();
+        self.write_origin(queue, slot, glam::IVec3::new(x, 0, z));
+        self.lods.insert(
+            pos,
+            GpuLod {
+                slot,
+                page,
+                space,
+                heights: mesh.min_y..mesh.max_y,
+            },
+        );
+    }
+
+    pub(crate) fn remove_lod(&mut self, pos: LodTilePos) {
+        if let Some(gpu) = self.lods.remove(&pos) {
+            self.pages[gpu.page].space.free(gpu.space);
+            self.slots.give_back(gpu.slot);
+        }
     }
 
     pub(crate) fn remove(&mut self, pos: ChunkPos) {
@@ -568,6 +642,7 @@ impl WorldPass {
 
     pub(crate) fn clear(&mut self) {
         self.chunks.clear();
+        self.lods.clear();
         self.pages.clear();
         self.slots = Slots::new(MAX_SLOTS);
     }
@@ -598,9 +673,12 @@ impl WorldPass {
         (width, height): (u32, u32),
     ) {
         let camera = scene.camera.position;
+        // With far-away terrain, the view reaches past the chunks drawn in
+        // full, and the fog with it.
+        let far = scene.view_distance.max(scene.lod_distance);
         let view_proj = scene
             .camera
-            .view_proj(width as f32 / height as f32, scene.view_distance + 64.0);
+            .view_proj(width as f32 / height as f32, far + 64.0);
         let frustum = Frustum::new(view_proj);
         let radius = (scene.view_distance / CHUNK_SIZE as f32).ceil() as i32;
         let bounds = scene.bounds.unwrap_or(WorldBounds::DEFAULT);
@@ -665,12 +743,13 @@ impl WorldPass {
         globals.matrix(view_proj);
         globals.matrix(view_proj.inverse());
         globals.floats([sky.fog.x, sky.fog.y, sky.fog.z, 1.0]);
-        globals.floats([
-            scene.view_distance * 0.6,
-            scene.view_distance * 0.95,
-            0.0,
-            0.0,
-        ]);
+        // Far-away terrain gives way to the chunks a chunk inside their edge.
+        let lod_start = if scene.lod_distance > 0.0 {
+            scene.view_distance - CHUNK_SIZE as f32
+        } else {
+            f32::MAX
+        };
+        globals.floats([far * 0.6, far * 0.95, lod_start, 0.0]);
         globals.floats(selection.extend(0.0).to_array());
         globals.floats([width as f32, height as f32, 0.0, 0.0]);
         globals.ints(camera_block.extend(0).to_array());
@@ -775,6 +854,42 @@ impl WorldPass {
                 bound = Some(gpu.page);
             }
             pass.draw(gpu.models.clone(), 0..1);
+        }
+
+        if scene.lod_distance > 0.0 {
+            let mut tiles: Vec<&GpuLod> = self
+                .lods
+                .iter()
+                .filter_map(|(pos, gpu)| {
+                    let (x, z) = pos.origin();
+                    let min =
+                        DVec3::new(f64::from(x), f64::from(gpu.heights.start - 1), f64::from(z));
+                    let size = DVec3::new(
+                        f64::from(LOD_TILE_SIZE),
+                        f64::from(gpu.heights.end - gpu.heights.start + 2),
+                        f64::from(LOD_TILE_SIZE),
+                    );
+                    let min = (min - camera).as_vec3();
+                    frustum
+                        .intersects_box(min, min + size.as_vec3())
+                        .then_some(gpu)
+                })
+                .collect();
+            tiles.sort_by_key(|gpu| (gpu.page, gpu.space.start));
+            let mut draws = Vec::new();
+            for gpu in tiles {
+                push_draw(&mut draws, gpu.page, gpu.space.clone());
+            }
+            self.stats.draw_calls += draws.len();
+            pass.set_pipeline(&self.lod_pipeline);
+            let mut bound = None;
+            for draw in &draws {
+                if bound != Some(draw.page) {
+                    pass.set_vertex_buffer(0, self.pages[draw.page].buffer.slice(..));
+                    bound = Some(draw.page);
+                }
+                pass.draw(0..4, draw.quads.clone());
+            }
         }
 
         if scene.target.is_some() {

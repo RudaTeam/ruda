@@ -31,8 +31,9 @@ cargo run -p ruda          # client
 cargo run -p ruda-server   # dedicated server (a stub until network play lands)
 ```
 
-The game opens on the main menu. Settings has the view distance, field of
-view, vertical sync, fullscreen, sun shadows (off by default: they cost a
+The game opens on the main menu. Settings has the view distance, how far
+simplified far terrain reaches beyond it, field of view, vertical sync,
+fullscreen, sun shadows (off by default: they cost a
 second drawing of the world), graphics API and language (English or
 Russian; the system language by default). They are saved to `settings.toml`
 in `~/.config/ruda` on Linux, `~/Library/Application Support/Ruda` on macOS
@@ -58,6 +59,8 @@ The client takes a few options:
   sunset and 18000 midnight.
 - `--view-distance <CHUNKS>` overrides how far the world loads, in chunks of 32
   blocks, up to 32 (6 by default; try 2 or 3 on weak hardware).
+- `--lod-distance <BLOCKS>` overrides how far simplified far terrain
+  reaches past the chunks drawn in full; 0 turns it off.
 - `--gpu-backend <auto|vulkan|metal|dx12|gl>` overrides the graphics API. You
   can also set it with `RUDA_GPU_BACKEND`. `auto` tries Vulkan, Metal and DX12
   before falling back to OpenGL.

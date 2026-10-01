@@ -17,6 +17,7 @@ use ruda_net::{ClientConnection, RecvError, ServerConnection, local_pair};
 pub use ruda_protocol::TICK_RATE;
 use ruda_protocol::{ClientMessage, DAY_LENGTH, PROTOCOL_VERSION, REACH, ServerMessage};
 use ruda_world::light::LightEngine;
+use ruda_world::lod::{LOD_TILE_SIZE, LodTile, LodTilePos};
 use ruda_world::{Chunk, Generator, World};
 use tracing::{info, warn};
 
@@ -24,6 +25,8 @@ const TICK: Duration = Duration::from_millis(1000 / TICK_RATE as u64);
 
 /// Most chunks sent to one client in a tick.
 const CHUNKS_PER_TICK: usize = 64;
+/// Most far-away tiles sent to one client in a tick.
+const LOD_TILES_PER_TICK: usize = 4;
 /// Time a tick may spend lighting new chunks.
 const LIGHT_BUDGET: Duration = Duration::from_millis(10);
 
@@ -36,6 +39,8 @@ pub struct ServerConfig {
     pub bounds: WorldBounds,
     /// The time the world starts at, in ticks; see [`DAY_LENGTH`].
     pub start_time: u64,
+    /// The farthest, in blocks, that the far-away look of the world is sent.
+    pub max_lod_distance: i32,
 }
 
 impl Default for ServerConfig {
@@ -45,6 +50,7 @@ impl Default for ServerConfig {
             bounds: WorldBounds::DEFAULT,
             // Early morning.
             start_time: DAY_LENGTH / 24,
+            max_lod_distance: 2048,
         }
     }
 }
@@ -75,6 +81,13 @@ pub struct Server {
     unlit: HashSet<ChunkPos>,
     /// Chunks whose light changed since clients last heard.
     light_changed: HashSet<ChunkPos>,
+    /// The far-away look of tiles near players.
+    lod_tiles: HashMap<LodTilePos, Arc<LodTile>>,
+    lod_generating: HashSet<LodTilePos>,
+    lod_tx: Sender<(LodTilePos, Option<LodTile>)>,
+    lod_rx: Receiver<(LodTilePos, Option<LodTile>)>,
+    /// Set when the generator can't tell its surface: no far-away look.
+    lod_unsupported: bool,
     clients: Vec<RemoteClient>,
     /// Offsets of the chunks streamed around a player, nearest first, by
     /// view distance.
@@ -93,6 +106,9 @@ struct RemoteClient {
     /// In chunks.
     view_distance: i32,
     sent: HashSet<ChunkPos>,
+    /// In blocks; 0 for no far-away look.
+    lod_distance: i32,
+    lod_sent: HashSet<LodTilePos>,
     connected: bool,
 }
 
@@ -111,7 +127,13 @@ impl Server {
             None => DVec3::new(0.5, 100.0, 0.5),
         };
         let (generated_tx, generated_rx) = mpsc::channel();
+        let (lod_tx, lod_rx) = mpsc::channel();
         Self {
+            lod_tiles: HashMap::new(),
+            lod_generating: HashSet::new(),
+            lod_tx,
+            lod_rx,
+            lod_unsupported: false,
             views: HashMap::new(),
             light: LightEngine::new(content.blocks(), config.bounds),
             unlit: HashSet::new(),
@@ -141,6 +163,8 @@ impl Server {
             position: None,
             view_distance: DEFAULT_VIEW_DISTANCE.min(self.config.view_distance),
             sent: HashSet::new(),
+            lod_distance: 0,
+            lod_sent: HashSet::new(),
             connected: true,
         });
     }
@@ -164,6 +188,13 @@ impl Server {
             self.world.insert_chunk(pos, chunk);
             self.unlit.insert(pos);
         }
+        while let Ok((pos, tile)) = self.lod_rx.try_recv() {
+            self.lod_generating.remove(&pos);
+            match tile {
+                Some(tile) => drop(self.lod_tiles.insert(pos, Arc::new(tile))),
+                None => self.lod_unsupported = true,
+            }
+        }
         for index in 0..self.clients.len() {
             self.handle_messages(index);
         }
@@ -173,6 +204,7 @@ impl Server {
         self.send_light_changes();
         for index in 0..self.clients.len() {
             self.stream_chunks(index);
+            self.stream_lod(index);
         }
         self.ticks += 1;
         self.time += 1;
@@ -314,6 +346,10 @@ impl Server {
             ClientMessage::ViewDistance(chunks) => {
                 self.clients[index].view_distance =
                     i32::from(chunks).clamp(1, self.config.view_distance);
+            }
+            ClientMessage::LodDistance(blocks) => {
+                self.clients[index].lod_distance =
+                    i32::from(blocks).min(self.config.max_lod_distance);
             }
             ClientMessage::BreakBlock { pos, seq } => {
                 self.block_action(index, pos, BlockId::AIR, seq);
@@ -462,6 +498,71 @@ impl Server {
         )
     }
 
+    /// Sends the far-away look of the nearest tiles the client doesn't have
+    /// yet, asks for the ones that don't exist, and tells it to forget those
+    /// it moved away from.
+    fn stream_lod(&mut self, index: usize) {
+        let Some(position) = self.clients[index].position else {
+            return;
+        };
+        let center = LodTilePos::containing(position.x.floor() as i32, position.z.floor() as i32);
+        let reach = if self.lod_unsupported {
+            0
+        } else {
+            self.clients[index].lod_distance
+        };
+        let radius = (reach + LOD_TILE_SIZE - 1) / LOD_TILE_SIZE;
+        let mut budget = LOD_TILES_PER_TICK;
+        let wanted = if reach > 0 {
+            lod_tiles_around(center, radius)
+        } else {
+            Vec::new()
+        };
+        for pos in wanted {
+            if self.clients[index].lod_sent.contains(&pos) {
+                continue;
+            }
+            match self.lod_tiles.get(&pos) {
+                Some(_) if budget == 0 => {}
+                Some(tile) => {
+                    budget -= 1;
+                    let message = ServerMessage::LodTile {
+                        pos,
+                        tile: LodTile::clone(tile),
+                    };
+                    let client = &mut self.clients[index];
+                    client.lod_sent.insert(pos);
+                    client.send(message);
+                }
+                None => self.generate_lod(pos),
+            }
+        }
+
+        // A tile of slack, as with chunks.
+        let client = &mut self.clients[index];
+        let far: Vec<LodTilePos> = client
+            .lod_sent
+            .iter()
+            .filter(|pos| reach == 0 || !in_lod_reach(**pos, center, radius + 1))
+            .copied()
+            .collect();
+        for pos in far {
+            client.lod_sent.remove(&pos);
+            client.send(ServerMessage::UnloadLod(pos));
+        }
+    }
+
+    fn generate_lod(&mut self, pos: LodTilePos) {
+        if self.lod_generating.len() >= self.max_generating || !self.lod_generating.insert(pos) {
+            return;
+        }
+        let generator = Arc::clone(&self.generator);
+        let done = self.lod_tx.clone();
+        rayon::spawn(move || {
+            let _ = done.send((pos, LodTile::generate(&*generator, pos)));
+        });
+    }
+
     fn generate(&mut self, pos: ChunkPos) {
         if self.generating.len() >= self.max_generating || !self.generating.insert(pos) {
             return;
@@ -502,6 +603,24 @@ impl Server {
             self.light.forget(pos);
             self.unlit.remove(&pos);
         }
+
+        // Far-away tiles nobody is near.
+        let reaches: Vec<(LodTilePos, i32)> = self
+            .clients
+            .iter()
+            .filter_map(|client| {
+                let position = client.position?;
+                let center =
+                    LodTilePos::containing(position.x.floor() as i32, position.z.floor() as i32);
+                let radius = (client.lod_distance + LOD_TILE_SIZE - 1) / LOD_TILE_SIZE;
+                Some((center, radius + 2))
+            })
+            .collect();
+        self.lod_tiles.retain(|&pos, _| {
+            reaches
+                .iter()
+                .any(|&(center, radius)| in_lod_reach(pos, center, radius))
+        });
     }
 
     fn kick(&mut self, index: usize, reason: &str) {
@@ -551,6 +670,30 @@ pub fn spawn_integrated(
         .name("server".into())
         .spawn(move || server.run_until_empty())?;
     Ok((thread, client))
+}
+
+/// Tiles whose middle is within `radius` tiles of the middle of `center`.
+fn in_lod_reach(pos: LodTilePos, center: LodTilePos, radius: i32) -> bool {
+    let (dx, dz) = (pos.x - center.x, pos.z - center.z);
+    dx * dx + dz * dz <= radius * radius
+}
+
+/// The tiles within `radius` of `center`, nearest first.
+fn lod_tiles_around(center: LodTilePos, radius: i32) -> Vec<LodTilePos> {
+    let mut tiles = Vec::new();
+    for dz in -radius..=radius {
+        for dx in -radius..=radius {
+            let pos = LodTilePos::new(center.x + dx, center.z + dz);
+            if in_lod_reach(pos, center, radius) {
+                tiles.push(pos);
+            }
+        }
+    }
+    tiles.sort_by_key(|pos| {
+        let (dx, dz) = (pos.x - center.x, pos.z - center.z);
+        dx * dx + dz * dz
+    });
+    tiles
 }
 
 /// The chunk and the 26 around it.
@@ -612,6 +755,10 @@ mod tests {
 
         fn surface_height(&self, _x: i32, _z: i32) -> Option<i32> {
             Some(-1)
+        }
+
+        fn surface(&self, _x: i32, _z: i32) -> Option<(i32, BlockId)> {
+            Some((-1, self.stone))
         }
     }
 
@@ -890,6 +1037,24 @@ mod tests {
             harness.server.world().block(BlockPos::new(3, 0, 3)),
             Some(on_floor)
         );
+    }
+
+    #[test]
+    fn sends_the_far_away_look_and_takes_it_back() {
+        let mut harness = Harness::new();
+        harness.join();
+        harness.send(ClientMessage::LodDistance(300));
+        let ServerMessage::LodTile { pos, tile } =
+            harness.expect(|m| matches!(m, ServerMessage::LodTile { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(pos, LodTilePos::new(0, 0));
+        assert!(tile.is_complete());
+        assert_eq!(tile.cell(3, 3), (-1, harness.stone));
+
+        harness.send(ClientMessage::LodDistance(0));
+        harness.expect(|m| matches!(m, ServerMessage::UnloadLod(_)));
     }
 
     /// Waits for `count` chunks, then for a few more ticks in case there are

@@ -74,6 +74,11 @@ impl BlockFaces {
         self.get(id).is_some()
     }
 
+    /// The texture layer of each face of a cube block.
+    pub(crate) fn layers(&self, id: BlockId) -> Option<[u16; 6]> {
+        self.get(id)
+    }
+
     fn glows(&self, id: BlockId) -> bool {
         self.glowing.get(id.index()).copied().unwrap_or(false)
     }

@@ -1,4 +1,4 @@
-use ruda_core::ChunkPos;
+use ruda_core::{BlockId, ChunkPos};
 
 use crate::Chunk;
 
@@ -9,6 +9,13 @@ pub trait Generator: Send + Sync {
     /// Height of the topmost block of the column at `(x, z)`, if the
     /// generator can tell without generating chunks.
     fn surface_height(&self, x: i32, z: i32) -> Option<i32> {
+        let _ = (x, z);
+        None
+    }
+
+    /// Height and kind of the topmost block of the column at `(x, z)`, if
+    /// the generator can tell cheaply. Far-away terrain is drawn from it.
+    fn surface(&self, x: i32, z: i32) -> Option<(i32, BlockId)> {
         let _ = (x, z);
         None
     }

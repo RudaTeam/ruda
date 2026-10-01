@@ -255,6 +255,72 @@ fn sunlit(position: vec3<f32>, normal: vec3<f32>, distance: f32) -> f32 {
 
 @fragment
 fn chunk_fragment(in: ChunkVertex) -> @location(0) vec4<f32> {
+    return shade(in);
+}
+
+// Far-away terrain; see `LodQuad` in `lod.rs`. A tile's position comes from
+// the chunk position texture, like a chunk's.
+@vertex
+fn lod_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) -> ChunkVertex {
+    let first = vec3<f32>(f32(quad.x & 63u), 0.0, f32((quad.x >> 6u) & 63u)) * 4.0;
+    let cells = vec3<f32>(f32(((quad.x >> 12u) & 63u) + 1u), 0.0, f32(((quad.x >> 18u) & 63u) + 1u));
+    let face = (quad.x >> 24u) & 7u;
+    // The box's bottom and top, sign-extended from 16 bits.
+    let low = f32(bitcast<i32>(quad.z << 16u) >> 16u);
+    let high = f32(bitcast<i32>(quad.z) >> 16u);
+    let start = vec3<f32>(first.x, low, first.z);
+    let size = vec3<f32>(cells.x * 4.0, high - low, cells.z * 4.0);
+    let axis = face / 2u;
+
+    var u_axis = 0u;
+    var v_axis = 2u;
+    if axis == 0u {
+        u_axis = 2u;
+        v_axis = 1u;
+    } else if axis == 2u {
+        v_axis = 1u;
+    }
+    var cu = vertex & 1u;
+    var cv = vertex >> 1u;
+    if face == 0u || face == 2u || face == 5u {
+        let swap = cu;
+        cu = cv;
+        cv = swap;
+    }
+    var local = start
+        + unit(axis) * select(0.0, size[axis], face % 2u == 0u)
+        + unit(u_axis) * (f32(cu) * size[u_axis])
+        + unit(v_axis) * (f32(cv) * size[v_axis]);
+    // A little below the chunks drawn in full, so where both are drawn,
+    // those win.
+    local.y -= 0.5;
+    let position = camera_relative(quad.y >> 18u, local);
+
+    var out: ChunkVertex;
+    out.clip = globals.view_proj * vec4<f32>(position, 1.0);
+    out.position = position;
+    out.normal = face_normal(face);
+    // One texture per block, upright on walls.
+    out.uv = select(vec2<f32>(local[u_axis], -local[v_axis]), local.xz, axis == 1u);
+    out.layer = quad.y & 0x3ffu;
+    out.shade = face_shade(face);
+    out.distance = length(position);
+    out.light = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+    out.occlusion = 1.0;
+    out.glows = 0u;
+    return out;
+}
+
+@fragment
+fn lod_fragment(in: ChunkVertex) -> @location(0) vec4<f32> {
+    // Near the camera, the chunks drawn in full take over.
+    if length(in.position.xz) < globals.fog.z {
+        discard;
+    }
+    return shade(in);
+}
+
+fn shade(in: ChunkVertex) -> vec4<f32> {
     let texel = textureSample(block_textures, block_sampler, in.uv, in.layer).rgb;
     let level = brightness(in.light);
     // With shadows, part of sky light comes straight from the sun or moon

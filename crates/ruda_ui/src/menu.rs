@@ -1,6 +1,6 @@
 use egui::{Align2, Color32, ComboBox, RichText, Slider, TextureHandle, Ui, Vec2};
 
-use crate::settings::{FIELDS_OF_VIEW, GpuApi, Settings, VIEW_DISTANCES};
+use crate::settings::{FIELDS_OF_VIEW, GpuApi, LOD_DISTANCES, Settings, VIEW_DISTANCES};
 use crate::{I18n, Language};
 
 const BUTTON_SIZE: Vec2 = Vec2::new(340.0, 48.0);
@@ -219,6 +219,31 @@ impl Menu {
                                 ui.label(t("settings-shadows"));
                                 ui.checkbox(&mut graphics.shadows, "")
                                     .on_hover_text(t("settings-shadows-note"));
+                                ui.end_row();
+
+                                ui.label(t("settings-lod"));
+                                let lod_name = |blocks: u16| {
+                                    if blocks == 0 {
+                                        t("settings-lod-off")
+                                    } else {
+                                        i18n.get_with(
+                                            "settings-lod-value",
+                                            &[("blocks", i64::from(blocks))],
+                                        )
+                                    }
+                                };
+                                ComboBox::from_id_salt("lod")
+                                    .selected_text(lod_name(graphics.lod_distance))
+                                    .width(COMBO_WIDTH)
+                                    .show_ui(ui, |ui| {
+                                        for blocks in LOD_DISTANCES {
+                                            ui.selectable_value(
+                                                &mut graphics.lod_distance,
+                                                blocks,
+                                                lod_name(blocks),
+                                            );
+                                        }
+                                    });
                                 ui.end_row();
 
                                 ui.label(t("settings-gpu-api"));

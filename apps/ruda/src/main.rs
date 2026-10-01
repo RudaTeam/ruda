@@ -58,6 +58,11 @@ struct Args {
     #[arg(long, value_name = "CHUNKS", value_parser = clap::value_parser!(u8).range(2..=i64::from(MAX_VIEW_DISTANCE)))]
     view_distance: Option<u8>,
 
+    /// How far simplified far-away terrain reaches, in blocks (0 for none),
+    /// instead of the distance in the settings.
+    #[arg(long, value_name = "BLOCKS")]
+    lod_distance: Option<u16>,
+
     /// Exit after presenting this many frames (smoke tests, benchmarks).
     #[arg(long, value_name = "N")]
     exit_after_frames: Option<u64>,
@@ -326,6 +331,7 @@ impl App {
             fov: f32::from(graphics.fov),
             camera: self.args.camera,
             time: self.args.time,
+            lod_distance: self.args.lod_distance.unwrap_or(graphics.lod_distance),
         };
         self.game = Some(Game::start(config, renderer)?);
         self.resume();
@@ -404,6 +410,9 @@ impl App {
             }
             if new.fov != old.fov {
                 game.set_fov(f32::from(new.fov));
+            }
+            if new.lod_distance != old.lod_distance {
+                game.set_lod_distance(new.lod_distance);
             }
         }
         self.i18n

@@ -6,6 +6,7 @@
 mod arena;
 mod camera;
 mod culling;
+mod lod;
 mod mesh;
 mod mesher;
 mod shadows;
@@ -23,6 +24,7 @@ use tracing::{info, warn};
 use wgpu::rwh::{HasDisplayHandle, HasWindowHandle};
 
 pub use camera::{Camera, Frustum};
+pub use lod::{LodMesh, LodQuad, mesh_lod};
 pub use mesh::{BlockFaces, ChunkMesh, ModelVertex, PaddedChunk, Quad, mesh_chunk};
 pub use mesher::ChunkMesher;
 pub use textures::BlockTextures;
@@ -70,6 +72,9 @@ pub struct Scene {
     pub time_of_day: f32,
     /// The light where the camera is; from caves the sky looks dark.
     pub eye_light: Light,
+    /// How far the far-away look of the world reaches, in blocks; 0 for
+    /// none.
+    pub lod_distance: f32,
 }
 
 /// What the last frame drew.
@@ -368,6 +373,15 @@ impl Renderer {
 
     pub fn remove_chunk(&mut self, pos: ChunkPos) {
         self.world.remove(pos);
+    }
+
+    /// Replaces the geometry drawn for a tile of far-away terrain.
+    pub fn upload_lod(&mut self, pos: ruda_world::lod::LodTilePos, mesh: &LodMesh) {
+        self.world.upload_lod(&self.device, &self.queue, pos, mesh);
+    }
+
+    pub fn remove_lod(&mut self, pos: ruda_world::lod::LodTilePos) {
+        self.world.remove_lod(pos);
     }
 
     /// Forgets every chunk, for leaving a world.
