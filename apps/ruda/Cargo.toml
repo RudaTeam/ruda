@@ -15,9 +15,17 @@ tracy = ["dep:tracing-tracy"]
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+glam.workspace = true
 png.workspace = true
 pollster.workspace = true
+ruda_base.workspace = true
+ruda_client.workspace = true
+ruda_core.workspace = true
+ruda_input.workspace = true
+ruda_protocol.workspace = true
 ruda_render.workspace = true
+ruda_server.workspace = true
+ruda_world.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-tracy = { workspace = true, optional = true }

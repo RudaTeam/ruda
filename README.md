@@ -13,8 +13,9 @@ What we're aiming for:
 - smooth play on weak hardware, with a Raspberry Pi 4 as the low bar;
 - a modding API that can carry big tech mods: machines, power networks, their own UIs.
 
-It's very early. Right now the client opens a window and clears it with wgpu,
-and the dedicated server does nothing. There's nothing to play yet.
+It's very early. You can fly around a generated world with hills, caves and
+ore, and break and place blocks. Single-player already runs on a local server
+inside the game; there's no survival, saving or network play yet.
 
 ## Building
 
@@ -23,16 +24,31 @@ Install Rust with [rustup](https://rustup.rs). The toolchain pinned in
 
 ```sh
 cargo run -p ruda          # client
-cargo run -p ruda-server   # dedicated server
+cargo run -p ruda-server   # dedicated server (a stub until network play lands)
 ```
+
+Click the window to capture the mouse, then:
+
+| Key | Action |
+|---|---|
+| Mouse | Look around |
+| W A S D | Fly |
+| Space / Left Shift | Up / down |
+| Left Ctrl | Fly faster |
+| Left / right click | Break / place a block |
+| 1–9 | Pick the block to place |
+| Esc | Release the mouse |
 
 The client takes a few options:
 
+- `--seed <N>` picks the world; without it every start is a new world.
+- `--view-distance <CHUNKS>` sets how far the world loads, in chunks of 32
+  blocks (6 by default; try 2 or 3 on weak hardware).
 - `--gpu-backend <auto|vulkan|metal|dx12|gl>` selects the graphics API. You can
   also set it with `RUDA_GPU_BACKEND`. `auto` tries Vulkan, Metal and DX12
   before falling back to OpenGL.
-- `--exit-after-frames <N>` quits after N frames have been shown. CI uses it
-  as a smoke test.
+- `--exit-after-frames <N>` quits after N frames have been shown, and
+  `--screenshot <PATH>` saves the last one. CI uses them as a smoke test.
 
 Logging is controlled with `RUST_LOG`, for example `RUST_LOG=debug`. To profile
 with [Tracy](https://github.com/wolfpld/tracy), build with `--features tracy`.

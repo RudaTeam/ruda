@@ -10,8 +10,16 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+glam.workspace = true
+png.workspace = true
+rayon.workspace = true
+ruda_core.workspace = true
+ruda_world.workspace = true
 tracing.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

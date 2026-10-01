@@ -14,6 +14,7 @@ publish = false
 ruda_base = { path = "content/base" }
 ruda_client = { path = "crates/ruda_client" }
 ruda_core = { path = "crates/ruda_core" }
+ruda_input = { path = "crates/ruda_input" }
 ruda_net = { path = "crates/ruda_net" }
 ruda_protocol = { path = "crates/ruda_protocol" }
 ruda_render = { path = "crates/ruda_render" }

@@ -1,14 +1,38 @@
 //! Renderer on top of wgpu.
 //!
-//! wgpu types never leave this crate: the rest of the engine sees only
-//! [`Renderer`] and [`GpuBackend`].
+//! wgpu types never leave this crate: the rest of the engine sees the
+//! [`Renderer`], the [`Camera`] and the meshing helpers.
+
+mod camera;
+mod mesh;
+mod mesher;
+mod textures;
+mod world_pass;
 
 use std::fmt;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
+use ruda_core::{BlockPos, ChunkPos, Content};
 use tracing::{info, warn};
 use wgpu::rwh::{HasDisplayHandle, HasWindowHandle};
+
+pub use camera::{Camera, Frustum};
+pub use mesh::{BlockFaces, ChunkMesh, PaddedChunk, Quad, mesh_chunk};
+pub use mesher::ChunkMesher;
+pub use textures::BlockTextures;
+
+use world_pass::WorldPass;
+
+/// What to draw in a frame.
+#[derive(Clone, Copy, Debug)]
+pub struct Scene {
+    pub camera: Camera,
+    /// The block under the crosshair, outlined.
+    pub target: Option<BlockPos>,
+    /// How far the world is drawn, in blocks; fog hides the edge.
+    pub view_distance: f32,
+}
 
 /// Graphics API to render with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,6 +69,7 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     /// `None` while suspended: mobile platforms destroy the native window.
     surface: Option<wgpu::Surface<'static>>,
+    world: WorldPass,
 }
 
 impl Renderer {
@@ -137,6 +162,7 @@ impl Renderer {
             "GPU ready"
         );
 
+        let world = WorldPass::new(&device, &queue, config.format, width, height);
         let renderer = Self {
             instance,
             adapter,
@@ -145,6 +171,7 @@ impl Renderer {
             window,
             config,
             surface: Some(surface),
+            world,
         };
         renderer.configure_surface();
         Ok(renderer)
@@ -162,6 +189,112 @@ impl Renderer {
         self.config.width = width.min(max);
         self.config.height = height.min(max);
         self.configure_surface();
+        if self.config.width > 0 && self.config.height > 0 {
+            self.world
+                .resize(&self.device, self.config.width, self.config.height);
+        }
+    }
+
+    /// Uploads the block textures of `content` and returns, for meshing, the
+    /// texture layer of every block face.
+    pub fn load_block_textures(&mut self, content: &Content) -> BlockFaces {
+        let max_layers = self.device.limits().max_texture_array_layers;
+        let textures = BlockTextures::load(content, max_layers);
+        self.world
+            .set_textures(&self.device, &self.queue, &textures);
+        BlockFaces::new(content.blocks(), |id| textures.layer(id))
+    }
+
+    /// Replaces the geometry drawn for a chunk.
+    pub fn upload_chunk(&mut self, pos: ChunkPos, mesh: &ChunkMesh) {
+        self.world.upload(&self.device, pos, mesh);
+    }
+
+    pub fn remove_chunk(&mut self, pos: ChunkPos) {
+        self.world.remove(pos);
+    }
+
+    /// Chunks with geometry on the GPU.
+    pub fn chunk_count(&self) -> usize {
+        self.world.chunk_count()
+    }
+
+    /// Draws `scene` into an off-screen image instead of the window and
+    /// returns its width, height and RGBA pixels.
+    pub fn capture(&mut self, scene: &Scene) -> Result<(u32, u32, Vec<u8>)> {
+        let (width, height) = (self.config.width.max(1), self.config.height.max(1));
+        let format = self.config.format;
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("screenshot"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("screenshot"),
+            size: u64::from(row * height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("screenshot"),
+            });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.world.draw(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &view,
+            scene,
+            (width, height),
+            sky_color(format),
+        );
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(height),
+                },
+            },
+            size,
+        );
+        self.queue.submit([encoder.finish()]);
+
+        buffer.map_async(wgpu::MapMode::Read, .., |_| {});
+        self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })?;
+        let mapped = buffer.get_mapped_range(..)?;
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for line in mapped.chunks(row as usize) {
+            pixels.extend_from_slice(&line[..(width * 4) as usize]);
+        }
+        if matches!(
+            format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+        }
+        Ok((width, height, pixels))
     }
 
     /// Releases the surface; call when the platform suspends the app.
@@ -182,7 +315,7 @@ impl Renderer {
     /// presented while the window is hidden, zero-sized or being reconfigured.
     /// `pre_present` runs right before presenting (winit wants
     /// `Window::pre_present_notify` there).
-    pub fn render(&mut self, pre_present: impl FnOnce()) -> Result<bool> {
+    pub fn render(&mut self, scene: &Scene, pre_present: impl FnOnce()) -> Result<bool> {
         if self.config.width == 0 || self.config.height == 0 {
             return Ok(false);
         }
@@ -219,19 +352,15 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("clear"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(sky_color(self.config.format)),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
+        self.world.draw(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &view,
+            scene,
+            (self.config.width, self.config.height),
+            sky_color(self.config.format),
+        );
         self.queue.submit([encoder.finish()]);
 
         pre_present();

@@ -1785,9 +1785,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "glam",
  "png",
  "pollster",
+ "ruda_base",
+ "ruda_client",
+ "ruda_core",
+ "ruda_input",
+ "ruda_protocol",
  "ruda_render",
+ "ruda_server",
+ "ruda_world",
  "tracing",
  "tracing-subscriber",
  "tracing-tracy",
@@ -1833,6 +1841,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruda_input"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "winit",
+]
+
+[[package]]
 name = "ruda_net"
 version = "0.1.0"
 dependencies = [
@@ -1858,6 +1874,12 @@ name = "ruda_render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "glam",
+ "naga",
+ "png",
+ "rayon",
+ "ruda_core",
+ "ruda_world",
  "tracing",
  "wgpu",
 ]

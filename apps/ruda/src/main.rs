@@ -1,7 +1,10 @@
-//! Game client. For now it opens a window and clears it every frame.
+//! Game client: a window with the world of an integrated server.
 
+mod game;
+
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, ValueEnum};
@@ -9,9 +12,11 @@ use ruda_render::{GpuBackend, Renderer};
 use tracing::{info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
-use winit::window::{Icon, Window, WindowId};
+use winit::window::{CursorGrabMode, Icon, Window, WindowId};
+
+use crate::game::{Control, Game, GameConfig};
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/branding/app-icon.png");
 
@@ -22,9 +27,21 @@ struct Args {
     #[arg(long, value_enum, default_value_t, env = "RUDA_GPU_BACKEND")]
     gpu_backend: GpuBackendArg,
 
+    /// World seed; a random one if not given.
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// How far the world is loaded and drawn, in chunks of 32 blocks.
+    #[arg(long, value_name = "CHUNKS", default_value_t = 6, value_parser = clap::value_parser!(i32).range(2..=32))]
+    view_distance: i32,
+
     /// Exit after presenting this many frames (smoke tests, benchmarks).
     #[arg(long, value_name = "N")]
     exit_after_frames: Option<u64>,
+
+    /// With --exit-after-frames, save the last frame to this PNG file.
+    #[arg(long, value_name = "PATH", requires = "exit_after_frames")]
+    screenshot: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -60,8 +77,12 @@ fn main() -> Result<()> {
         args,
         window: None,
         renderer: None,
+        game: None,
+        cursor_grabbed: false,
+        last_frame: None,
         frames: 0,
         first_frame_at: None,
+        title: TitleStats::default(),
         occluded: false,
         zero_sized: false,
         error: None,
@@ -102,14 +123,45 @@ fn window_icon() -> Result<Icon> {
     Ok(Icon::from_rgba(rgba, frame.width, frame.height)?)
 }
 
+fn save_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+    let file = std::io::BufWriter::new(
+        std::fs::File::create(path).with_context(|| format!("can't create {}", path.display()))?,
+    );
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(rgba)?;
+    Ok(())
+}
+
+/// Frame counting for the window title.
+#[derive(Debug)]
+struct TitleStats {
+    since: Instant,
+    frames: u32,
+}
+
+impl Default for TitleStats {
+    fn default() -> Self {
+        Self {
+            since: Instant::now(),
+            frames: 0,
+        }
+    }
+}
+
 struct App {
     args: Args,
     display: OwnedDisplayHandle,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    game: Option<Game>,
+    cursor_grabbed: bool,
+    last_frame: Option<Instant>,
     /// Frames that actually reached the screen.
     frames: u64,
     first_frame_at: Option<Instant>,
+    title: TitleStats,
     occluded: bool,
     /// Minimized on Windows: the surface cannot be configured at 0×0.
     zero_sized: bool,
@@ -132,7 +184,7 @@ impl App {
                 .context("failed to create the window")?,
         );
         let size = window.inner_size();
-        let renderer = pollster::block_on(Renderer::new(
+        let mut renderer = pollster::block_on(Renderer::new(
             self.display.clone(),
             window.clone(),
             size.width,
@@ -140,7 +192,13 @@ impl App {
             self.args.gpu_backend.into(),
         ))?;
 
-        window.set_title(&format!("Ruda — {}", renderer.adapter_summary()));
+        let seed = self.args.seed.unwrap_or_else(random_seed);
+        let config = GameConfig {
+            seed,
+            view_distance: self.args.view_distance,
+        };
+        self.game = Some(Game::start(config, &mut renderer)?);
+
         window.request_redraw();
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -148,15 +206,35 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
-        let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
+        let (Some(window), Some(renderer), Some(game)) =
+            (&self.window, &mut self.renderer, &mut self.game)
+        else {
             return Ok(());
         };
         let _span = tracing::info_span!("frame").entered();
-        if renderer.render(|| window.pre_present_notify())? {
+
+        let now = Instant::now();
+        // A long hitch (dragging the window, a breakpoint) shouldn't teleport.
+        let dt = self
+            .last_frame
+            .map_or(0.0, |last| (now - last).as_secs_f64().min(0.1));
+        self.last_frame = Some(now);
+        let control = game.update(dt, self.cursor_grabbed, renderer)?;
+
+        let scene = game.scene();
+        if renderer.render(&scene, || window.pre_present_notify())? {
             self.frames += 1;
-            self.first_frame_at.get_or_insert_with(Instant::now);
+            self.title.frames += 1;
+            self.first_frame_at.get_or_insert(now);
             #[cfg(feature = "tracy")]
             tracing_tracy::client::frame_mark();
+        }
+
+        let elapsed = now - self.title.since;
+        if elapsed >= Duration::from_millis(500) {
+            let fps = f64::from(self.title.frames) / elapsed.as_secs_f64();
+            window.set_title(&format!("Ruda — {fps:.0} FPS · {}", game.status()));
+            self.title = TitleStats::default();
         }
 
         if self
@@ -164,11 +242,16 @@ impl App {
             .exit_after_frames
             .is_some_and(|n| self.frames >= n)
         {
-            let elapsed = self
+            if let Some(path) = &self.args.screenshot {
+                let (width, height, pixels) = renderer.capture(&scene)?;
+                save_png(path, width, height, &pixels)?;
+                info!(path = %path.display(), "saved a screenshot");
+            }
+            let seconds = self
                 .first_frame_at
                 .map_or(0.0, |at| at.elapsed().as_secs_f64());
-            let fps = if elapsed > 0.0 {
-                self.frames.saturating_sub(1) as f64 / elapsed
+            let fps = if seconds > 0.0 {
+                self.frames.saturating_sub(1) as f64 / seconds
             } else {
                 0.0
             };
@@ -181,7 +264,31 @@ impl App {
         } else if !self.occluded && !self.zero_sized {
             window.request_redraw();
         }
+
+        if control == Control::ReleaseCursor {
+            self.grab_cursor(false);
+        }
         Ok(())
+    }
+
+    fn grab_cursor(&mut self, grab: bool) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        if grab {
+            // Locked keeps the cursor in place; not every platform has it.
+            let grabbed = window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            if let Err(error) = grabbed {
+                warn!("can't capture the mouse: {error}");
+                return;
+            }
+        } else if let Err(error) = window.set_cursor_grab(CursorGrabMode::None) {
+            warn!("can't release the mouse: {error}");
+        }
+        window.set_cursor_visible(!grab);
+        self.cursor_grabbed = grab;
     }
 
     fn request_redraw(&self) {
@@ -214,6 +321,9 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let Some(game) = &mut self.game {
+            game.input.window_event(&event);
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -229,6 +339,17 @@ impl ApplicationHandler for App {
                     self.request_redraw();
                 }
             }
+            // The first click only captures the mouse.
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            } if !self.cursor_grabbed => {
+                self.grab_cursor(true);
+                if let Some(game) = &mut self.game {
+                    game.input.take_pressed();
+                }
+            }
+            WindowEvent::Focused(false) => self.grab_cursor(false),
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.redraw(event_loop) {
                     self.fail(event_loop, error);
@@ -237,6 +358,26 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if self.cursor_grabbed
+            && let Some(game) = &mut self.game
+        {
+            game.input.device_event(&event);
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(game) = self.game.take() {
+            game.shutdown();
+        }
+    }
+}
+
+fn random_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |time| time.as_nanos() as u64)
 }
 
 #[cfg(test)]

@@ -1,0 +1,230 @@
+//! The game itself: an integrated server, the client talking to it, and the
+//! player's camera and controls.
+
+use std::sync::Arc;
+use std::thread::JoinHandle;
+
+use anyhow::{Context as _, Result, anyhow};
+use glam::{DVec3, Vec3};
+use ruda_client::{Client, Event};
+use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ContentBuilder, Face};
+use ruda_input::{Action, Input};
+use ruda_protocol::REACH;
+use ruda_render::{Camera, ChunkMesher, Renderer, Scene};
+use ruda_server::ServerConfig;
+use ruda_world::{RayHit, raycast};
+use tracing::{info, warn};
+
+/// Flying speed in blocks per second.
+const SPEED: f64 = 12.0;
+const SPRINT_SPEED: f64 = 40.0;
+/// Radians of camera turn per unit of mouse movement.
+const MOUSE_SENSITIVITY: f32 = 0.0025;
+
+#[derive(Clone, Copy, Debug)]
+pub struct GameConfig {
+    pub seed: u64,
+    /// In chunks.
+    pub view_distance: i32,
+}
+
+/// What the window should do after an update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Control {
+    Continue,
+    ReleaseCursor,
+}
+
+#[derive(Debug)]
+pub struct Game {
+    client: Client,
+    server: Option<JoinHandle<()>>,
+    mesher: ChunkMesher,
+    pub input: Input,
+    camera: Camera,
+    hotbar: Vec<(&'static str, BlockId)>,
+    selected: usize,
+    target: Option<RayHit>,
+    view_distance: f32,
+    joined: bool,
+}
+
+impl Game {
+    pub fn start(config: GameConfig, renderer: &mut Renderer) -> Result<Self> {
+        let mut content = ContentBuilder::new();
+        ruda_base::register(&mut content)?;
+        let content = Arc::new(content.build());
+        let generator = Arc::new(ruda_base::terrain(content.blocks(), config.seed)?);
+        let server_config = ServerConfig {
+            view_distance: config.view_distance,
+            vertical_view_distance: (config.view_distance / 2).max(1),
+        };
+        let (server, connection) =
+            ruda_server::spawn_integrated(Arc::clone(&content), generator, server_config)
+                .context("failed to start the server")?;
+        let client = Client::connect(connection, Arc::clone(&content), "player")
+            .map_err(|_| anyhow!("the server stopped before the game started"))?;
+
+        let faces = Arc::new(renderer.load_block_textures(&content));
+        let hotbar = ruda_base::HOTBAR
+            .iter()
+            .filter_map(|&name| Some((name, content.blocks().id(&ruda_base::id(name).ok()?)?)))
+            .collect();
+        info!(seed = config.seed, "world started");
+        Ok(Self {
+            client,
+            server: Some(server),
+            mesher: ChunkMesher::new(faces),
+            input: Input::default(),
+            camera: Camera::new(DVec3::new(0.5, 100.0, 0.5)),
+            hotbar,
+            selected: 0,
+            target: None,
+            view_distance: (config.view_distance * CHUNK_SIZE) as f32,
+            joined: false,
+        })
+    }
+
+    /// Advances the game by `dt` seconds. Mouse movement only turns the
+    /// camera and clicks only act while the cursor is grabbed.
+    pub fn update(
+        &mut self,
+        dt: f64,
+        cursor_grabbed: bool,
+        renderer: &mut Renderer,
+    ) -> Result<Control> {
+        for event in self.client.update() {
+            match event {
+                Event::Joined { spawn } => {
+                    self.camera.position = spawn;
+                    self.camera.pitch = -0.3;
+                    self.joined = true;
+                }
+                Event::ChunkLoaded(pos) => self.mesher.chunk_loaded(pos),
+                Event::ChunkUnloaded(pos) => {
+                    self.mesher.forget(pos);
+                    renderer.remove_chunk(pos);
+                }
+                Event::BlockChanged(pos) => {
+                    // A block on a chunk border also changes the neighbour's faces.
+                    self.mesher.mark_dirty(pos.chunk());
+                    for face in Face::ALL {
+                        let neighbour = pos.offset(face).chunk();
+                        if neighbour != pos.chunk() {
+                            self.mesher.mark_dirty(neighbour);
+                        }
+                    }
+                }
+                Event::Disconnected { reason } => return Err(anyhow!("disconnected: {reason}")),
+            }
+        }
+
+        let look = self.input.take_look();
+        if cursor_grabbed {
+            self.camera
+                .rotate(look.x * MOUSE_SENSITIVITY, -look.y * MOUSE_SENSITIVITY);
+        }
+        self.fly(dt);
+        if self.joined {
+            self.client.set_position(self.camera.position);
+        }
+
+        // Aim a little short of the reach limit: the server measures to the
+        // block's centre, the ray to its nearest face.
+        let client = &self.client;
+        self.target = raycast(
+            self.camera.position,
+            self.camera.forward().as_dvec3(),
+            REACH - 1.0,
+            |pos| client.is_solid(pos),
+        );
+
+        let mut control = Control::Continue;
+        for action in self.input.take_pressed() {
+            match action {
+                Action::Break if cursor_grabbed => {
+                    if let Some(hit) = self.target {
+                        self.client.break_block(hit.block);
+                    }
+                }
+                Action::Place if cursor_grabbed => self.place(),
+                Action::Hotbar(slot) if usize::from(slot) < self.hotbar.len() => {
+                    self.selected = usize::from(slot);
+                }
+                Action::ReleaseCursor => control = Control::ReleaseCursor,
+                _ => {}
+            }
+        }
+
+        let center = BlockPos(self.camera.position.floor().as_ivec3()).chunk();
+        self.mesher.schedule(self.client.world(), center);
+        for (pos, mesh) in self.mesher.finished() {
+            renderer.upload_chunk(pos, &mesh);
+        }
+        Ok(control)
+    }
+
+    /// Free flight, horizontally along the view and straight up or down.
+    fn fly(&mut self, dt: f64) {
+        let movement = self.input.movement();
+        if movement == Vec3::ZERO {
+            return;
+        }
+        let forward = self.camera.forward();
+        let forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
+        let direction =
+            (forward * movement.z + self.camera.right() * movement.x + Vec3::Y * movement.y)
+                .normalize_or_zero();
+        let speed = if self.input.is_held(Action::Sprint) {
+            SPRINT_SPEED
+        } else {
+            SPEED
+        };
+        self.camera.position += direction.as_dvec3() * speed * dt;
+    }
+
+    fn place(&mut self) {
+        let Some(hit) = self.target else {
+            return;
+        };
+        let pos = hit.block.offset(hit.face);
+        // Don't wall the camera in.
+        if pos == BlockPos(self.camera.position.floor().as_ivec3()) {
+            return;
+        }
+        self.client.place_block(pos, self.hotbar[self.selected].1);
+    }
+
+    pub fn scene(&self) -> Scene {
+        Scene {
+            camera: self.camera,
+            target: self.target.map(|hit| hit.block),
+            view_distance: self.view_distance,
+        }
+    }
+
+    /// Debug information for the window title.
+    pub fn status(&self) -> String {
+        let p = self.camera.position;
+        let block = self.hotbar.get(self.selected).map_or("", |(name, _)| name);
+        format!(
+            "{:.0} {:.0} {:.0} · {block} · {} chunks, {} meshing",
+            p.x,
+            p.y,
+            p.z,
+            self.client.world().chunk_count(),
+            self.mesher.backlog()
+        )
+    }
+
+    /// Disconnects and waits for the integrated server to stop.
+    pub fn shutdown(self) {
+        let Self { client, server, .. } = self;
+        drop(client);
+        if let Some(server) = server
+            && server.join().is_err()
+        {
+            warn!("the server thread panicked");
+        }
+    }
+}
