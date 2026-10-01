@@ -24,6 +24,10 @@ inside the game; there's no survival, saving or network play yet.
 
 ## Building
 
+Ready-made builds of the game and the dedicated server for Windows, macOS and
+Linux are attached to each [release](https://github.com/RudaTeam/ruda/releases).
+They aren't signed yet, so macOS and Windows warn before the first start.
+
 Install Rust with [rustup](https://rustup.rs). The toolchain pinned in
 `rust-toolchain.toml` is picked up automatically.
 

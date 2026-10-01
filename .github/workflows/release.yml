@@ -1,0 +1,85 @@
+name: Release
+
+# Pushing a version tag builds the game and the dedicated server for every
+# supported platform and puts them into a draft release, to be checked and
+# published by hand.
+on:
+  push:
+    tags: ["v*"]
+  # A pull request changing this workflow builds everything too, without a
+  # release, so it is tried out before the next tag.
+  pull_request:
+    paths: [.github/workflows/release.yml]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'test' }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux builds on the oldest runners, so the binaries need no newer
+        # glibc than Raspberry Pi OS and other older distributions have.
+        include:
+          - { name: Linux x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { name: Linux aarch64, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: Windows x86_64, os: windows-2025, target: x86_64-pc-windows-msvc }
+          - { name: Windows aarch64, os: windows-2025, target: aarch64-pc-windows-msvc }
+          - { name: macOS aarch64, os: macos-15, target: aarch64-apple-darwin }
+          - { name: macOS x86_64, os: macos-15, target: x86_64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+      - run: cargo build --locked --profile dist --target ${{ matrix.target }} -p ruda -p ruda-server
+      - name: Package
+        shell: bash
+        run: |
+          name="ruda-$VERSION-${{ matrix.target }}"
+          exe=""
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/dist/ruda$exe" "target/${{ matrix.target }}/dist/ruda-server$exe" \
+            README.md LICENSE NOTICE "$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: ruda-${{ env.VERSION }}-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Draft the release with the builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "Ruda $GITHUB_REF_NAME" \
+            --notes "Builds of $GITHUB_REF_NAME; the release notes follow."
