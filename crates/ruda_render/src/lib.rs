@@ -177,31 +177,33 @@ impl Renderer {
         Ok(())
     }
 
-    /// Draws a frame. `pre_present` runs right before the frame is presented
-    /// (winit wants `Window::pre_present_notify` there).
-    pub fn render(&mut self, pre_present: impl FnOnce()) -> Result<()> {
+    /// Draws a frame and returns whether it reached the screen: nothing is
+    /// presented while the window is hidden, zero-sized or being reconfigured.
+    /// `pre_present` runs right before presenting (winit wants
+    /// `Window::pre_present_notify` there).
+    pub fn render(&mut self, pre_present: impl FnOnce()) -> Result<bool> {
         if self.config.width == 0 || self.config.height == 0 {
-            return Ok(());
+            return Ok(false);
         }
         let Some(surface) = &self.surface else {
-            return Ok(());
+            return Ok(false);
         };
 
         let (frame, suboptimal) = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
+                return Ok(false);
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.configure_surface();
-                return Ok(());
+                return Ok(false);
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 warn!("window surface lost, recreating it");
                 self.surface = Some(create_surface(&self.instance, &self.window)?);
                 self.configure_surface();
-                return Ok(());
+                return Ok(false);
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 bail!("validation error while acquiring a frame")
@@ -236,7 +238,7 @@ impl Renderer {
         if suboptimal {
             self.configure_surface();
         }
-        Ok(())
+        Ok(true)
     }
 
     fn configure_surface(&self) {
