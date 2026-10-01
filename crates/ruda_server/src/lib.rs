@@ -520,16 +520,14 @@ impl Server {
         let Some(position) = self.clients[index].position else {
             return;
         };
-        let center = LodTilePos::containing(position.x.floor() as i32, position.z.floor() as i32);
         let reach = if self.lod_unsupported {
             0
         } else {
             self.clients[index].lod_distance
         };
-        let radius = (reach + LOD_TILE_SIZE - 1) / LOD_TILE_SIZE;
         let mut budget = LOD_TILES_PER_TICK;
         let wanted = if reach > 0 {
-            lod_tiles_around(center, radius)
+            lod_tiles_around(position, reach)
         } else {
             Vec::new()
         };
@@ -558,7 +556,9 @@ impl Server {
         let far: Vec<LodTilePos> = client
             .lod_sent
             .iter()
-            .filter(|pos| reach == 0 || !in_lod_reach(**pos, center, radius + 1))
+            .filter(|pos| {
+                reach == 0 || tile_distance(**pos, position) > f64::from(reach + LOD_TILE_SIZE)
+            })
             .copied()
             .collect();
         for pos in far {
@@ -619,22 +619,19 @@ impl Server {
             self.unlit.remove(&pos);
         }
 
-        // Far-away tiles nobody is near.
-        let reaches: Vec<(LodTilePos, i32)> = self
+        // Far-away tiles nobody is near, with a margin.
+        let reaches: Vec<(DVec3, f64)> = self
             .clients
             .iter()
             .filter_map(|client| {
-                let position = client.position?;
-                let center =
-                    LodTilePos::containing(position.x.floor() as i32, position.z.floor() as i32);
-                let radius = (client.lod_distance + LOD_TILE_SIZE - 1) / LOD_TILE_SIZE;
-                Some((center, radius + 2))
+                let reach = client.lod_distance + 2 * LOD_TILE_SIZE;
+                Some((client.position?, f64::from(reach)))
             })
             .collect();
         self.lod_tiles.retain(|&pos, _| {
             reaches
                 .iter()
-                .any(|&(center, radius)| in_lod_reach(pos, center, radius))
+                .any(|&(position, reach)| tile_distance(pos, position) <= reach)
         });
     }
 
@@ -687,28 +684,38 @@ pub fn spawn_integrated(
     Ok((thread, client))
 }
 
-/// Tiles whose middle is within `radius` tiles of the middle of `center`.
-fn in_lod_reach(pos: LodTilePos, center: LodTilePos, radius: i32) -> bool {
-    let (dx, dz) = (pos.x - center.x, pos.z - center.z);
-    dx * dx + dz * dz <= radius * radius
+/// How far across, in blocks, the nearest column of the tile is from
+/// `position`; height doesn't count.
+fn tile_distance(pos: LodTilePos, position: DVec3) -> f64 {
+    let (x, z) = pos.origin();
+    let size = f64::from(LOD_TILE_SIZE);
+    let gap = |at: f64, start: i32| {
+        let start = f64::from(start);
+        (start - at).max(at - start - size).max(0.0)
+    };
+    gap(position.x, x).hypot(gap(position.z, z))
 }
 
-/// The tiles within `radius` of `center`, nearest first.
-fn lod_tiles_around(center: LodTilePos, radius: i32) -> Vec<LodTilePos> {
+/// The tiles that come within `reach` blocks of `position`, nearest first.
+/// Measured from the player rather than from the middle of its tile, so
+/// the far-away look reaches as far in every direction, wherever in its
+/// tile the player is.
+fn lod_tiles_around(position: DVec3, reach: i32) -> Vec<LodTilePos> {
+    let center = LodTilePos::containing(position.x.floor() as i32, position.z.floor() as i32);
+    // A tile n tiles over is at least n − 1 tiles away.
+    let radius = reach / LOD_TILE_SIZE + 1;
     let mut tiles = Vec::new();
     for dz in -radius..=radius {
         for dx in -radius..=radius {
             let pos = LodTilePos::new(center.x + dx, center.z + dz);
-            if in_lod_reach(pos, center, radius) {
-                tiles.push(pos);
+            let distance = tile_distance(pos, position);
+            if distance <= f64::from(reach) {
+                tiles.push((distance, pos));
             }
         }
     }
-    tiles.sort_by_key(|pos| {
-        let (dx, dz) = (pos.x - center.x, pos.z - center.z);
-        dx * dx + dz * dz
-    });
-    tiles
+    tiles.sort_by(|a, b| a.0.total_cmp(&b.0));
+    tiles.into_iter().map(|(_, pos)| pos).collect()
 }
 
 /// The chunk and the 26 around it.
@@ -1070,6 +1077,30 @@ mod tests {
 
         harness.send(ClientMessage::LodDistance(0));
         harness.expect(|m| matches!(m, ServerMessage::UnloadLod(_)));
+    }
+
+    #[test]
+    fn the_far_away_look_reaches_as_far_every_way() {
+        // Near a corner of tile (0, 0), where the tiles round the middle of
+        // the player's tile used to fall short.
+        let position = DVec3::new(250.0, 70.0, 250.0);
+        let tiles = lod_tiles_around(position, 1024);
+        assert_eq!(tiles[0], LodTilePos::new(0, 0));
+        let set: HashSet<LodTilePos> = tiles.iter().copied().collect();
+        for degrees in 0..360 {
+            let (sin, cos) = f64::from(degrees).to_radians().sin_cos();
+            for distance in [300.0, 700.0, 1000.0, 1023.0] {
+                let x = position.x + cos * distance;
+                let z = position.z + sin * distance;
+                let tile = LodTilePos::containing(x.floor() as i32, z.floor() as i32);
+                assert!(set.contains(&tile), "{tile:?} is missing");
+            }
+        }
+        assert!(
+            tiles
+                .iter()
+                .all(|&pos| tile_distance(pos, position) <= 1024.0)
+        );
     }
 
     /// Waits for `count` chunks, then for a few more ticks in case there are

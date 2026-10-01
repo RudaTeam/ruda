@@ -8,8 +8,9 @@ use crate::BlockFaces;
 
 const CELLS: usize = LOD_TILE_CELLS;
 /// How far walls on the edge of a tile reach down, hiding gaps to the
-/// next tile, whose heights aren't known here.
-const SKIRT: i32 = 8;
+/// next tile, whose heights aren't known here. Steep mountainsides step
+/// down more than 8 blocks from one cell to the next.
+const SKIRT: i32 = 32;
 
 /// A box face of far-away terrain, packed into four words like a
 /// [`crate::Quad`]:
