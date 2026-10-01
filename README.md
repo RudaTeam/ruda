@@ -1,54 +1,48 @@
 # Ruda
 
-Воксельная песочница в духе Minecraft на Rust: свой контент, мультиплеер, работа на слабом железе
-вплоть до Raspberry Pi и моддинг уровня Industrial Craft 2.
+Ruda is a voxel sandbox game in the spirit of Minecraft, written in Rust.
 
-> **Статус:** веха M0 (фундамент): окно, которое заливается цветом через wgpu. Игры пока нет.
+What we're aiming for:
 
-## Сборка и запуск
+- multiplayer from the start, with single-player running on a built-in local server;
+- smooth play on weak hardware, with a Raspberry Pi 4 as the low bar;
+- a modding API that can carry big tech mods: machines, power networks, their own UIs.
 
-Нужен только [rustup](https://rustup.rs): нужная версия Rust поставится сама из `rust-toolchain.toml`.
+It's very early. Right now the client opens a window and clears it with wgpu,
+and the dedicated server does nothing. There's nothing to play yet.
 
-```sh
-cargo run -p ruda                         # клиент
-cargo run -p ruda -- --gpu-backend gl     # выбрать API: auto, vulkan, metal, dx12, gl
-cargo run -p ruda --features tracy        # с профилировщиком Tracy
-cargo run -p ruda-server                  # выделенный сервер (пока заглушка)
-```
+## Building
 
-- Бэкенд можно задать и переменной `RUDA_GPU_BACKEND`.
-- Подробность логов — через `RUST_LOG`, например `RUST_LOG=debug`.
-- `--exit-after-frames N` — отрисовать N кадров и выйти (для смоук-тестов).
-
-Перед коммитом — то же, что проверяет CI:
+Install Rust with [rustup](https://rustup.rs). The toolchain pinned in
+`rust-toolchain.toml` is picked up automatically.
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-cargo deny check          # cargo install cargo-deny --locked
+cargo run -p ruda          # client
+cargo run -p ruda-server   # dedicated server
 ```
 
-## Документация
+The client takes a few options:
 
-- [Видение проекта](docs/vision.md) — цели, принципы и то, что в цели не входит
-- [Обзор архитектуры](docs/architecture.md) — крейты, процессы, жизненный цикл чанка
-- [Дорожная карта](docs/roadmap.md)
-- [Архитектурные решения (ADR)](docs/adr/README.md)
-- [Глоссарий](docs/glossary.md)
+- `--gpu-backend <auto|vulkan|metal|dx12|gl>` selects the graphics API. You can
+  also set it with `RUDA_GPU_BACKEND`. `auto` tries Vulkan, Metal and DX12
+  before falling back to OpenGL.
+- `--exit-after-frames <N>` quits after N frames have been shown. CI uses it
+  as a smoke test.
 
-## Ключевые решения
+Logging is controlled with `RUST_LOG`, for example `RUST_LOG=debug`. To profile
+with [Tracy](https://github.com/wolfpld/tracy), build with `--features tracy`.
 
-| Область | Решение |
-|---|---|
-| Графика | Свой движок на wgpu + winit; базовый уровень — OpenGL ES 3.0 |
-| Платформы | Windows, macOS, Linux x86_64 и ARM; мобильные позже |
-| Сеть | Авторитарный сервер, QUIC (quinn); одиночная игра идёт на встроенном сервере |
-| Мир | Кубические чанки 32³ с палитрой *(предложено)* |
-| Моддинг | Механизм отложен, требования уровня IC2 заложены в архитектуру |
-| Лицензия | Apache-2.0: форки любые, с сохранением атрибуции из `NOTICE` |
+## Platforms
 
-## Лицензия
+CI builds Ruda for Windows, macOS and Linux, on both x86_64 and ARM. The
+renderer needs a GPU with Vulkan, Metal or DX12, or at least OpenGL 3.3 /
+OpenGL ES 3.0.
 
-© 2026 RudaTeam / F4 Studio. Распространяется под лицензией [Apache-2.0](LICENSE).
-Форки и переиспользование разрешены при условии сохранения атрибуции из файла [NOTICE](NOTICE).
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE). If you fork Ruda, keep the attribution
+from [NOTICE](NOTICE).
