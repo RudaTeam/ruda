@@ -79,9 +79,9 @@ jobs:
           target: ${{ matrix.target }}
       - run: cargo build --workspace --target ${{ matrix.target }}
 
-  # The client must open a window and present frames on every platform.
-  # Runners have no GPU, so Linux renders with Mesa (lavapipe, llvmpipe) under
-  # Xvfb and Windows with WARP.
+  # The client must open a window and present the menu and the world on every
+  # platform. Runners have no GPU, so Linux renders with Mesa (lavapipe,
+  # llvmpipe) under Xvfb and Windows with WARP.
   smoke:
     name: Smoke (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -110,8 +110,11 @@ jobs:
           wrap=()
           if [ "$RUNNER_OS" = Linux ]; then wrap=(xvfb-run -a); fi
           for backend in ${{ matrix.backends }}; do
-            echo "::group::$backend"
-            "${wrap[@]}" target/debug/ruda --gpu-backend "$backend" --exit-after-frames 60
+            echo "::group::$backend: main menu"
+            "${wrap[@]}" target/debug/ruda --gpu-backend "$backend" --exit-after-frames 30
+            echo "::endgroup::"
+            echo "::group::$backend: world"
+            "${wrap[@]}" target/debug/ruda --gpu-backend "$backend" --singleplayer --exit-after-frames 60
             echo "::endgroup::"
           done
 

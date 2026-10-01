@@ -20,19 +20,23 @@ const SPEED: f64 = 12.0;
 const SPRINT_SPEED: f64 = 40.0;
 /// Radians of camera turn per unit of mouse movement.
 const MOUSE_SENSITIVITY: f32 = 0.0025;
+/// The farthest the integrated server streams the world, in chunks.
+pub const MAX_VIEW_DISTANCE: u8 = 32;
 
 #[derive(Clone, Copy, Debug)]
 pub struct GameConfig {
     pub seed: u64,
     /// In chunks.
-    pub view_distance: i32,
+    pub view_distance: u8,
+    /// Vertical field of view in degrees.
+    pub fov: f32,
 }
 
 /// What the window should do after an update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Control {
     Continue,
-    ReleaseCursor,
+    Pause,
 }
 
 #[derive(Debug)]
@@ -57,15 +61,15 @@ impl Game {
         let bounds = WorldBounds::DEFAULT;
         let generator = Arc::new(ruda_base::terrain(content.blocks(), config.seed, bounds)?);
         let server_config = ServerConfig {
-            view_distance: config.view_distance,
-            vertical_view_distance: (config.view_distance / 2).max(1),
+            view_distance: i32::from(MAX_VIEW_DISTANCE),
             bounds,
         };
         let (server, connection) =
             ruda_server::spawn_integrated(Arc::clone(&content), generator, server_config)
                 .context("failed to start the server")?;
-        let client = Client::connect(connection, Arc::clone(&content), "player")
+        let mut client = Client::connect(connection, Arc::clone(&content), "player")
             .map_err(|_| anyhow!("the server stopped before the game started"))?;
+        client.set_view_distance(config.view_distance);
 
         let faces = Arc::new(renderer.load_block_textures(&content));
         let hotbar = ruda_base::HOTBAR
@@ -73,16 +77,18 @@ impl Game {
             .filter_map(|&name| Some((name, content.blocks().id(&ruda_base::id(name).ok()?)?)))
             .collect();
         info!(seed = config.seed, "world started");
+        let mut camera = Camera::new(DVec3::new(0.5, 100.0, 0.5));
+        camera.fov_y = config.fov.to_radians();
         Ok(Self {
             client,
             server: Some(server),
             mesher: ChunkMesher::new(faces),
             input: Input::default(),
-            camera: Camera::new(DVec3::new(0.5, 100.0, 0.5)),
+            camera,
             hotbar,
             selected: 0,
             target: None,
-            view_distance: (config.view_distance * CHUNK_SIZE) as f32,
+            view_distance: (i32::from(config.view_distance) * CHUNK_SIZE) as f32,
             joined: false,
         })
     }
@@ -153,7 +159,7 @@ impl Game {
                 Action::Hotbar(slot) if usize::from(slot) < self.hotbar.len() => {
                     self.selected = usize::from(slot);
                 }
-                Action::ReleaseCursor => control = Control::ReleaseCursor,
+                Action::Pause => control = Control::Pause,
                 _ => {}
             }
         }
@@ -203,6 +209,17 @@ impl Game {
             return;
         }
         self.client.place_block(pos, self.hotbar[self.selected].1);
+    }
+
+    /// How far the world is loaded and drawn, in chunks.
+    pub fn set_view_distance(&mut self, chunks: u8) {
+        self.view_distance = (i32::from(chunks) * CHUNK_SIZE) as f32;
+        self.client.set_view_distance(chunks);
+    }
+
+    /// Vertical field of view in degrees.
+    pub fn set_fov(&mut self, degrees: f32) {
+        self.camera.fov_y = degrees.to_radians();
     }
 
     pub fn scene(&self) -> Scene {

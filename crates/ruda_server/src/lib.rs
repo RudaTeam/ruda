@@ -4,7 +4,7 @@
 //! decides. Single-player runs it on a thread next to the client, the
 //! dedicated server on its own.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -27,10 +27,9 @@ const CHUNKS_PER_TICK: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ServerConfig {
-    /// Radius, in chunks, of the area streamed around each player.
+    /// The largest radius, in chunks, of the area a player can ask to have
+    /// streamed around it.
     pub view_distance: i32,
-    /// Vertical radius in chunks: worlds are far wider than they are tall.
-    pub vertical_view_distance: i32,
     /// Blocks exist only between these heights.
     pub bounds: WorldBounds,
 }
@@ -38,11 +37,19 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            view_distance: 6,
-            vertical_view_distance: 3,
+            view_distance: 16,
             bounds: WorldBounds::DEFAULT,
         }
     }
+}
+
+/// View distance of a player who hasn't asked for one.
+const DEFAULT_VIEW_DISTANCE: i32 = 6;
+
+/// Worlds are far wider than they are tall, so the streamed area is half as
+/// high as it is wide.
+fn vertical_view_distance(radius: i32) -> i32 {
+    (radius / 2).max(1)
 }
 
 pub struct Server {
@@ -58,8 +65,9 @@ pub struct Server {
     generated_tx: Sender<(ChunkPos, Chunk)>,
     generated_rx: Receiver<(ChunkPos, Chunk)>,
     clients: Vec<RemoteClient>,
-    /// Offsets of the chunks streamed around a player, nearest first.
-    view: Vec<IVec3>,
+    /// Offsets of the chunks streamed around a player, nearest first, by
+    /// view distance.
+    views: HashMap<i32, Arc<[IVec3]>>,
     spawn: DVec3,
     ticks: u64,
 }
@@ -69,6 +77,8 @@ struct RemoteClient {
     /// Set once the client has said hello.
     name: Option<String>,
     position: Option<DVec3>,
+    /// In chunks.
+    view_distance: i32,
     sent: HashSet<ChunkPos>,
     connected: bool,
 }
@@ -89,7 +99,7 @@ impl Server {
         };
         let (generated_tx, generated_rx) = mpsc::channel();
         Self {
-            view: view_offsets(config.view_distance, config.vertical_view_distance),
+            views: HashMap::new(),
             config,
             content,
             generator,
@@ -112,6 +122,7 @@ impl Server {
             connection,
             name: None,
             position: None,
+            view_distance: DEFAULT_VIEW_DISTANCE.min(self.config.view_distance),
             sent: HashSet::new(),
             connected: true,
         });
@@ -208,6 +219,10 @@ impl Server {
                     self.clients[index].position = Some(position);
                 }
             }
+            ClientMessage::ViewDistance(chunks) => {
+                self.clients[index].view_distance =
+                    i32::from(chunks).clamp(1, self.config.view_distance);
+            }
             ClientMessage::BreakBlock { pos, seq } => {
                 self.block_action(index, pos, BlockId::AIR, seq);
             }
@@ -269,9 +284,11 @@ impl Server {
             return;
         };
         let center = BlockPos(position.floor().as_ivec3()).chunk();
+        let radius = self.clients[index].view_distance;
+        let view = self.view(radius);
         let mut budget = CHUNKS_PER_TICK;
-        for i in 0..self.view.len() {
-            let pos = ChunkPos(center.0 + self.view[i]);
+        for offset in view.iter() {
+            let pos = ChunkPos(center.0 + *offset);
             if !self.config.bounds.contains_chunk(pos) || self.clients[index].sent.contains(&pos) {
                 continue;
             }
@@ -293,10 +310,7 @@ impl Server {
 
         // One chunk of slack, so walking along a border doesn't make chunks
         // load and unload over and over.
-        let (radius, vertical) = (
-            self.config.view_distance + 1,
-            self.config.vertical_view_distance + 1,
-        );
+        let (radius, vertical) = (radius + 1, vertical_view_distance(radius) + 1);
         let client = &mut self.clients[index];
         let far: Vec<ChunkPos> = client
             .sent
@@ -308,6 +322,14 @@ impl Server {
             client.sent.remove(&pos);
             client.send(ServerMessage::UnloadChunk(pos));
         }
+    }
+
+    fn view(&mut self, radius: i32) -> Arc<[IVec3]> {
+        Arc::clone(
+            self.views
+                .entry(radius)
+                .or_insert_with(|| view_offsets(radius, vertical_view_distance(radius)).into()),
+        )
     }
 
     fn generate(&mut self, pos: ChunkPos) {
@@ -324,25 +346,25 @@ impl Server {
 
     /// Drops generated chunks nobody is near, unless players changed them.
     fn unload_unused_chunks(&mut self) {
-        let centers: Vec<ChunkPos> = self
+        // Each player's area, with a margin.
+        let areas: Vec<(ChunkPos, i32, i32)> = self
             .clients
             .iter()
-            .filter_map(|client| client.position)
-            .map(|position| BlockPos(position.floor().as_ivec3()).chunk())
+            .filter_map(|client| {
+                let center = BlockPos(client.position?.floor().as_ivec3()).chunk();
+                let radius = client.view_distance;
+                Some((center, radius + 2, vertical_view_distance(radius) + 2))
+            })
             .collect();
-        let (radius, vertical) = (
-            self.config.view_distance + 2,
-            self.config.vertical_view_distance + 2,
-        );
         let unused: Vec<ChunkPos> = self
             .world
             .chunks()
             .map(|(pos, _)| pos)
             .filter(|pos| {
                 !self.modified.contains(pos)
-                    && !centers
-                        .iter()
-                        .any(|center| in_view(pos.0 - center.0, radius, vertical))
+                    && !areas.iter().any(|&(center, radius, vertical)| {
+                        in_view(pos.0 - center.0, radius, vertical)
+                    })
             })
             .collect();
         for pos in unused {
@@ -478,7 +500,6 @@ mod tests {
                 .unwrap();
             let config = ServerConfig {
                 view_distance: 1,
-                vertical_view_distance: 1,
                 // Two chunks tall: y from −32 to 31.
                 bounds: WorldBounds {
                     min_y: -32,
@@ -625,13 +646,11 @@ mod tests {
         assert_eq!(harness.server.world().block(open), Some(BlockId::AIR));
     }
 
-    #[test]
-    fn sends_no_chunks_outside_the_world() {
-        let mut harness = Harness::new();
-        harness.join();
-        // Radius 1 around the origin is 5 columns, two chunks tall in bounds.
+    /// Waits for `count` chunks, then for a few more ticks in case there are
+    /// more than that.
+    fn received_chunks(harness: &mut Harness, count: usize) -> HashSet<ChunkPos> {
         let mut received = HashSet::new();
-        while received.len() < 10 {
+        while received.len() < count {
             if let ServerMessage::Chunk { pos, .. } =
                 harness.expect(|m| matches!(m, ServerMessage::Chunk { .. }))
             {
@@ -646,7 +665,24 @@ mod tests {
                 received.insert(pos);
             }
         }
+        received
+    }
+
+    #[test]
+    fn sends_no_chunks_outside_the_world() {
+        let mut harness = Harness::new();
+        harness.join();
+        // Radius 1 around the origin is 5 columns, two chunks tall in bounds.
+        let received = received_chunks(&mut harness, 10);
         assert_eq!(received.len(), 10);
         assert!(received.iter().all(|pos| (-1..=0).contains(&pos.0.y)));
+    }
+
+    #[test]
+    fn caps_the_view_distance_players_ask_for() {
+        let mut harness = Harness::new();
+        harness.join();
+        harness.send(ClientMessage::ViewDistance(12));
+        assert_eq!(received_chunks(&mut harness, 10).len(), 10);
     }
 }

@@ -24,7 +24,32 @@ pub use textures::BlockTextures;
 
 use world_pass::WorldPass;
 
-/// What to draw in a frame.
+/// What fills the screen behind the interface.
+#[derive(Clone, Copy, Debug)]
+pub enum Backdrop<'a> {
+    World(&'a Scene),
+    /// A plain sRGB colour, for menus outside a game.
+    Color([u8; 3]),
+}
+
+/// An egui frame to draw over the backdrop.
+#[derive(Clone, Copy)]
+pub struct UiFrame<'a> {
+    pub primitives: &'a [egui::ClippedPrimitive],
+    pub textures: &'a egui::TexturesDelta,
+    pub pixels_per_point: f32,
+}
+
+impl fmt::Debug for UiFrame<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UiFrame")
+            .field("primitives", &self.primitives.len())
+            .field("pixels_per_point", &self.pixels_per_point)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A view of the world to draw.
 #[derive(Clone, Copy, Debug)]
 pub struct Scene {
     pub camera: Camera,
@@ -70,6 +95,10 @@ pub struct Renderer {
     /// `None` while suspended: mobile platforms destroy the native window.
     surface: Option<wgpu::Surface<'static>>,
     world: WorldPass,
+    ui: egui_wgpu::Renderer,
+    /// egui blends in gamma space, so where the GPU allows it the interface
+    /// draws through a non-sRGB view of the frame.
+    ui_format: wgpu::TextureFormat,
 }
 
 impl Renderer {
@@ -150,6 +179,20 @@ impl Renderer {
             config.format = format;
         }
         config.present_mode = wgpu::PresentMode::AutoVsync;
+        let reinterpret =
+            wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS | wgpu::DownlevelFlags::VIEW_FORMATS;
+        let ui_format = if adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(reinterpret)
+        {
+            config.format.remove_srgb_suffix()
+        } else {
+            config.format
+        };
+        if ui_format != config.format {
+            config.view_formats.push(ui_format);
+        }
 
         let info = adapter.get_info();
         info!(
@@ -163,6 +206,14 @@ impl Renderer {
         );
 
         let world = WorldPass::new(&device, &queue, config.format, width, height);
+        let ui = egui_wgpu::Renderer::new(
+            &device,
+            ui_format,
+            egui_wgpu::RendererOptions {
+                msaa_samples: 1,
+                ..Default::default()
+            },
+        );
         let renderer = Self {
             instance,
             adapter,
@@ -172,6 +223,8 @@ impl Renderer {
             config,
             surface: Some(surface),
             world,
+            ui,
+            ui_format,
         };
         renderer.configure_surface();
         Ok(renderer)
@@ -214,14 +267,28 @@ impl Renderer {
         self.world.remove(pos);
     }
 
+    /// Forgets every chunk, for leaving a world.
+    pub fn clear_chunks(&mut self) {
+        self.world.clear();
+    }
+
+    /// The largest texture the interface may upload, in pixels per side.
+    pub fn max_texture_side(&self) -> usize {
+        self.device.limits().max_texture_dimension_2d as usize
+    }
+
     /// Chunks with geometry on the GPU.
     pub fn chunk_count(&self) -> usize {
         self.world.chunk_count()
     }
 
-    /// Draws `scene` into an off-screen image instead of the window and
+    /// Draws a frame into an off-screen image instead of the window and
     /// returns its width, height and RGBA pixels.
-    pub fn capture(&mut self, scene: &Scene) -> Result<(u32, u32, Vec<u8>)> {
+    pub fn capture(
+        &mut self,
+        backdrop: Backdrop<'_>,
+        ui: Option<&UiFrame<'_>>,
+    ) -> Result<(u32, u32, Vec<u8>)> {
         let (width, height) = (self.config.width.max(1), self.config.height.max(1));
         let format = self.config.format;
         let size = wgpu::Extent3d {
@@ -237,7 +304,7 @@ impl Renderer {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            view_formats: &[self.ui_format],
         });
         let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -252,16 +319,8 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("screenshot"),
             });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.world.draw(
-            &self.device,
-            &self.queue,
-            &mut encoder,
-            &view,
-            scene,
-            (width, height),
-            sky_color(format),
-        );
+        self.update_ui_textures(ui);
+        let ui_commands = self.encode(&mut encoder, &texture, (width, height), backdrop, ui);
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -274,7 +333,9 @@ impl Renderer {
             },
             size,
         );
-        self.queue.submit([encoder.finish()]);
+        self.queue
+            .submit(ui_commands.into_iter().chain([encoder.finish()]));
+        self.free_ui_textures(ui);
 
         buffer.map_async(wgpu::MapMode::Read, .., |_| {});
         self.device.poll(wgpu::PollType::Wait {
@@ -315,7 +376,26 @@ impl Renderer {
     /// presented while the window is hidden, zero-sized or being reconfigured.
     /// `pre_present` runs right before presenting (winit wants
     /// `Window::pre_present_notify` there).
-    pub fn render(&mut self, scene: &Scene, pre_present: impl FnOnce()) -> Result<bool> {
+    pub fn render(
+        &mut self,
+        backdrop: Backdrop<'_>,
+        ui: Option<&UiFrame<'_>>,
+        pre_present: impl FnOnce(),
+    ) -> Result<bool> {
+        // egui sends each texture change only once, so keep them even when
+        // the frame is skipped.
+        self.update_ui_textures(ui);
+        let presented = self.present(backdrop, ui, pre_present);
+        self.free_ui_textures(ui);
+        presented
+    }
+
+    fn present(
+        &mut self,
+        backdrop: Backdrop<'_>,
+        ui: Option<&UiFrame<'_>>,
+        pre_present: impl FnOnce(),
+    ) -> Result<bool> {
         if self.config.width == 0 || self.config.height == 0 {
             return Ok(false);
         }
@@ -344,24 +424,15 @@ impl Renderer {
             }
         };
 
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        self.world.draw(
-            &self.device,
-            &self.queue,
-            &mut encoder,
-            &view,
-            scene,
-            (self.config.width, self.config.height),
-            sky_color(self.config.format),
-        );
-        self.queue.submit([encoder.finish()]);
+        let size = (self.config.width, self.config.height);
+        let ui_commands = self.encode(&mut encoder, &frame.texture, size, backdrop, ui);
+        self.queue
+            .submit(ui_commands.into_iter().chain([encoder.finish()]));
 
         pre_present();
         self.queue.present(frame);
@@ -369,6 +440,107 @@ impl Renderer {
             self.configure_surface();
         }
         Ok(true)
+    }
+
+    /// Turns waiting for the display's refresh on or off.
+    pub fn set_vsync(&mut self, vsync: bool) {
+        self.config.present_mode = if vsync {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+        self.configure_surface();
+    }
+
+    /// Records the backdrop and the interface into `encoder`. Returns extra
+    /// command buffers egui needs submitted before it.
+    fn encode(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        (width, height): (u32, u32),
+        backdrop: Backdrop<'_>,
+        ui: Option<&UiFrame<'_>>,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let format = self.config.format;
+        let view = &target.create_view(&wgpu::TextureViewDescriptor::default());
+        match backdrop {
+            Backdrop::World(scene) => self.world.draw(
+                &self.device,
+                &self.queue,
+                encoder,
+                view,
+                scene,
+                (width, height),
+                sky_color(format),
+            ),
+            Backdrop::Color(rgb) => {
+                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("backdrop"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(color(
+                                rgb.map(|c| f64::from(c) / 255.0),
+                                format,
+                            )),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+            }
+        }
+
+        let Some(ui) = ui else {
+            return Vec::new();
+        };
+        let view = &target.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.ui_format),
+            ..Default::default()
+        });
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [width, height],
+            pixels_per_point: ui.pixels_per_point,
+        };
+        let commands =
+            self.ui
+                .update_buffers(&self.device, &self.queue, encoder, ui.primitives, &screen);
+        let mut pass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("interface"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            })
+            .forget_lifetime();
+        self.ui.render(&mut pass, ui.primitives, &screen);
+        commands
+    }
+
+    fn update_ui_textures(&mut self, ui: Option<&UiFrame<'_>>) {
+        for (id, deltas) in ui.iter().flat_map(|ui| &ui.textures.set) {
+            for delta in deltas {
+                self.ui
+                    .update_texture(&self.device, &self.queue, *id, delta);
+            }
+        }
+    }
+
+    /// Call once the frame using the textures has been submitted.
+    fn free_ui_textures(&mut self, ui: Option<&UiFrame<'_>>) {
+        for id in ui.iter().flat_map(|ui| &ui.textures.free) {
+            self.ui.free_texture(id);
+        }
     }
 
     fn configure_surface(&self) {
@@ -406,11 +578,16 @@ fn create_surface(
 const SKY: [f64; 3] = [0.53, 0.81, 0.92];
 
 fn sky_color(format: wgpu::TextureFormat) -> wgpu::Color {
-    // sRGB surfaces take linear values and encode them on write.
+    color(SKY, format)
+}
+
+/// An sRGB colour as the surface `format` expects it: sRGB surfaces take
+/// linear values and encode them on write.
+fn color(srgb: [f64; 3], format: wgpu::TextureFormat) -> wgpu::Color {
     let [r, g, b] = if format.is_srgb() {
-        SKY.map(srgb_to_linear)
+        srgb.map(srgb_to_linear)
     } else {
-        SKY
+        srgb
     };
     wgpu::Color { r, g, b, a: 1.0 }
 }

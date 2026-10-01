@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
 glam.workspace = true
 png.workspace = true
 rayon.workspace = true

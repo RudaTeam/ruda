@@ -19,12 +19,17 @@ ruda_net = { path = "crates/ruda_net" }
 ruda_protocol = { path = "crates/ruda_protocol" }
 ruda_render = { path = "crates/ruda_render" }
 ruda_server = { path = "crates/ruda_server" }
+ruda_ui = { path = "crates/ruda_ui" }
 ruda_world = { path = "crates/ruda_world" }
 ruda_worldgen = { path = "crates/ruda_worldgen" }
 
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+egui = { version = "0.36.2", default-features = false }
+egui-wgpu = { version = "0.36.2", default-features = false }
+egui-winit = { version = "0.36.2", default-features = false, features = ["clipboard", "wayland", "x11"] }
+fluent-bundle = "0.16.0"
 glam = "0.33.11"
 noise = "0.9.0"
 png = "0.18.1"
@@ -32,10 +37,13 @@ pollster = "1.0.1"
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
+sys-locale = "0.3.2"
 thiserror = "2.0.21"
+toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-tracy = "0.12.0"
+unic-langid = "0.9.6"
 wgpu = "30.0.1"
 winit = "0.30.13"
 

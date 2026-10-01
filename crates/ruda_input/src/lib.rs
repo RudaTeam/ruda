@@ -21,8 +21,8 @@ pub enum Action {
     Place,
     /// Select hotbar slot 0–8.
     Hotbar(u8),
-    /// Give the mouse cursor back to the system.
-    ReleaseCursor,
+    /// Open the pause menu.
+    Pause,
 }
 
 /// A physical button that can be bound to an action.
@@ -47,7 +47,7 @@ impl Default for Bindings {
             (Space, MoveUp),
             (ShiftLeft, MoveDown),
             (ControlLeft, Sprint),
-            (Escape, ReleaseCursor),
+            (Escape, Action::Pause),
         ]
         .into_iter()
         .map(|(key, action)| (Button::Key(key), action))
@@ -116,6 +116,14 @@ impl Input {
         } else {
             self.held.remove(&action);
         }
+    }
+
+    /// Forgets held buttons and pending presses and movement, for when a
+    /// menu takes over the input.
+    pub fn clear(&mut self) {
+        self.held.clear();
+        self.pressed.clear();
+        self.look = Vec2::ZERO;
     }
 
     pub fn is_held(&self, action: Action) -> bool {

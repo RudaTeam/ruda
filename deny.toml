@@ -45,8 +45,8 @@ wildcards = "deny"
 allow-wildcard-paths = true
 deny = [
     # Graphics and windowing stay out of the dedicated server.
-    { crate = "wgpu", wrappers = ["ruda_render"] },
-    { crate = "winit", wrappers = ["ruda", "ruda_input"] },
+    { crate = "wgpu", wrappers = ["ruda_render", "egui-wgpu"] },
+    { crate = "winit", wrappers = ["ruda", "ruda_input", "egui-winit"] },
 ]
 
 [sources]

@@ -133,6 +133,12 @@ impl Client {
         }
     }
 
+    /// Asks the server to stream the world this far around the player, in
+    /// chunks.
+    pub fn set_view_distance(&mut self, chunks: u8) {
+        self.send(&ClientMessage::ViewDistance(chunks));
+    }
+
     /// Breaks a solid block. Returns false if there is nothing that can be
     /// broken.
     pub fn break_block(&mut self, pos: BlockPos) -> bool {

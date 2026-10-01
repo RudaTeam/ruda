@@ -17,3 +17,13 @@ Changes made for Ruda:
 - `grass_side.png` is the pack's grass side overlay drawn over its dirt texture;
 - `bedrock.png` is the pack's cobblestone texture, darkened and with more contrast;
 - files are renamed to Ruda's block names.
+
+## Font — Pixelify Sans
+
+`assets/fonts/PixelifySans.ttf` is the Regular weight of
+[Pixelify Sans](https://github.com/eifetx/Pixelify-Sans) by **The Pixelify Sans
+Project Authors**, licensed under the SIL Open Font License 1.1
+(`assets/fonts/OFL.txt`). It is taken from
+[pull request #5](https://github.com/eifetx/Pixelify-Sans/pull/5) (commit
+`296814deb225`), which adds the Cyrillic capitals О and П missing from the
+released font and fixes К.

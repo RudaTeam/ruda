@@ -23,7 +23,6 @@ impl Game {
             Arc::new(ruda_base::terrain(content.blocks(), 2024, WorldBounds::DEFAULT).unwrap());
         let config = ServerConfig {
             view_distance: 2,
-            vertical_view_distance: 1,
             ..Default::default()
         };
         let mut server = Server::new(content.clone(), generator, config);

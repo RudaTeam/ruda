@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// How far a player can reach to break or place blocks, measured in blocks
 /// from the eye to the block's centre. Clients aim within it and the server
@@ -25,6 +25,9 @@ pub enum ClientMessage {
     Hello { protocol: u32, name: String },
     /// Where the player's camera is. The server streams the chunks around it.
     Position(DVec3),
+    /// How far, in chunks, the client wants the world around it. The server
+    /// may send less.
+    ViewDistance(u8),
     /// Asks to break the block at `pos`. The server answers with
     /// [`ServerMessage::ActionDone`] carrying the same `seq`.
     BreakBlock { pos: BlockPos, seq: u32 },

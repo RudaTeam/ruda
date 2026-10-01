@@ -282,6 +282,10 @@ impl WorldPass {
         self.meshes.remove(&pos);
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.meshes.clear();
+    }
+
     pub(crate) fn chunk_count(&self) -> usize {
         self.meshes.len()
     }

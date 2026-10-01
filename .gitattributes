@@ -1,2 +1,3 @@
 # Third-party license notes ship byte for byte, as their licenses require.
 content/base/textures/*.txt -text
+assets/fonts/*.txt -text

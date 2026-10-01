@@ -29,7 +29,13 @@ cargo run -p ruda          # client
 cargo run -p ruda-server   # dedicated server (a stub until network play lands)
 ```
 
-Click the window to capture the mouse, then:
+The game opens on the main menu. Settings has the view distance, field of
+view, vertical sync, fullscreen, graphics API and language (English or
+Russian; the system language by default). They are saved to `settings.toml`
+in `~/.config/ruda` on Linux, `~/Library/Application Support/Ruda` on macOS
+and `%APPDATA%\Ruda` on Windows.
+
+In the game:
 
 | Key | Action |
 |---|---|
@@ -39,15 +45,16 @@ Click the window to capture the mouse, then:
 | Left Ctrl | Fly faster |
 | Left / right click | Break / place a block |
 | 1–9 | Pick the block to place |
-| Esc | Release the mouse |
+| Esc | Pause menu |
 
 The client takes a few options:
 
+- `--singleplayer` skips the menu and starts a world right away.
 - `--seed <N>` picks the world; without it every start is a new world.
-- `--view-distance <CHUNKS>` sets how far the world loads, in chunks of 32
-  blocks (6 by default; try 2 or 3 on weak hardware).
-- `--gpu-backend <auto|vulkan|metal|dx12|gl>` selects the graphics API. You can
-  also set it with `RUDA_GPU_BACKEND`. `auto` tries Vulkan, Metal and DX12
+- `--view-distance <CHUNKS>` overrides how far the world loads, in chunks of 32
+  blocks, up to 32 (6 by default; try 2 or 3 on weak hardware).
+- `--gpu-backend <auto|vulkan|metal|dx12|gl>` overrides the graphics API. You
+  can also set it with `RUDA_GPU_BACKEND`. `auto` tries Vulkan, Metal and DX12
   before falling back to OpenGL.
 - `--exit-after-frames <N>` quits after N frames have been shown, and
   `--screenshot <PATH>` saves the last one. CI uses them as a smoke test.
@@ -71,4 +78,6 @@ Apache-2.0, see [LICENSE](LICENSE). If you fork Ruda, keep the attribution
 from [NOTICE](NOTICE).
 
 Block textures are from [Isabella II](https://github.com/minetest-texture-packs/Isabella-II)
-by Bonemouse, licensed under CC BY 3.0; see [assets/CREDITS.md](assets/CREDITS.md).
+by Bonemouse, licensed under CC BY 3.0, and the interface font is
+[Pixelify Sans](https://github.com/eifetx/Pixelify-Sans), licensed under the SIL
+Open Font License 1.1; see [assets/CREDITS.md](assets/CREDITS.md).
