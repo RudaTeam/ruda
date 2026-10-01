@@ -6,12 +6,14 @@ use std::time::Instant;
 use anyhow::{Context as _, Result};
 use clap::{Parser, ValueEnum};
 use ruda_render::{GpuBackend, Renderer};
-use tracing::info;
+use tracing::{info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
-use winit::window::{Window, WindowId};
+use winit::window::{Icon, Window, WindowId};
+
+const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/branding/app-icon.png");
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -83,6 +85,23 @@ fn init_tracing() {
     registry.init();
 }
 
+/// Window and taskbar icon on Windows and X11. macOS takes the icon from the
+/// app bundle instead, and Wayland from the desktop entry.
+fn window_icon() -> Result<Icon> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(APP_ICON_PNG)).read_info()?;
+    let size = reader
+        .output_buffer_size()
+        .context("app icon is too large")?;
+    let mut rgba = vec![0; size];
+    let frame = reader.next_frame(&mut rgba)?;
+    anyhow::ensure!(
+        frame.color_type == png::ColorType::Rgba && frame.bit_depth == png::BitDepth::Eight,
+        "app icon must be 8-bit RGBA"
+    );
+    rgba.truncate(frame.buffer_size());
+    Ok(Icon::from_rgba(rgba, frame.width, frame.height)?)
+}
+
 struct App {
     args: Args,
     display: OwnedDisplayHandle,
@@ -100,9 +119,13 @@ struct App {
 
 impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let icon = window_icon()
+            .inspect_err(|error| warn!("no window icon: {error:#}"))
+            .ok();
         let attributes = Window::default_attributes()
             .with_title("Ruda")
-            .with_inner_size(LogicalSize::new(1280, 720));
+            .with_inner_size(LogicalSize::new(1280, 720))
+            .with_window_icon(icon);
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -213,5 +236,13 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn app_icon_decodes() {
+        super::window_icon().unwrap();
     }
 }

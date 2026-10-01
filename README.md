@@ -1,4 +1,9 @@
-# Ruda
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/logo-dark.svg">
+    <img alt="Ruda" src="assets/branding/logo-light.svg" width="520">
+  </picture>
+</p>
 
 Ruda is a voxel sandbox game in the spirit of Minecraft, written in Rust.
 
