@@ -5,7 +5,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use ruda_core::{ChunkPos, ContentBuilder};
+use ruda_core::{ChunkPos, ContentBuilder, WorldBounds};
 use ruda_render::{BlockFaces, PaddedChunk, mesh_chunk};
 use ruda_world::World;
 
@@ -14,7 +14,7 @@ fn terrain(y: i32) -> (World, Vec<ChunkPos>, BlockFaces) {
     let mut content = ContentBuilder::new();
     ruda_base::register(&mut content).unwrap();
     let content = content.build();
-    let generator = ruda_base::terrain(content.blocks(), 2024).unwrap();
+    let generator = ruda_base::terrain(content.blocks(), 2024, WorldBounds::DEFAULT).unwrap();
     let mut world = World::new();
     for cy in y - 1..=y + 1 {
         for cz in -1..=4 {
@@ -33,7 +33,7 @@ fn terrain(y: i32) -> (World, Vec<ChunkPos>, BlockFaces) {
 }
 
 fn meshing(c: &mut Criterion) {
-    for (name, y) in [("surface", 1), ("underground", -3)] {
+    for (name, y) in [("surface", 0), ("underground", -4)] {
         let (world, patch, faces) = terrain(y);
         let chunks: Vec<PaddedChunk> = patch
             .iter()

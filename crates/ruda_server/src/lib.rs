@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use glam::{DVec3, IVec3};
-use ruda_core::{BlockId, BlockPos, ChunkPos, Content};
+use ruda_core::{BlockId, BlockPos, ChunkPos, Content, WorldBounds};
 use ruda_net::{ClientConnection, RecvError, ServerConnection, local_pair};
 use ruda_protocol::{ClientMessage, PROTOCOL_VERSION, REACH, ServerMessage};
 use ruda_world::{Chunk, Generator, World};
@@ -31,6 +31,8 @@ pub struct ServerConfig {
     pub view_distance: i32,
     /// Vertical radius in chunks: worlds are far wider than they are tall.
     pub vertical_view_distance: i32,
+    /// Blocks exist only between these heights.
+    pub bounds: WorldBounds,
 }
 
 impl Default for ServerConfig {
@@ -38,6 +40,7 @@ impl Default for ServerConfig {
         Self {
             view_distance: 6,
             vertical_view_distance: 3,
+            bounds: WorldBounds::DEFAULT,
         }
     }
 }
@@ -195,6 +198,7 @@ impl Server {
                 client.send(ServerMessage::Welcome {
                     blocks,
                     spawn: self.spawn,
+                    bounds: self.config.bounds,
                 });
             }
             _ if !greeted => self.kick(index, "expected a hello first"),
@@ -219,16 +223,25 @@ impl Server {
         let content = Arc::clone(&self.content);
         let blocks = content.blocks();
         let breaking = block == BlockId::AIR;
-        let placeable =
-            block != BlockId::UNKNOWN && block.index() < blocks.len() && blocks.is_solid(block);
+        // Players can't place what they couldn't break.
+        let placeable = block != BlockId::UNKNOWN
+            && block.index() < blocks.len()
+            && blocks.is_solid(block)
+            && blocks.is_breakable(block);
         let in_reach = self.clients[index]
             .position
             .is_some_and(|eye| eye.distance(pos.0.as_dvec3() + 0.5) <= REACH);
         let current = self.world.block(pos);
-        // Breaking needs something solid there, placing needs an empty cell.
-        let allowed = (breaking || placeable)
-            && in_reach
-            && current.is_some_and(|current| blocks.is_solid(current) == breaking);
+        // Breaking needs something breakable there, placing needs an empty cell.
+        let target_ok = current.is_some_and(|current| {
+            if breaking {
+                blocks.is_solid(current) && blocks.is_breakable(current)
+            } else {
+                !blocks.is_solid(current)
+            }
+        });
+        let allowed =
+            (breaking || placeable) && in_reach && self.config.bounds.contains(pos) && target_ok;
 
         if allowed {
             self.world.set_block(pos, block);
@@ -259,7 +272,7 @@ impl Server {
         let mut budget = CHUNKS_PER_TICK;
         for i in 0..self.view.len() {
             let pos = ChunkPos(center.0 + self.view[i]);
-            if self.clients[index].sent.contains(&pos) {
+            if !self.config.bounds.contains_chunk(pos) || self.clients[index].sent.contains(&pos) {
                 continue;
             }
             match self.world.chunk(pos) {
@@ -408,16 +421,30 @@ fn view_offsets(radius: i32, vertical: i32) -> Vec<IVec3> {
 
 #[cfg(test)]
 mod tests {
-    use ruda_core::{Appearance, BlockDef, ContentBuilder, CubeTextures, ResourceId};
+    use ruda_core::{Appearance, BlockDef, ContentBuilder, CubeTextures, LocalPos, ResourceId};
 
     use super::*;
 
-    /// Stone below y = 0, air above.
-    struct Flat(BlockId);
+    /// Stone below y = 0 on a floor at y = −32, air above.
+    struct Flat {
+        stone: BlockId,
+        floor: BlockId,
+    }
 
     impl Generator for Flat {
         fn generate(&self, pos: ChunkPos) -> Chunk {
-            Chunk::filled(if pos.0.y < 0 { self.0 } else { BlockId::AIR })
+            if pos.0.y >= 0 {
+                return Chunk::filled(BlockId::AIR);
+            }
+            let mut chunk = Chunk::filled(self.stone);
+            if pos.0.y == -1 {
+                for x in 0..32 {
+                    for z in 0..32 {
+                        chunk.set(LocalPos::new(x, 0, z), self.floor);
+                    }
+                }
+            }
+            chunk
         }
 
         fn surface_height(&self, _x: i32, _z: i32) -> Option<i32> {
@@ -429,6 +456,7 @@ mod tests {
         server: Server,
         client: ClientConnection,
         stone: BlockId,
+        bedrock: BlockId,
     }
 
     impl Harness {
@@ -441,17 +469,37 @@ mod tests {
                     Appearance::Cube(CubeTextures::all(id)),
                 ))
                 .unwrap();
+            let id: ResourceId = "test:bedrock".parse().unwrap();
+            let bedrock = content
+                .add_block(
+                    BlockDef::new(id.clone(), Appearance::Cube(CubeTextures::all(id)))
+                        .unbreakable(),
+                )
+                .unwrap();
             let config = ServerConfig {
                 view_distance: 1,
                 vertical_view_distance: 1,
+                // Two chunks tall: y from −32 to 31.
+                bounds: WorldBounds {
+                    min_y: -32,
+                    max_y: 31,
+                },
             };
-            let mut server = Server::new(Arc::new(content.build()), Arc::new(Flat(stone)), config);
+            let mut server = Server::new(
+                Arc::new(content.build()),
+                Arc::new(Flat {
+                    stone,
+                    floor: bedrock,
+                }),
+                config,
+            );
             let (client, server_end) = local_pair();
             server.connect(server_end);
             Self {
                 server,
                 client,
                 stone,
+                bedrock,
             }
         }
 
@@ -543,5 +591,62 @@ mod tests {
         harness.send(ClientMessage::BreakBlock { pos: far, seq: 3 });
         harness.expect(|m| matches!(m, ServerMessage::ActionDone { seq: 3 }));
         assert_ne!(harness.server.world().block(far), Some(BlockId::AIR));
+    }
+
+    #[test]
+    fn keeps_unbreakable_blocks_and_world_bounds() {
+        let mut harness = Harness::new();
+        harness.join();
+        harness.send(ClientMessage::Position(DVec3::new(0.5, -29.5, 0.5)));
+        let floor = BlockPos::new(0, -32, 0);
+        harness.expect(|m| matches!(m, ServerMessage::Chunk { pos, .. } if *pos == floor.chunk()));
+
+        harness.send(ClientMessage::BreakBlock { pos: floor, seq: 1 });
+        let correction = harness.expect(|m| matches!(m, ServerMessage::BlockChanged { .. }));
+        assert_eq!(
+            correction,
+            ServerMessage::BlockChanged {
+                pos: floor,
+                block: harness.bedrock
+            }
+        );
+        assert_eq!(harness.server.world().block(floor), Some(harness.bedrock));
+
+        // Players can't place unbreakable blocks either.
+        let open = BlockPos::new(1, -29, 0);
+        harness.send(ClientMessage::BreakBlock { pos: open, seq: 2 });
+        harness.expect(|m| matches!(m, ServerMessage::ActionDone { seq: 2 }));
+        harness.send(ClientMessage::PlaceBlock {
+            pos: open,
+            block: harness.bedrock,
+            seq: 3,
+        });
+        harness.expect(|m| matches!(m, ServerMessage::ActionDone { seq: 3 }));
+        assert_eq!(harness.server.world().block(open), Some(BlockId::AIR));
+    }
+
+    #[test]
+    fn sends_no_chunks_outside_the_world() {
+        let mut harness = Harness::new();
+        harness.join();
+        // Radius 1 around the origin is 5 columns, two chunks tall in bounds.
+        let mut received = HashSet::new();
+        while received.len() < 10 {
+            if let ServerMessage::Chunk { pos, .. } =
+                harness.expect(|m| matches!(m, ServerMessage::Chunk { .. }))
+            {
+                received.insert(pos);
+            }
+        }
+        for _ in 0..5 {
+            harness.server.tick();
+        }
+        while let Some(message) = harness.client.try_recv().unwrap() {
+            if let ServerMessage::Chunk { pos, .. } = message {
+                received.insert(pos);
+            }
+        }
+        assert_eq!(received.len(), 10);
+        assert!(received.iter().all(|pos| (-1..=0).contains(&pos.0.y)));
     }
 }

@@ -72,11 +72,23 @@ impl CubeTextures {
 pub struct BlockDef {
     pub id: ResourceId,
     pub appearance: Appearance,
+    /// Whether players can break it. Unbreakable blocks can't be placed by
+    /// players either.
+    pub breakable: bool,
 }
 
 impl BlockDef {
     pub fn new(id: ResourceId, appearance: Appearance) -> Self {
-        Self { id, appearance }
+        Self {
+            id,
+            appearance,
+            breakable: true,
+        }
+    }
+
+    pub fn unbreakable(mut self) -> Self {
+        self.breakable = false;
+        self
     }
 
     /// Whether the block fills its whole cell: it hides the faces of its
@@ -137,6 +149,10 @@ impl BlockRegistry {
 
     pub fn is_solid(&self, id: BlockId) -> bool {
         self.get(id).is_solid()
+    }
+
+    pub fn is_breakable(&self, id: BlockId) -> bool {
+        self.get(id).breakable
     }
 
     pub fn len(&self) -> usize {

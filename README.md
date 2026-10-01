@@ -14,7 +14,9 @@ What we're aiming for:
 - a modding API that can carry big tech mods: machines, power networks, their own UIs.
 
 It's very early. You can fly around a generated world with hills, caves and
-ore, and break and place blocks. Single-player already runs on a local server
+ore, and break and place blocks. The world is endless sideways and 2048 blocks
+tall, from −1024 to +1023, with sea level at 0 and unbreakable bedrock at the
+bottom. Single-player already runs on a local server
 inside the game; there's no survival, saving or network play yet.
 
 ## Building
@@ -67,3 +69,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Apache-2.0, see [LICENSE](LICENSE). If you fork Ruda, keep the attribution
 from [NOTICE](NOTICE).
+
+Block textures are from [Isabella II](https://github.com/minetest-texture-packs/Isabella-II)
+by Bonemouse, licensed under CC BY 3.0; see [assets/CREDITS.md](assets/CREDITS.md).

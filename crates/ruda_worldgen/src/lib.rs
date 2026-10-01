@@ -22,6 +22,10 @@ pub struct TerrainSettings {
     /// Everything deeper down.
     pub stone: BlockId,
     pub ores: Vec<Ore>,
+    /// The bottom of the world: a single layer of `floor` at `min_y`, with
+    /// nothing below it.
+    pub floor: BlockId,
+    pub min_y: i32,
 }
 
 /// An ore that replaces stone in small clusters within a band of heights.
@@ -111,7 +115,7 @@ impl TerrainGenerator {
             }
         }
         let highest = heights.iter().flatten().copied().max().unwrap_or(i32::MIN);
-        if origin.y > highest {
+        if origin.y > highest || origin.y + CHUNK_SIZE - 1 < self.settings.min_y {
             return Chunk::filled(BlockId::AIR);
         }
 
@@ -121,6 +125,12 @@ impl TerrainGenerator {
             let local = LocalPos::from_index(index);
             let (x, y, z) = (local.x() as usize, local.y() as usize, local.z() as usize);
             let world = origin + local.vec();
+            if world.y <= self.settings.min_y {
+                if world.y == self.settings.min_y {
+                    *block = self.settings.floor;
+                }
+                continue;
+            }
             let height = heights[z][x];
             let depth = height - world.y;
             if depth < 0 {
@@ -232,12 +242,13 @@ mod tests {
     const SAND: BlockId = BlockId::from_raw(12);
     const STONE: BlockId = BlockId::from_raw(13);
     const ORE: BlockId = BlockId::from_raw(14);
+    const FLOOR: BlockId = BlockId::from_raw(15);
 
     fn generator(seed: u64) -> TerrainGenerator {
         TerrainGenerator::new(
             seed,
             TerrainSettings {
-                sea_level: 32,
+                sea_level: 0,
                 grass: GRASS,
                 dirt: DIRT,
                 sand: SAND,
@@ -248,6 +259,8 @@ mod tests {
                     max_y: 1000,
                     threshold: 0.65,
                 }],
+                floor: FLOOR,
+                min_y: -1024,
             },
         )
     }
@@ -263,6 +276,23 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_ne!(heights(7), heights(8));
+    }
+
+    #[test]
+    fn the_floor_is_one_layer_with_nothing_below() {
+        let generator = generator(5);
+        let mut blocks = vec![BlockId::AIR; CHUNK_VOLUME];
+        generator
+            .generate(ChunkPos::new(2, -32, 2))
+            .copy_to(&mut blocks);
+        for (index, &block) in blocks.iter().enumerate() {
+            let y = LocalPos::from_index(index).y();
+            assert_eq!(block == FLOOR, y == 0, "y = {y}");
+        }
+        assert_eq!(
+            generator.generate(ChunkPos::new(2, -33, 2)).uniform(),
+            Some(BlockId::AIR)
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use glam::DVec3;
-use ruda_core::{BlockId, BlockPos, ChunkPos, Content};
+use ruda_core::{BlockId, BlockPos, ChunkPos, Content, WorldBounds};
 use ruda_net::{ClientConnection, Disconnected, RecvError};
 use ruda_protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
 use ruda_world::World;
@@ -35,6 +35,7 @@ pub struct Client {
     content: Arc<Content>,
     world: World,
     spawn: Option<DVec3>,
+    bounds: Option<WorldBounds>,
     events: Vec<Event>,
     next_seq: u32,
     /// Actions the server has not answered yet.
@@ -59,6 +60,7 @@ impl Client {
             content,
             world: World::new(),
             spawn: None,
+            bounds: None,
             events: Vec::new(),
             next_seq: 0,
             pending: 0,
@@ -84,12 +86,17 @@ impl Client {
 
     fn handle(&mut self, message: ServerMessage) {
         match message {
-            ServerMessage::Welcome { blocks, spawn } => {
+            ServerMessage::Welcome {
+                blocks,
+                spawn,
+                bounds,
+            } => {
                 let ours = self.content.blocks().iter().map(|(_, def)| &def.id);
                 if !ours.eq(blocks.iter()) {
                     return self.disconnect("this game's content differs from the server's");
                 }
                 self.spawn = Some(spawn);
+                self.bounds = Some(bounds);
                 self.events.push(Event::Joined { spawn });
             }
             ServerMessage::Disconnect { reason } => self.disconnect(&reason),
@@ -126,9 +133,14 @@ impl Client {
         }
     }
 
-    /// Breaks a solid block. Returns false if there is nothing to break.
+    /// Breaks a solid block. Returns false if there is nothing that can be
+    /// broken.
     pub fn break_block(&mut self, pos: BlockPos) -> bool {
-        if !self.is_solid(pos) {
+        let breakable = self
+            .world
+            .block(pos)
+            .is_some_and(|block| self.content.blocks().is_breakable(block));
+        if !self.is_solid(pos) || !breakable {
             return false;
         }
         let seq = self.next_seq();
@@ -138,8 +150,12 @@ impl Client {
 
     /// Places `block` into an empty cell. Returns false if that isn't possible.
     pub fn place_block(&mut self, pos: BlockPos, block: BlockId) -> bool {
+        let blocks = self.content.blocks();
         let empty = self.world.block(pos).is_some() && !self.is_solid(pos);
-        if !empty || block == BlockId::UNKNOWN || !self.content.blocks().is_solid(block) {
+        let inside = self.bounds.is_some_and(|bounds| bounds.contains(pos));
+        let placeable =
+            block != BlockId::UNKNOWN && blocks.is_solid(block) && blocks.is_breakable(block);
+        if !empty || !inside || !placeable {
             return false;
         }
         let seq = self.next_seq();
@@ -192,6 +208,11 @@ impl Client {
     /// Where the server put the player, once joined.
     pub fn spawn(&self) -> Option<DVec3> {
         self.spawn
+    }
+
+    /// The heights blocks can exist at, once joined.
+    pub fn bounds(&self) -> Option<WorldBounds> {
+        self.bounds
     }
 
     /// Actions sent that the server has not answered yet.

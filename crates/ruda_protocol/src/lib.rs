@@ -5,13 +5,13 @@
 //! and either way the client learns about the world only from these.
 
 use glam::DVec3;
-use ruda_core::{BlockId, BlockPos, ChunkPos, ResourceId};
+use ruda_core::{BlockId, BlockPos, ChunkPos, ResourceId, WorldBounds};
 use ruda_world::Chunk;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on every incompatible change to the messages.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// How far a player can reach to break or place blocks, measured in blocks
 /// from the eye to the block's centre. Clients aim within it and the server
@@ -43,6 +43,7 @@ pub enum ServerMessage {
     Welcome {
         blocks: Vec<ResourceId>,
         spawn: DVec3,
+        bounds: WorldBounds,
     },
     /// Closes the connection.
     Disconnect {
@@ -111,6 +112,7 @@ mod tests {
         round_trip(ServerMessage::Welcome {
             blocks: vec!["ruda:air".parse().unwrap(), "base:stone".parse().unwrap()],
             spawn: DVec3::new(0.5, 70.0, 0.5),
+            bounds: WorldBounds::DEFAULT,
         });
     }
 
@@ -119,6 +121,7 @@ mod tests {
         let message = ServerMessage::Welcome {
             blocks: vec!["base:stone".parse().unwrap()],
             spawn: DVec3::ZERO,
+            bounds: WorldBounds::DEFAULT,
         };
         let mut bytes = encode(&message);
         let at = bytes.windows(5).position(|w| w == b"stone").unwrap();

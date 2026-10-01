@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use glam::DVec3;
 use ruda_client::{Client, Event};
-use ruda_core::{BlockId, ContentBuilder};
+use ruda_core::{BlockId, ContentBuilder, WorldBounds};
 use ruda_server::{Server, ServerConfig};
 use ruda_world::{RayHit, raycast};
 
@@ -19,10 +19,12 @@ impl Game {
         let mut content = ContentBuilder::new();
         ruda_base::register(&mut content).unwrap();
         let content = Arc::new(content.build());
-        let generator = Arc::new(ruda_base::terrain(content.blocks(), 2024).unwrap());
+        let generator =
+            Arc::new(ruda_base::terrain(content.blocks(), 2024, WorldBounds::DEFAULT).unwrap());
         let config = ServerConfig {
             view_distance: 2,
             vertical_view_distance: 1,
+            ..Default::default()
         };
         let mut server = Server::new(content.clone(), generator, config);
         let (connection, server_end) = ruda_net::local_pair();

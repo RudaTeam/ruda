@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context as _, Result, anyhow};
 use glam::{DVec3, Vec3};
 use ruda_client::{Client, Event};
-use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ContentBuilder, Face};
+use ruda_core::{BlockId, BlockPos, CHUNK_SIZE, ContentBuilder, Face, WorldBounds};
 use ruda_input::{Action, Input};
 use ruda_protocol::REACH;
 use ruda_render::{Camera, ChunkMesher, Renderer, Scene};
@@ -54,10 +54,12 @@ impl Game {
         let mut content = ContentBuilder::new();
         ruda_base::register(&mut content)?;
         let content = Arc::new(content.build());
-        let generator = Arc::new(ruda_base::terrain(content.blocks(), config.seed)?);
+        let bounds = WorldBounds::DEFAULT;
+        let generator = Arc::new(ruda_base::terrain(content.blocks(), config.seed, bounds)?);
         let server_config = ServerConfig {
             view_distance: config.view_distance,
             vertical_view_distance: (config.view_distance / 2).max(1),
+            bounds,
         };
         let (server, connection) =
             ruda_server::spawn_integrated(Arc::clone(&content), generator, server_config)
@@ -181,6 +183,14 @@ impl Game {
             SPEED
         };
         self.camera.position += direction.as_dvec3() * speed * dt;
+        // Stay above the floor of the world; above the build limit is fine
+        // for a look around.
+        if let Some(bounds) = self.client.bounds() {
+            self.camera.position.y = self.camera.position.y.clamp(
+                f64::from(bounds.min_y) + 1.5,
+                f64::from(bounds.max_y) + 256.0,
+            );
+        }
     }
 
     fn place(&mut self) {

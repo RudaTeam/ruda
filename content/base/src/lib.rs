@@ -4,6 +4,7 @@
 
 use ruda_core::{
     Appearance, BlockDef, BlockRegistry, ContentBuilder, ContentError, CubeTextures, ResourceId,
+    WorldBounds,
 };
 use ruda_worldgen::{Ore, TerrainGenerator, TerrainSettings};
 
@@ -28,7 +29,8 @@ macro_rules! textures {
     };
 }
 
-const TEXTURES: [(&str, &[u8]); 10] = textures![
+const TEXTURES: [(&str, &[u8]); 11] = textures![
+    "bedrock",
     "cobblestone",
     "copper_ore",
     "dirt",
@@ -73,17 +75,25 @@ pub fn register(content: &mut ContentBuilder) -> Result<(), ContentError> {
         side: id("grass_side")?,
     };
     content.add_block(BlockDef::new(id("grass")?, Appearance::Cube(grass)))?;
+    let bedrock = CubeTextures::all(id("bedrock")?);
+    content.add_block(BlockDef::new(id("bedrock")?, Appearance::Cube(bedrock)).unbreakable())?;
     Ok(())
 }
 
 /// The base game's terrain for `seed`, built from the blocks of [`register`].
-pub fn terrain(blocks: &BlockRegistry, seed: u64) -> Result<TerrainGenerator, ContentError> {
+/// Sea level is at 0 and an unbreakable floor of bedrock lies at the bottom
+/// of `bounds`.
+pub fn terrain(
+    blocks: &BlockRegistry,
+    seed: u64,
+    bounds: WorldBounds,
+) -> Result<TerrainGenerator, ContentError> {
     let block = |name| {
         let id = id(name)?;
         blocks.id(&id).ok_or(ContentError::MissingBlock(id))
     };
     let settings = TerrainSettings {
-        sea_level: 32,
+        sea_level: 0,
         grass: block("grass")?,
         dirt: block("dirt")?,
         sand: block("sand")?,
@@ -102,6 +112,8 @@ pub fn terrain(blocks: &BlockRegistry, seed: u64) -> Result<TerrainGenerator, Co
                 threshold: 0.78,
             },
         ],
+        floor: block("bedrock")?,
+        min_y: bounds.min_y,
     };
     Ok(TerrainGenerator::new(seed, settings))
 }
@@ -154,6 +166,8 @@ mod tests {
         for name in HOTBAR {
             assert!(content.blocks().id(&id(name).unwrap()).is_some(), "{name}");
         }
-        terrain(content.blocks(), 1).unwrap();
+        terrain(content.blocks(), 1, WorldBounds::DEFAULT).unwrap();
+        let bedrock = content.blocks().id(&id("bedrock").unwrap()).unwrap();
+        assert!(!content.blocks().is_breakable(bedrock));
     }
 }
