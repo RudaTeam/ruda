@@ -33,8 +33,10 @@ license). You keep the copyright on your work, and there is no CLA to sign.
    cargo deny check    # cargo install cargo-deny --locked
    ```
 
-3. Open a pull request. `main` only takes squash-merged pull requests, and
-   the **CI passed** check has to be green.
+3. Open a pull request. Pull requests are rebase-merged, which keeps commit
+   authorship intact, so squash your branch into one commit (or a few
+   meaningful ones) before it is merged. The **CI passed** check has to be
+   green.
 
 ## Assets
 
