@@ -36,6 +36,7 @@ cargo deny check          # cargo install cargo-deny --locked
 - [Дорожная карта](docs/roadmap.md)
 - [Архитектурные решения (ADR)](docs/adr/README.md)
 - [Глоссарий](docs/glossary.md)
+- [Как участвовать](CONTRIBUTING.md) — процесс, проверки, лицензия вклада
 
 ## Ключевые решения
 

@@ -1,0 +1,36 @@
+name: Баг
+description: Что-то работает не так
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: Что случилось
+      description: Что вы делали, что ожидали увидеть и что произошло на самом деле.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как воспроизвести
+      placeholder: |
+        1. Запустить `ruda --gpu-backend gl`
+        2. …
+  - type: input
+    id: version
+    attributes:
+      label: Версия или коммит
+      placeholder: 0.1.0 или 0ddb2bd
+  - type: textarea
+    id: system
+    attributes:
+      label: Система
+      description: ОС, процессор, видеокарта. Очень поможет строка `GPU ready …` из лога игры.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Лог
+      description: Вывод игры. Подробнее — запустите с переменной `RUST_LOG=debug`.
+      render: text

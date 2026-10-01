@@ -114,3 +114,15 @@ jobs:
             "${wrap[@]}" target/debug/ruda --gpu-backend "$backend" --exit-after-frames 60
             echo "::endgroup::"
           done
+
+  # The one required check for merging into main: it stays the same when jobs
+  # or matrix entries above are added, renamed or removed.
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [fmt, policy, test, build, smoke]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
