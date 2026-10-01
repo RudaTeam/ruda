@@ -75,4 +75,4 @@ ruda/
 
 **Что нужно сделать:**
 - [x] Создать workspace, `rust-toolchain.toml` и `deny.toml`.
-- [ ] Настроить CI-матрицу: Windows x86_64, macOS (Apple Silicon и Intel), Linux x86_64, Linux aarch64 (ADR-0005).
+- [x] Настроить CI-матрицу: Windows x86_64, macOS (Apple Silicon и Intel), Linux x86_64, Linux aarch64 (ADR-0005).
