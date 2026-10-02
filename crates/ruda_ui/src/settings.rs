@@ -44,8 +44,11 @@ pub struct Graphics {
     pub fps_limit: FpsLimit,
     pub fullscreen: bool,
     /// Shadows cast by the sun and moon; costly.
-    pub shadows: bool,
-    pub clouds: Clouds,
+    #[serde(deserialize_with = "shadows_cast")]
+    pub shadows: Shadows,
+    /// Clouds over the world.
+    #[serde(deserialize_with = "clouds_shown")]
+    pub clouds: bool,
     pub lighting: Lighting,
     /// Takes effect on the next start.
     pub gpu_api: GpuApi,
@@ -61,8 +64,8 @@ impl Default for Graphics {
             view_bobbing: true,
             fps_limit: FpsLimit::default(),
             fullscreen: false,
-            shadows: false,
-            clouds: Clouds::default(),
+            shadows: Shadows::Off,
+            clouds: true,
             lighting: Lighting::default(),
             gpu_api: GpuApi::Auto,
         };
@@ -86,9 +89,9 @@ impl Preset {
     /// Sets the settings the preset decides; the rest stay as they are.
     pub fn apply(self, graphics: &mut Graphics) {
         let (lighting, clouds, shadows, view_distance, lod_distance) = match self {
-            Preset::Standard => (Lighting::Classic, Clouds::Standard, false, 8, 512),
-            Preset::High => (Lighting::Atmospheric, Clouds::Standard, false, 12, 1024),
-            Preset::Ultra => (Lighting::Atmospheric, Clouds::Volumetric, true, 16, 2048),
+            Preset::Standard => (Lighting::Classic, true, Shadows::Off, 8, 512),
+            Preset::High => (Lighting::Atmospheric, true, Shadows::Off, 12, 1024),
+            Preset::Ultra => (Lighting::Atmospheric, true, Shadows::Rays, 16, 2048),
         };
         graphics.lighting = lighting;
         graphics.clouds = clouds;
@@ -156,50 +159,51 @@ impl FpsLimit {
     }
 }
 
-/// How clouds are drawn.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+/// How the sun and the moon cast shadows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Clouds {
-    Off,
-    /// Blocks of cloud in a thin layer, as in classic block games.
+pub enum Shadows {
     #[default]
+    Off,
+    /// From a map of what the sun sees.
     Standard,
-    /// Soft clouds the light passes through: the best looking, for stronger
-    /// graphics cards.
-    Volumetric,
+    /// Traced towards the sun for every point near the camera: exact.
+    Rays,
 }
 
-impl Clouds {
-    pub const ALL: [Clouds; 3] = [Clouds::Off, Clouds::Standard, Clouds::Volumetric];
+impl Shadows {
+    pub const ALL: [Shadows; 3] = [Shadows::Off, Shadows::Standard, Shadows::Rays];
 }
 
-impl<'de> Deserialize<'de> for Clouds {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Older settings only said whether there were clouds, or had other
-        // kinds of them.
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Saved {
-            Shown(bool),
-            Named(Named),
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "lowercase")]
-        enum Named {
-            Off,
-            Standard,
-            Blocky,
-            Simple,
-            Volumetric,
-        }
-        Ok(match Saved::deserialize(deserializer)? {
-            Saved::Shown(false) | Saved::Named(Named::Off) => Clouds::Off,
-            Saved::Shown(true) | Saved::Named(Named::Standard | Named::Blocky | Named::Simple) => {
-                Clouds::Standard
-            }
-            Saved::Named(Named::Volumetric) => Clouds::Volumetric,
-        })
+/// How shadows are cast. Older settings only said whether there were any:
+/// those that had them get the best.
+fn shadows_cast<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Shadows, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Saved {
+        On(bool),
+        Kind(Shadows),
     }
+    Ok(match Saved::deserialize(deserializer)? {
+        Saved::On(true) => Shadows::Rays,
+        Saved::On(false) => Shadows::Off,
+        Saved::Kind(kind) => kind,
+    })
+}
+
+/// Whether clouds are shown. Older settings named kinds of clouds: any but
+/// "off" shows them.
+fn clouds_shown<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Saved {
+        Shown(bool),
+        Named(String),
+    }
+    Ok(match Saved::deserialize(deserializer)? {
+        Saved::Shown(shown) => shown,
+        Saved::Named(name) => name != "off",
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,7 +279,7 @@ mod tests {
         };
         settings.graphics.fps_limit = FpsLimit::HundredTwenty;
         settings.graphics.gpu_api = GpuApi::Gl;
-        settings.graphics.clouds = Clouds::Off;
+        settings.graphics.clouds = false;
         settings.controls.auto_jump = true;
         assert_eq!(Settings::from_toml(&settings.to_toml()).unwrap(), settings);
     }
@@ -300,7 +304,7 @@ mod tests {
         }
         Preset::Standard.apply(&mut graphics);
         assert_eq!(graphics.lighting, Lighting::Classic);
-        assert_eq!(graphics.clouds, Clouds::Standard);
+        assert!(graphics.clouds);
         graphics.view_distance = 9;
         assert_eq!(Preset::of(&graphics), None);
     }
@@ -315,17 +319,24 @@ mod tests {
     }
 
     #[test]
-    fn reads_clouds_from_before_their_quality() {
+    fn reads_shadows_from_when_they_were_on_or_off() {
+        let shadows = |text| Settings::from_toml(text).unwrap().graphics.shadows;
+        assert_eq!(shadows("[graphics]\nshadows = false\n"), Shadows::Off);
+        assert_eq!(shadows("[graphics]\nshadows = true\n"), Shadows::Rays);
+        assert_eq!(
+            shadows("[graphics]\nshadows = \"standard\"\n"),
+            Shadows::Standard
+        );
+        assert_eq!(shadows("[graphics]\n"), Shadows::Off);
+    }
+
+    #[test]
+    fn reads_clouds_from_when_they_came_in_kinds() {
         let clouds = |text| Settings::from_toml(text).unwrap().graphics.clouds;
-        assert_eq!(clouds("[graphics]\nclouds = false\n"), Clouds::Off);
-        assert_eq!(clouds("[graphics]\nclouds = true\n"), Clouds::Standard);
-        assert_eq!(
-            clouds("[graphics]\nclouds = \"simple\"\n"),
-            Clouds::Standard
-        );
-        assert_eq!(
-            clouds("[graphics]\nclouds = \"volumetric\"\n"),
-            Clouds::Volumetric
-        );
+        assert!(!clouds("[graphics]\nclouds = false\n"));
+        assert!(clouds("[graphics]\nclouds = true\n"));
+        assert!(!clouds("[graphics]\nclouds = \"off\"\n"));
+        assert!(clouds("[graphics]\nclouds = \"standard\"\n"));
+        assert!(clouds("[graphics]\nclouds = \"volumetric\"\n"));
     }
 }

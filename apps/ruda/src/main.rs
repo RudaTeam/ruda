@@ -11,11 +11,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, ValueEnum};
-use ruda_render::{Backdrop, CloudQuality, GpuBackend, Renderer};
-use ruda_ui::{
-    Clouds, FpsLimit, GpuApi, I18n, Language, Menu, MenuAction, MenuContext, Screen, Settings,
-};
-use ruda_ui::{Lighting, Preset};
+use ruda_render::{Backdrop, GpuBackend, Renderer};
+use ruda_ui::{FpsLimit, GpuApi, I18n, Language, Menu, MenuAction, MenuContext, Screen, Settings};
+use ruda_ui::{Lighting, Preset, Shadows};
 use tracing::{info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -66,7 +64,8 @@ struct Args {
     #[arg(long, value_name = "BLOCKS")]
     lod_distance: Option<u16>,
 
-    /// Exit after presenting this many frames (smoke tests, benchmarks).
+    /// Exit after presenting this many frames (smoke tests, benchmarks);
+    /// those of the loading screen don't count.
     #[arg(long, value_name = "N")]
     exit_after_frames: Option<u64>,
 
@@ -84,17 +83,13 @@ struct Args {
     #[arg(long)]
     no_vsync: bool,
 
-    /// Turn on sun shadows, whatever the settings say.
-    #[arg(long)]
-    shadows: bool,
+    /// How the sun casts shadows, whatever the settings say.
+    #[arg(long, value_enum)]
+    shadows: Option<ShadowsArg>,
 
     /// Draw no clouds, whatever the settings say.
     #[arg(long)]
     no_clouds: bool,
-
-    /// How to draw clouds, whatever the settings say.
-    #[arg(long, value_enum)]
-    clouds: Option<CloudsArg>,
 
     /// Start from this graphics preset for this run; the saved settings
     /// stay as they are unless changed in the menu.
@@ -125,6 +120,23 @@ fn parse_size(text: &str) -> Result<(u32, u32), String> {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum ShadowsArg {
+    Off,
+    Standard,
+    Rays,
+}
+
+impl From<ShadowsArg> for Shadows {
+    fn from(arg: ShadowsArg) -> Self {
+        match arg {
+            ShadowsArg::Off => Shadows::Off,
+            ShadowsArg::Standard => Shadows::Standard,
+            ShadowsArg::Rays => Shadows::Rays,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum PresetArg {
     Standard,
     High,
@@ -148,23 +160,6 @@ fn load_settings(path: Option<&Path>, args: &Args) -> Settings {
         Preset::from(preset).apply(&mut settings.graphics);
     }
     settings
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum CloudsArg {
-    Off,
-    Standard,
-    Volumetric,
-}
-
-impl From<CloudsArg> for Clouds {
-    fn from(arg: CloudsArg) -> Self {
-        match arg {
-            CloudsArg::Off => Clouds::Off,
-            CloudsArg::Standard => Clouds::Standard,
-            CloudsArg::Volumetric => Clouds::Volumetric,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -298,7 +293,7 @@ struct App {
     system_language: Language,
     cursor_grabbed: bool,
     last_frame: Option<Instant>,
-    /// Frames that actually reached the screen.
+    /// Frames that actually reached the screen, but for the loading screen.
     frames: u64,
     first_frame_at: Option<Instant>,
     title: TitleStats,
@@ -385,8 +380,7 @@ impl App {
             },
         };
         renderer.set_vsync(self.vsync());
-        renderer.set_shadows(graphics.shadows || self.args.shadows);
-        renderer.set_cloud_quality(cloud_quality(self.clouds()));
+        renderer.set_shadows(shadows(&self.args, graphics.shadows));
         renderer.set_lighting(lighting(graphics.lighting));
 
         self.interface = Some(Interface::new(&window, renderer.max_texture_side()));
@@ -416,9 +410,9 @@ impl App {
         Some(Duration::from_secs_f64(1.0 / f64::from(fps)))
     }
 
-    /// How clouds are drawn: as the settings say, unless the command line
-    /// says otherwise.
-    fn clouds(&self) -> Clouds {
+    /// Whether there are clouds: as the settings say, unless the command
+    /// line says otherwise.
+    fn clouds(&self) -> bool {
         clouds(&self.args, self.settings.graphics.clouds)
     }
 
@@ -435,13 +429,19 @@ impl App {
             camera: self.args.camera,
             time: self.args.time,
             lod_distance: self.args.lod_distance.unwrap_or(graphics.lod_distance),
-            clouds: clouds != Clouds::Off,
+            clouds,
             auto_jump: self.settings.controls.auto_jump,
             view_bobbing: graphics.view_bobbing,
         };
         self.game = Some(Game::start(config, renderer)?);
-        self.resume();
+        // The world shows once the area around the player has loaded.
+        self.menu = Some(Menu::new(Screen::Loading));
         Ok(())
+    }
+
+    /// Whether the loading screen is up.
+    fn loading(&self) -> bool {
+        self.menu.is_some_and(|menu| menu.screen == Screen::Loading)
     }
 
     fn quit_to_title(&mut self) {
@@ -509,14 +509,9 @@ impl App {
         if new.shadows != old.shadows
             && let Some(renderer) = &mut self.renderer
         {
-            renderer.set_shadows(new.shadows);
+            renderer.set_shadows(shadows(&self.args, new.shadows));
         }
         let clouds = self.clouds();
-        if new.clouds != old.clouds
-            && let Some(renderer) = &mut self.renderer
-        {
-            renderer.set_cloud_quality(cloud_quality(clouds));
-        }
         if new.lighting != old.lighting
             && let Some(renderer) = &mut self.renderer
         {
@@ -533,7 +528,7 @@ impl App {
                 game.set_lod_distance(new.lod_distance);
             }
             if new.clouds != old.clouds {
-                game.set_clouds(clouds != Clouds::Off);
+                game.set_clouds(clouds);
             }
             game.set_auto_jump(self.settings.controls.auto_jump);
             game.set_view_bobbing(new.view_bobbing);
@@ -574,6 +569,11 @@ impl App {
             self.pause();
         }
 
+        if self.loading() && self.game.as_ref().is_some_and(Game::is_ready) {
+            self.resume();
+        }
+        let loading = self.loading();
+
         let (Some(window), Some(renderer), Some(interface)) =
             (&self.window, &mut self.renderer, &mut self.interface)
         else {
@@ -602,7 +602,7 @@ impl App {
             }
         };
         let ui = painted.as_ref().map(|painted| painted.frame());
-        let scene = self.game.as_ref().map(Game::scene);
+        let scene = self.game.as_ref().filter(|_| !loading).map(Game::scene);
         let backdrop = match &scene {
             Some(scene) => Backdrop::World(scene),
             None => {
@@ -611,10 +611,12 @@ impl App {
             }
         };
         let presented = renderer.render(backdrop, ui.as_ref(), || window.pre_present_notify())?;
-        if presented {
+        if presented && !loading {
             self.frames += 1;
-            self.title.frames += 1;
             self.first_frame_at.get_or_insert(now);
+        }
+        if presented {
+            self.title.frames += 1;
             #[cfg(feature = "tracy")]
             tracing_tracy::client::frame_mark();
             let busy = now.elapsed().saturating_sub(renderer.surface_wait());
@@ -854,14 +856,10 @@ fn random_seed() -> u64 {
         .map_or(0, |time| time.as_nanos() as u64)
 }
 
-/// How clouds are drawn: as `saved` in the settings, unless the command line
-/// says otherwise.
-fn clouds(args: &Args, saved: Clouds) -> Clouds {
-    if args.no_clouds {
-        Clouds::Off
-    } else {
-        args.clouds.map_or(saved, Clouds::from)
-    }
+/// Whether there are clouds: as `saved` in the settings, unless the command
+/// line says otherwise.
+fn clouds(args: &Args, saved: bool) -> bool {
+    saved && !args.no_clouds
 }
 
 /// `--benchmark --headless`: the game without a window, each frame drawn
@@ -872,9 +870,8 @@ fn run_headless(args: &Args) -> Result<()> {
     let (width, height) = args.size;
     let mut renderer = pollster::block_on(Renderer::headless(width, height))?;
     info!(adapter = %renderer.adapter_summary(), width, height, "drawing off-screen");
-    renderer.set_shadows(graphics.shadows || args.shadows);
+    renderer.set_shadows(shadows(args, graphics.shadows));
     let clouds = clouds(args, graphics.clouds);
-    renderer.set_cloud_quality(cloud_quality(clouds));
     renderer.set_lighting(lighting(graphics.lighting));
     let config = GameConfig {
         seed: args.seed.unwrap_or_else(random_seed),
@@ -883,7 +880,7 @@ fn run_headless(args: &Args) -> Result<()> {
         camera: args.camera,
         time: args.time,
         lod_distance: args.lod_distance.unwrap_or(graphics.lod_distance),
-        clouds: clouds != Clouds::Off,
+        clouds,
         auto_jump: false,
         view_bobbing: graphics.view_bobbing,
     };
@@ -911,19 +908,21 @@ fn run_headless(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// How the renderer casts shadows: as `saved` in the settings, unless the
+/// command line says otherwise.
+fn shadows(args: &Args, saved: Shadows) -> ruda_render::Shadows {
+    match args.shadows.map_or(saved, Shadows::from) {
+        Shadows::Off => ruda_render::Shadows::Off,
+        Shadows::Standard => ruda_render::Shadows::Map,
+        Shadows::Rays => ruda_render::Shadows::Rays,
+    }
+}
+
 /// How the renderer lights the world.
 fn lighting(lighting: Lighting) -> ruda_render::Lighting {
     match lighting {
         Lighting::Classic => ruda_render::Lighting::Classic,
         Lighting::Atmospheric => ruda_render::Lighting::Atmospheric,
-    }
-}
-
-/// How the renderer draws clouds that are on.
-fn cloud_quality(clouds: Clouds) -> CloudQuality {
-    match clouds {
-        Clouds::Standard => CloudQuality::Blocky,
-        Clouds::Off | Clouds::Volumetric => CloudQuality::Volumetric,
     }
 }
 

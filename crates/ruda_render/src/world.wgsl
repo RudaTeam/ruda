@@ -43,46 +43,34 @@ struct Globals {
     // rgb: the sun's colour through the air, for its disc.
     sun_disc: vec4<f32>,
     // Light space of each shadow cascade, nearest first.
-    shadow_view_proj: array<mat4x4<f32>, 3>,
-    // xyz: how far each cascade reaches; w: size of a shadow map texel in
-    // texture coordinates.
+    shadow_view_proj: array<mat4x4<f32>, 4>,
+    // How far each cascade reaches. The last one shows far-away terrain;
+    // when it reaches no farther than the one before, there is none.
     shadow: vec4<f32>,
-    // x: how much of the sky clouds cover; y: 1 with clouds, 0 without; z,
+    // x: how much of the sky clouds cover; y: how dense they are, 1 for
+    // fair-weather clouds, 0 without clouds; z,
     // w: the bottom and the top of the cloud layer.
     clouds: vec4<f32>,
-    // xy: where the camera is in `cloud_patches`; zw: where it is in
-    // `cloud_detail` along x and z. Both move with the wind.
-    cloud_offset: vec4<f32>,
-    // x: where the camera is in `cloud_detail` along y; yz: the first
-    // corner of `cloud_obstacles`, x and z relative to the camera.
+    // xy: where the camera is over `cloud_cells`, in blocks: it moves with
+    // the wind, and repeats with the map; zw: the first corner of
+    // `cloud_obstacles`, x and z relative to the camera.
     cloud_place: vec4<f32>,
     // xyz: towards the light the clouds get: high up, they still see the
     // sun for a while after it has set on the ground.
     cloud_light: vec4<f32>,
     // rgb: that light on a white surface facing it.
     cloud_light_color: vec4<f32>,
-    // xy: the first corner of `cloud_shadows`, x and z relative to the
-    // camera; z: how many blocks it spans; w: 1 if it holds the shadows of
-    // blocky clouds, 0 for soft ones.
-    cloud_shadow: vec4<f32>,
-    // The view of the last frame, relative to where the camera was then.
-    cloud_past_view_proj: mat4x4<f32>,
-    // xyz: add to a point of a cloud (relative to the camera) to get where
-    // that bit of cloud was last frame, relative to the camera then; w: which
-    // pixel of each 2×2 square of the marched clouds is marched this frame,
-    // below 0 to march them all.
-    cloud_past: vec4<f32>,
-    // xyz: the layer of `shadow_map` each cascade is shown from.
+    // The layer of `shadow_map` each cascade is shown from.
     shadow_layers: vec4<f32>,
     // Classic light (see `ClassicSky` in `sky.rs`): sky colour straight up
     // (w: how bright the stars are), at the horizon, the glow of sunrise and
     // sunset, the fog, sky light (w: the least light anything gets) and a
     // cloud's lit top.
     classic: array<vec4<f32>, 6>,
-    // Blocky clouds: xy: where the camera is over the patches of cloud, in
-    // blocks, repeating every few times `PATCH_PERIOD`; z: the bottom of
-    // their layer; w: how thick it is.
-    blocky: vec4<f32>,
+    // Rays towards the light: x, z: the first block of `ray_solids` along x
+    // and z; y: its lowest block; w: how high above that solid blocks reach,
+    // 0 without rays.
+    ray_window: vec4<i32>,
 }
 
 // Width of `chunk_origins`, whose texels are chunk slots.
@@ -98,30 +86,35 @@ const ORIGINS_WIDTH = 128u;
 // Depth from the light, a layer per cascade.
 @group(0) @binding(5) var shadow_map: texture_depth_2d_array;
 @group(0) @binding(6) var shadow_sampler: sampler_comparison;
-// Patches of cloud, repeating; see `clouds.rs`.
-@group(0) @binding(7) var cloud_patches: texture_2d<f32>;
+// The same map read as plain numbers: OpenGL can only compare depth
+// textures, not read them.
+@group(0) @binding(11) var shadow_depths: texture_2d_array<f32>;
+// Which cells of the layer hold cloud, 1 for those, repeating; see
+// `cloud_cells` in `clouds.rs`.
+@group(0) @binding(7) var cloud_cells: texture_2d<f32>;
 // Linear filtering, clamped at the edges.
 @group(0) @binding(8) var smooth_sampler: sampler;
 // Linear filtering, repeating.
 @group(0) @binding(10) var wrap_sampler: sampler;
-// Puffs for the edges of clouds, repeating in all three directions.
-@group(0) @binding(11) var cloud_detail: texture_3d<f32>;
 // How high obstacles reach into the clouds around the camera, widened and
 // softened, above `OBSTACLE_BASE`.
 @group(0) @binding(12) var cloud_obstacles: texture_2d<f32>;
-// How much light gets through the clouds for each place where it enters
-// their bottom on its way down; see `cloud_shadow_fragment`. Each level
-// after the first is the one before, halved and blurred.
-@group(0) @binding(13) var cloud_shadows: texture_2d<f32>;
 // Which chunks are drawn in full this frame: a texel per column of chunks,
 // repeating every `DRAWN_WIDTH` columns, and in it a bit per chunk up the
 // column, repeating every 32.
 @group(0) @binding(14) var chunks_drawn: texture_2d<u32>;
 const DRAWN_WIDTH = 128;
-// A level of the cloud shadow map, while the next is drawn from it.
-@group(0) @binding(15) var cloud_shadow_level: texture_2d<f32>;
-// Blocky clouds come in cells of this many blocks a side.
-const BLOCKY_CELL = 12.0;
+// The world near the camera, for rays towards the light (see `rays.rs`): a
+// word of 32 blocks up y for each x and z, a layer per layer of chunks,
+// wrapping around every `RAY_WINDOW` blocks along x and z; and for each brick
+// of `RAY_BRICK`³ blocks, whether it holds a solid one.
+@group(0) @binding(16) var ray_solids: texture_3d<u32>;
+@group(0) @binding(17) var ray_bricks: texture_3d<u32>;
+// How high solid blocks reach in each column of bricks, from the window's
+// lowest block.
+@group(0) @binding(18) var ray_tops: texture_2d<u32>;
+const RAY_WINDOW = 512;
+const RAY_BRICK = 8.0;
 // The sky's colour by direction, a layer per height of the light; see
 // `atmosphere.rs`.
 @group(0) @binding(9) var sky_table: texture_3d<f32>;
@@ -139,8 +132,6 @@ const LUMINANCE = vec3<f32>(0.2126, 0.7152, 0.0722);
 const BLOCK_LIGHT = 0.45;
 // How bright glowing blocks are.
 const GLOW = 1.4;
-// How much light clouds reflect.
-const CLOUD_ALBEDO = 0.9;
 // Haze thins out with height: by e every this many blocks.
 const HAZE_HEIGHT = 100.0;
 // The look on top of the filmic curve: contrast and saturation.
@@ -309,52 +300,218 @@ fn model_vertex(@location(0) vertex: vec4<u32>) -> ChunkVertex {
     return out;
 }
 
-// How much of the sun's (or moon's) direct light reaches a point: 0 in full
-// shadow, 1 in full light. Each cascade gives way to the next over the last
-// fifth of its reach, and the last one fades out.
-fn sunlit(position: vec3<f32>, normal: vec3<f32>, distance: f32, facing: f32) -> f32 {
-    let reach = globals.shadow.xyz;
-    if distance >= reach.z {
-        return 1.0;
+// Whether `block` of the ray window (from its first corner) is a solid cube.
+fn ray_solid(block: vec3<i32>) -> bool {
+    let at = block + vec3<i32>(globals.ray_window.x, 0, globals.ray_window.z);
+    let word = textureLoad(ray_solids, vec3<i32>(at.x & (RAY_WINDOW - 1), at.y >> 5u, at.z & (RAY_WINDOW - 1)), 0).r;
+    return ((word >> u32(at.y & 31)) & 1u) != 0u;
+}
+
+// Whether `brick` of the ray window holds a solid cube.
+fn ray_brick(brick: vec3<i32>) -> bool {
+    let at = brick + vec3<i32>(globals.ray_window.x, 0, globals.ray_window.z) / 8;
+    let size = RAY_WINDOW / 8;
+    return textureLoad(ray_bricks, vec3<i32>(at.x & (size - 1), at.y, at.z & (size - 1)), 0).r != 0u;
+}
+
+// How far a ray from `origin`, along the direction whose reciprocal is
+// `inverse`, goes until it leaves the box from `low` to `high`.
+fn slab_exit(origin: vec3<f32>, inverse: vec3<f32>, low: vec3<f32>, high: vec3<f32>) -> f32 {
+    let far = select(low, high, inverse > vec3<f32>(0.0));
+    let t = (far - origin) * inverse;
+    return min(min(t.x, t.y), t.z);
+}
+
+// How high solid blocks reach in `column` of bricks of the ray window.
+fn ray_top(column: vec2<i32>) -> f32 {
+    let at = column + vec2<i32>(globals.ray_window.x, globals.ray_window.z) / 8;
+    let size = RAY_WINDOW / 8;
+    return f32(textureLoad(ray_tops, vec2<i32>(at.x & (size - 1), at.y & (size - 1)), 0).r);
+}
+
+// A ray from `position` (on a face turned towards `normal`) towards the
+// light through the solid cubes near the camera: x is 1 if it gets out of
+// the window of the world the GPU holds without meeting one, 0 if it meets
+// one; y is how far it went. The light is above the horizon, so the ray only
+// rises: it crosses columns of bricks, skipping those whose solid blocks it
+// is already above, and inside the others bricks, skipping those with none,
+// then blocks.
+fn ray_shadow(position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+    let window = globals.ray_window;
+    let toward = globals.light.xyz;
+    let first = vec3<i32>(window.x, window.y, window.z);
+    // Above `top`, nothing is solid.
+    let top = f32(window.w);
+    let start = position + globals.camera_fract.xyz + vec3<f32>(globals.camera_block.xyz - first)
+        + normal * 0.002;
+    let size = vec3<f32>(f32(RAY_WINDOW), top, f32(RAY_WINDOW));
+    if toward.y <= 0.0 || any(start.xz < vec2<f32>(0.0)) || any(start.xz >= size.xz)
+        || start.y < 0.0 {
+        return vec2<f32>(1.0, 0.0);
     }
-    var cascade = 2;
-    if distance < reach.y {
-        cascade = 1;
+    if start.y >= top {
+        return vec2<f32>(1.0, 0.0);
     }
-    if distance < reach.x {
-        cascade = 0;
-    }
-    var lit = cascade_shadow(cascade, position, normal, facing);
-    let blend = smoothstep(reach[cascade] * 0.8, reach[cascade], distance);
-    if blend > 0.0 {
-        var next = 1.0;
-        if cascade < 2 {
-            next = cascade_shadow(cascade + 1, position, normal, facing);
+    let inverse = 1.0 / select(toward, vec3<f32>(1e-6), abs(toward) < vec3<f32>(1e-6));
+    let out = slab_exit(start, inverse, vec3<f32>(0.0), size);
+    var t = 0.0;
+    for (var i = 0; i < 160; i++) {
+        let at = start + toward * (t + 1e-3);
+        let column = vec2<i32>(floor(at.xz / RAY_BRICK));
+        let corner = vec3<f32>(vec2<f32>(column).x * RAY_BRICK, -1e6, vec2<f32>(column).y * RAY_BRICK);
+        let leave = min(slab_exit(start, inverse, corner, corner + vec3<f32>(RAY_BRICK, 2e6, RAY_BRICK)), out);
+        let column_top = ray_top(column);
+        if at.y < column_top {
+            // Up to where the ray rises above the column's solid blocks.
+            let until = min(leave, (column_top - start.y) * inverse.y);
+            var u = t;
+            for (var j = 0; j < 64; j++) {
+                let brick = vec3<i32>(floor((start + toward * (u + 1e-3)) / RAY_BRICK));
+                let low = vec3<f32>(brick) * RAY_BRICK;
+                let past = min(slab_exit(start, inverse, low, low + RAY_BRICK), until);
+                if ray_brick(brick) {
+                    // Block by block across the brick.
+                    var s = u;
+                    for (var k = 0; k < 24; k++) {
+                        let block = vec3<i32>(floor(start + toward * (s + 1e-3)));
+                        if ray_solid(block) {
+                            return vec2<f32>(0.0, s);
+                        }
+                        let cell = vec3<f32>(block);
+                        s = slab_exit(start, inverse, cell, cell + 1.0);
+                        if s >= past {
+                            break;
+                        }
+                    }
+                }
+                u = past;
+                if u >= until {
+                    break;
+                }
+            }
         }
-        lit = mix(lit, next, blend);
+        t = leave;
+        if t >= out {
+            break;
+        }
+    }
+    return vec2<f32>(1.0, t);
+}
+
+// How much of the sun's (or moon's) direct light reaches a point: 0 in full
+// shadow, 1 in full light. Each near cascade gives way to the next over the
+// last fifth of its reach, and the last of them fades out; the far cascade
+// adds the shadows of far-away terrain, near the camera only of what lies
+// farther towards the light than the near cascades see.
+fn sunlit(position: vec3<f32>, normal: vec3<f32>, distance: f32, facing: f32) -> f32 {
+    let reach = globals.shadow;
+    // With rays: what they meet near the camera, and farther along them,
+    // far-away terrain from the far cascade.
+    if globals.ray_window.w > 0 {
+        let ray = ray_shadow(position, normal);
+        var lit = ray.x;
+        if lit > 0.0 && reach.w > reach.z && distance < reach.w {
+            let far = cascade_shadow(3, position, normal, facing, max(ray.y, FAR_SHADOW_LIFT.x));
+            lit *= mix(far, 1.0, smoothstep(reach.w * 0.8, reach.w, distance));
+        }
+        return lit;
+    }
+    var lit = 1.0;
+    // How much of the near cascades counts here.
+    var near = 0.0;
+    if distance < reach.z {
+        var cascade = 2;
+        if distance < reach.y {
+            cascade = 1;
+        }
+        if distance < reach.x {
+            cascade = 0;
+        }
+        lit = cascade_shadow(cascade, position, normal, facing, 0.0);
+        let blend = smoothstep(reach[cascade] * 0.8, reach[cascade], distance);
+        if blend > 0.0 {
+            var next = 1.0;
+            if cascade < 2 {
+                next = cascade_shadow(cascade + 1, position, normal, facing, 0.0);
+            }
+            lit = mix(lit, next, blend);
+        }
+        near = 1.0 - smoothstep(reach.z * 0.8, reach.z, distance);
+    }
+    if reach.w > reach.z && distance < reach.w {
+        let lift = mix(FAR_SHADOW_LIFT.x, FAR_SHADOW_LIFT.y, near);
+        let far = cascade_shadow(3, position, normal, facing, lift);
+        lit *= mix(far, 1.0, smoothstep(reach.w * 0.8, reach.w, distance));
     }
     return lit;
 }
 
-fn cascade_shadow(cascade: i32, position: vec3<f32>, normal: vec3<f32>, facing: f32) -> f32 {
+// The far cascade counts only what lies farther than this towards the
+// light: everywhere, `x`, as far-away terrain is drawn coarse and would
+// shade itself, and small things that near would only blur; near the
+// camera, `y`, as the near cascades see what lies nearer.
+const FAR_SHADOW_LIFT = vec2<f32>(8.0, 200.0);
+// Texels along a side of each cascade, as in `shadows.rs`.
+const SHADOW_MAP_SIZE = 2048.0;
+
+// How much of the light reaches `position` in `cascade`, counting only what
+// lies more than `lift` blocks towards the light. The shadow's edge is as
+// soft as the sun's disc makes it: sharp where what casts it is near, softer
+// the farther it is.
+fn cascade_shadow(cascade: i32, position: vec3<f32>, normal: vec3<f32>, facing: f32, lift: f32) -> f32 {
     // Nudged out along the normal by about a texel, more where the light
     // grazes the face, so faces don't shade themselves.
-    let texel = 2.0 * globals.shadow[cascade] * globals.shadow.w;
-    let lifted = position + normal * texel * (1.0 + 2.0 * (1.0 - facing));
+    let texel = 2.0 * globals.shadow[cascade] / SHADOW_MAP_SIZE;
+    let lifted = position + normal * texel * (1.0 + 2.0 * (1.0 - facing)) + globals.light.xyz * lift;
     let matrix = globals.shadow_view_proj[cascade];
     let light = matrix * vec4<f32>(lifted, 1.0);
     let uv = vec2<f32>(light.x * 0.5 + 0.5, 0.5 - light.y * 0.5);
     if any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) || light.z >= 1.0 {
         return 1.0;
     }
-    // As soft in every cascade, but no sharper than a couple of texels.
-    let radius = max(SHADOW_SOFTNESS / texel, 1.5) * globals.shadow.w;
+    let layer = i32(globals.shadow_layers[cascade]);
     let slope = depth_slope(matrix, normal);
-    return soft_shadow(uv, light.z, slope, radius, i32(globals.shadow_layers[cascade]));
+    // Depth per block towards the light, and how much of the map a block is.
+    let per_block = abs((matrix * vec4<f32>(globals.light.xyz, 0.0)).z);
+    let across = 0.5 / globals.shadow[cascade];
+    // How far what casts the shadow is: the blockers over the softest edge
+    // worth looking for here, on average.
+    let search = max(clamp(SUN_WIDTH * globals.shadow[cascade], 0.2, 8.0) * across, 2.0 / SHADOW_MAP_SIZE);
+    var blockers = 0.0;
+    var gap = 0.0;
+    var around = vec2<f32>(search, 0.0);
+    let quarter = mat2x2<f32>(0.0, 1.0, -1.0, 0.0);
+    for (var i = 0; i < 5; i++) {
+        var offset = vec2<f32>(0.0);
+        if i > 0 {
+            offset = around;
+            around = quarter * around;
+        }
+        let texel_at = clamp(
+            vec2<i32>((uv + offset) * SHADOW_MAP_SIZE),
+            vec2<i32>(0),
+            vec2<i32>(i32(SHADOW_MAP_SIZE) - 1),
+        );
+        let stored = textureLoad(shadow_depths, texel_at, layer, 0).r;
+        let here = light.z + dot(slope, offset);
+        if stored < here - 1e-5 {
+            blockers += 1.0;
+            gap += here - stored;
+        }
+    }
+    if blockers == 0.0 {
+        return 1.0;
+    }
+    let distance = gap / blockers / per_block + lift;
+    let width = SHADOW_SOFTNESS + SUN_WIDTH * distance;
+    // No sharper than a couple of texels.
+    let radius = max(0.5 * width * across, 1.5 / SHADOW_MAP_SIZE);
+    return soft_shadow(uv, light.z, slope, radius, layer);
 }
 
-// How wide the soft edge of a shadow is, in blocks either way.
-const SHADOW_SOFTNESS = 0.15;
+// How soft the edge of a shadow is at the least, in blocks: the air
+// scatters a little light around everything.
+const SHADOW_SOFTNESS = 0.04;
 // Comparisons averaged for a soft edge: each texel of the shadow map
 // counts for little, so edges don't twitch as the sun moves across the
 // texels.
@@ -465,19 +622,9 @@ fn box_corner(start: vec3<f32>, size: vec3<f32>, face: u32, vertex: u32) -> BoxC
 // the chunk position texture, like a chunk's.
 @vertex
 fn lod_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) -> ChunkVertex {
-    let first = vec3<f32>(f32(quad.x & 63u), 0.0, f32((quad.x >> 6u) & 63u)) * 4.0;
-    let cells = vec3<f32>(f32(((quad.x >> 12u) & 63u) + 1u), 0.0, f32(((quad.x >> 18u) & 63u) + 1u));
     let face = (quad.x >> 24u) & 7u;
-    // The box's bottom and top, sign-extended from 16 bits.
-    let low = f32(bitcast<i32>(quad.z << 16u) >> 16u);
-    let high = f32(bitcast<i32>(quad.z) >> 16u);
-    let start = vec3<f32>(first.x, low, first.z);
-    let size = vec3<f32>(cells.x * 4.0, high - low, cells.z * 4.0);
-    let corner = box_corner(start, size, face, vertex);
-    var local = corner.local;
-    // A little below the chunks drawn in full, so where both are drawn,
-    // those win.
-    local.y -= 0.5;
+    let corner = lod_corner(quad, vertex);
+    let local = corner.local;
     let position = camera_relative(quad.y >> 18u, local);
 
     var out: ChunkVertex;
@@ -495,6 +642,30 @@ fn lod_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) 
     out.occlusion = 1.0;
     out.glows = 0u;
     return out;
+}
+
+// Far-away terrain drawn into the far cascade of the shadow map.
+@vertex
+fn lod_shadow_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) -> @builtin(position) vec4<f32> {
+    let local = lod_corner(quad, vertex).local;
+    return shadow_pass * vec4<f32>(camera_relative(quad.y >> 18u, local), 1.0);
+}
+
+// A corner of a packed quad of far-away terrain (see `lod.rs`), in its tile.
+fn lod_corner(quad: vec4<u32>, vertex: u32) -> BoxCorner {
+    let first = vec3<f32>(f32(quad.x & 63u), 0.0, f32((quad.x >> 6u) & 63u)) * 4.0;
+    let cells = vec3<f32>(f32(((quad.x >> 12u) & 63u) + 1u), 0.0, f32(((quad.x >> 18u) & 63u) + 1u));
+    let face = (quad.x >> 24u) & 7u;
+    // The box's bottom and top, sign-extended from 16 bits.
+    let low = f32(bitcast<i32>(quad.z << 16u) >> 16u);
+    let high = f32(bitcast<i32>(quad.z) >> 16u);
+    let start = vec3<f32>(first.x, low, first.z);
+    let size = vec3<f32>(cells.x * 4.0, high - low, cells.z * 4.0);
+    var corner = box_corner(start, size, face, vertex);
+    // A little below the chunks drawn in full, so where both are drawn,
+    // those win.
+    corner.local.y -= 0.5;
+    return corner;
 }
 
 @fragment
@@ -630,16 +801,55 @@ fn sky_radiance(direction: vec3<f32>) -> vec3<f32> {
     return mix(color, vec3<f32>(grey), globals.weather.x * 0.5) * globals.weather.y;
 }
 
-// Distant things fade into the sky behind them.
+// Distant things fade into the haze, and at the edge of the world into what
+// lies behind them.
 fn with_fog(color: vec3<f32>, position: vec3<f32>, distance: f32) -> vec3<f32> {
-    let amount = fog_amount(position, distance);
-    return mix(color, sky_radiance(position / max(distance, 1e-4)), amount);
+    let direction = position / max(distance, 1e-4);
+    let hazy = mix(color, haze_radiance(direction), haze(position, distance));
+    let edge = smoothstep(mix(globals.fog.x, globals.fog.y, 0.5), globals.fog.y, distance);
+    return mix(hazy, background(direction), edge);
 }
 
-// How much of something at `position` the haze hides, and at the edge of
-// the world, the fog that hides everything.
-fn fog_amount(position: vec3<f32>, distance: f32) -> f32 {
-    return max(haze(position, distance), smoothstep(globals.fog.x, globals.fog.y, distance));
+// What the sky shows in `direction`: below the horizon, haze over land too
+// far to draw.
+fn background(direction: vec3<f32>) -> vec3<f32> {
+    let level = normalize(vec3<f32>(direction.x, max(direction.y, 0.0), direction.z));
+    let sky = sky_radiance(level);
+    if direction.y >= 0.0 {
+        return sky;
+    }
+    return mix(sky, haze_radiance(direction), smoothstep(0.0, 0.05, -direction.y));
+}
+
+// The haze is lit from this many radians up the sky: as bright as the sky
+// there, the same angle from the light. The bright band at the horizon
+// comes from looking through all of the air, while haze lies a few
+// kilometres deep at most.
+const HAZE_ELEVATION = 0.1;
+
+// The light the haze scatters towards the eye in `direction`: brighter
+// towards the sun, whatever the height.
+fn haze_radiance(direction: vec3<f32>) -> vec3<f32> {
+    var color = vec3<f32>(0.0);
+    if globals.sky.x >= 0.0 {
+        color += haze_from(direction, globals.sun.xyz, globals.sky.x);
+    }
+    if globals.sky.y >= 0.0 {
+        color += haze_from(direction, -globals.sun.xyz, globals.sky.y) * globals.sky.z;
+    }
+    let grey = dot(color, LUMINANCE);
+    return mix(color, vec3<f32>(grey), globals.weather.x * 0.5) * globals.weather.y;
+}
+
+// The sky at `HAZE_ELEVATION`, as far from the light `toward` as `direction`
+// is.
+fn haze_from(direction: vec3<f32>, toward: vec3<f32>, layer: f32) -> vec3<f32> {
+    let up = vec2<f32>(sin(HAZE_ELEVATION), cos(HAZE_ELEVATION));
+    let level = max(length(toward.xz), 1e-4);
+    let around = acos(clamp((dot(direction, toward) - up.x * toward.y) / (up.y * level), -1.0, 1.0));
+    let bearing = atan2(toward.z, toward.x) + around;
+    let sample = vec3<f32>(up.y * cos(bearing), up.x, up.y * sin(bearing));
+    return sky_from(sample, toward, layer);
 }
 
 // How much of something at `position` the haze hides: it is thicker low
@@ -734,19 +944,19 @@ fn classic_sky(direction: vec3<f32>) -> vec3<f32> {
 fn sky_fragment(in: SkyVertex) -> @location(0) vec4<f32> {
     let far = globals.inverse_view_proj * vec4<f32>(in.screen, 1.0, 1.0);
     let direction = normalize(far.xyz / far.w);
-    // Below the horizon, where nothing is drawn, the horizon goes on.
-    let level = normalize(vec3<f32>(direction.x, max(direction.y, 0.0), direction.z));
     var color: vec3<f32>;
     if classic() {
+        // Below the horizon, where nothing is drawn, the horizon goes on.
+        let level = normalize(vec3<f32>(direction.x, max(direction.y, 0.0), direction.z));
         color = output(classic_sky(level));
     } else {
-        color = finish(sky_radiance(level));
+        color = finish(background(direction));
     }
 
     // Stars: one in a few hundred cells of a grid around the camera. They
     // are added on screen, whatever the exposure.
     let up = direction.y;
-    if globals.sky.w > 0.0 && up > 0.0 {
+    if globals.sky.w > 0.0 && up > 0.0 && !behind_disc(direction) {
         let scale = 150.0;
         let cell = floor(direction * scale);
         let chance = hash(cell);
@@ -775,6 +985,35 @@ struct CelestialVertex {
 const SUN_DISC = 4.0;
 const MOON_DISC = 0.08;
 
+// Whether the sun's or the moon's disc hides the sky in `direction`: no
+// stars show through them.
+fn behind_disc(direction: vec3<f32>) -> bool {
+    for (var body = 0u; body < 2u; body++) {
+        let center = select(globals.sun.xyz, -globals.sun.xyz, body == 1u);
+        let along = dot(direction, center);
+        if along <= 0.0 {
+            continue;
+        }
+        let right = normalize(cross(vec3<f32>(0.0, 0.0, 1.0), center));
+        let up = cross(center, right);
+        // Where on the disc's square, as in `celestial_vertex`.
+        let corner = vec2<f32>(dot(direction, right), dot(direction, up)) / along / disc_size(body);
+        if all(abs(corner) < vec2<f32>(1.0)) {
+            let uv = vec2<f32>(corner.x, -corner.y) * 0.5 + 0.5;
+            if textureSampleLevel(sky_textures, block_sampler, uv, body, 0.0).a > 0.5 {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Half the width of the square of the sun (`body` 0) or the moon (1), as a
+// tangent of the angle.
+fn disc_size(body: u32) -> f32 {
+    return select(0.12, 0.09, body == 1u);
+}
+
 // Two squares facing the camera: the sun, then the moon opposite it.
 @vertex
 fn celestial_vertex(@builtin(vertex_index) index: u32) -> CelestialVertex {
@@ -787,7 +1026,7 @@ fn celestial_vertex(@builtin(vertex_index) index: u32) -> CelestialVertex {
     let direction = select(globals.sun.xyz, -globals.sun.xyz, body == 1u);
     let right = normalize(cross(vec3<f32>(0.0, 0.0, 1.0), direction));
     let up = cross(direction, right);
-    let size = select(0.12, 0.09, body == 1u);
+    let size = disc_size(body);
     // Inside the far plane even at the shortest view distance.
     let position = (direction + (right * corner.x + up * corner.y) * size) * 60.0;
 
@@ -853,13 +1092,13 @@ fn crosshair_fragment() -> @location(0) vec4<f32> {
     return vec4<f32>(0.95, 0.95, 0.95, 1.0);
 }
 
-// Clouds. A cloud isn't geometry: `cloud_density` says how much cloud there
-// is at a point, and clouds are drawn by marching rays through the layer, or
-// in blocky cells as in classic block games. See `clouds.rs`.
+// Clouds: blocks of cloud in a thin layer, as in classic block games. A
+// cloud isn't geometry: each pixel walks its ray across the cells of the
+// layer until it meets one. See `clouds.rs`.
 
-// The textures, as in `clouds.rs`.
-const PATCH_PERIOD = 4096.0;
-const DETAIL_PERIOD = 96.0;
+// The cell map and the obstacle map, as in `clouds.rs`.
+const CLOUD_CELL = 12.0;
+const CELL_MAP_SIZE = 1024;
 const OBSTACLE_SPAN = 4096.0;
 
 fn cloud_bottom() -> f32 {
@@ -875,35 +1114,30 @@ fn cloud_top() -> f32 {
 fn obstacle_base() -> f32 {
     return cloud_bottom() - 32.0;
 }
-// How much a block of the densest cloud dims light passing through it.
-const CLOUD_DENSITY = 0.2;
-// The most of the direct light a cloud's shadow takes away: clouds let some
-// through, scattered.
-const CLOUD_SHADOW = 0.75;
-// Cloud shadows fade out from this far away to that.
+// How much light clouds reflect.
+const CLOUD_ALBEDO = 0.9;
+// How much a block of cloud dims the light passing through it, for
+// fair-weather clouds (density 1): looking straight up through the layer,
+// the sky shows through a fifth. The same for the eye as for the sun, so a
+// cloud the sun shines through casts as light a shadow.
+const CLOUD_EXTINCTION = 0.27;
+// Clouds scatter light mostly onwards: some of what they take from the
+// sun's beam still reaches the ground under them, as if through a cloud
+// thinner by `y`, weighted `x` against the beam.
+const CLOUD_ONWARD = vec2<f32>(0.3, 0.25);
+// The sun is a disc this many radians across: a shadow's edge is this much
+// softer per block from what casts it.
+const SUN_WIDTH = 0.0093;
+// Light scattered about inside a cloud softens its shadow's edges by this
+// many blocks besides, and onwards by this much more per block it comes
+// from the cloud.
+const CLOUD_SHADOW_SOFT = 1.0;
+const CLOUD_SHADOW_SPREAD = 0.01;
+// The farther below its cloud, the more of a shadow light from all around
+// fills in: half of it over this many blocks or so.
+const CLOUD_SHADOW_FILL = 1000.0;
+// Cloud shadows fade out from this far away to that, in the haze.
 const CLOUD_SHADOW_FADE = vec2<f32>(250.0, 900.0);
-// And as the light has come this far from the clouds to that: the farther
-// it goes under them, the more sky light and haze fill their shadows in.
-const CLOUD_SHADOW_REACH = vec2<f32>(300.0, 1200.0);
-// How wide the soft edge of a cloud's shadow is, per block the light has
-// come from the cloud: the sun is no point, and clouds scatter light
-// onwards around their edges.
-const CLOUD_SHADOW_SPREAD = 0.02;
-// Texels along a side of `cloud_shadows`, and its levels, as in
-// `world_pass.rs`.
-const CLOUD_SHADOW_SIZE = 512.0;
-const CLOUD_SHADOW_LEVELS = 6.0;
-// Light scattered many times inside a thick cloud, beyond what the few
-// octaves of `cloud_lighting` account for: sunlit cloud is brilliant white.
-const CLOUD_BRIGHTNESS = 1.6;
-// How far clouds are pushed aside by an obstacle per block it rises over a
-// block of ground.
-const PARTING = 3.0;
-// Rays through the clouds stop this far away.
-const CLOUD_REACH = 4000.0;
-// Clouds are marched at this fraction of the screen's width and height, as
-// in `world_pass.rs`.
-const CLOUD_SCALE = 4;
 
 fn camera_height() -> f32 {
     return f32(globals.camera_block.y) + globals.camera_fract.y;
@@ -912,439 +1146,101 @@ fn camera_height() -> f32 {
 // How high obstacles near `xz` (relative to the camera) reach, as clouds
 // keep clear of them.
 fn obstacle_top(xz: vec2<f32>) -> f32 {
-    let uv = (xz - globals.cloud_place.yz) / OBSTACLE_SPAN;
+    let uv = (xz - globals.cloud_place.zw) / OBSTACLE_SPAN;
     let inside = all(uv > vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0));
     let height = textureSampleLevel(cloud_obstacles, smooth_sampler, uv, 0.0).r * 255.0;
     return obstacle_base() + select(0.0, height, inside);
 }
 
-// How much cloud the sky holds over `xz`, from 0 at the edge of a patch to
-// 1 deep inside it. With `part`, near an obstacle, the cloud there is the one
-// that would have been closer to it: patches part around obstacles.
-fn cloud_cover(xz: vec2<f32>, top: f32, part: bool) -> f32 {
-    var push = vec2<f32>(0.0);
-    if part && top > cloud_bottom() - 24.0 {
-        let e = 4.0;
-        let slope = vec2<f32>(
-            obstacle_top(xz + vec2<f32>(e, 0.0)) - obstacle_top(xz - vec2<f32>(e, 0.0)),
-            obstacle_top(xz + vec2<f32>(0.0, e)) - obstacle_top(xz - vec2<f32>(0.0, e)),
-        ) / (2.0 * e);
-        push = slope * PARTING;
-    }
-    let uv = globals.cloud_offset.xy + (xz + push) / PATCH_PERIOD;
-    let spot = textureSampleLevel(cloud_patches, wrap_sampler, uv, 0.0).r;
-    // Patches thicken towards their middles; under an overcast sky, they
-    // are thick almost everywhere.
-    let cover = globals.clouds.x;
-    return saturate((spot - (1.0 - cover)) / (0.05 + 0.25 * (1.0 - cover)));
+// Whether `cell` of the layer holds cloud. Cells are counted over the air
+// the wind carries.
+fn cloud_cell(cell: vec2<i32>) -> bool {
+    let texel = (cell % CELL_MAP_SIZE + CELL_MAP_SIZE) % CELL_MAP_SIZE;
+    return textureLoad(cloud_cells, texel, 0).r > 0.5;
 }
 
-// The puff noise at `position` (relative to the camera), at `scale` times
-// the size of `cloud_detail`; it moves with the wind.
-fn puffs(position: vec3<f32>, scale: f32) -> f32 {
-    let at = vec3<f32>(globals.cloud_offset.z, globals.cloud_place.x, globals.cloud_offset.w)
-        * (1.0 / scale) + position / (DETAIL_PERIOD * scale);
-    return textureSampleLevel(cloud_detail, wrap_sampler, at, 0.0).r;
-}
-
-// How dense the cloud is at `position` (relative to the camera), from 0 to
-// 1. `detail`, from 0 to 1, is how much its edges are worn into small puffs:
-// none far away, where they would only flicker. Without `part`, a little
-// cheaper: patches don't part around obstacles, only thin out near them,
-// which is enough for shadows.
-fn cloud_density(position: vec3<f32>, detail: f32, part: bool) -> f32 {
-    let y = position.y + camera_height();
-    let h = (y - cloud_bottom()) / (cloud_top() - cloud_bottom());
-    if h <= 0.0 || h >= 1.0 {
-        return 0.0;
+// How much of a box `size` blocks across around `xz` (relative to the camera)
+// is cloud, from 0 to 1. The box slides over cell edges smoothly, so this
+// moves smoothly with the clouds.
+//
+// Filtering the cell map between texels does it in one sample: across a
+// cell, the sample stays on the cell's texel but within half the box of its
+// sides, where it moves on to the next linearly, as the box sliding over the
+// edge would. The box can be no wider than a cell.
+//
+// Wider than a cell, by `level` halvings, the smaller levels of the map
+// blur it instead.
+fn cloud_cover(xz: vec2<f32>, size: vec2<f32>, level: f32) -> f32 {
+    if level > 0.0 {
+        let uv = (globals.cloud_place.xy + xz) / CLOUD_CELL / f32(CELL_MAP_SIZE);
+        return textureSampleLevel(cloud_cells, wrap_sampler, uv, level).r;
     }
-    let top = obstacle_top(position.xz);
-    let cover = cloud_cover(position.xz, top, part);
-    if cover <= 0.0 {
-        return 0.0;
-    }
-    // Flat bottoms and round tops; the deeper into a patch, the taller.
-    let height = 0.3 + 0.7 * cover;
-    let profile = smoothstep(0.0, 0.07, h) * (1.0 - smoothstep(height * 0.35, height, h));
-    // Big billows carve the shape out of that.
-    let billows = puffs(position, 3.0);
-    var density = saturate(cover * profile * 1.8 - (1.0 - billows) * 0.9);
-    // Nothing near the top of an obstacle; its sides are kept clear by the
-    // widened obstacle map.
-    density *= smoothstep(top + 1.0, top + 8.0, y);
-    if detail > 0.0 && density > 0.0 && density < 0.6 {
-        // Small puffs wear the thin edges away.
-        let wear = (1.0 - puffs(position, 1.0)) * 0.3 * detail;
-        density = saturate((density - wear) / (1.0 - wear));
-    }
-    return density;
-}
-
-// Whether the clouds are blocky rather than soft.
-fn blocky_clouds() -> bool {
-    return globals.cloud_shadow.w > 0.5;
-}
-
-// The bottom of the clouds that cast shadows.
-fn shadow_bottom() -> f32 {
-    return select(cloud_bottom(), globals.blocky.z, blocky_clouds());
+    let at = (globals.cloud_place.xy + xz) / CLOUD_CELL - 0.5;
+    let first = floor(at);
+    let f = clamp((at - first - 0.5) * (CLOUD_CELL / size) + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+    let uv = (first + 0.5 + f) / f32(CELL_MAP_SIZE);
+    return textureSampleLevel(cloud_cells, wrap_sampler, uv, 0.0).r;
 }
 
 // How much of the light gets through the clouds to `position`, `distance`
-// from the eye, on its way along `toward`.
+// from the eye, on its way along `toward`. The light dims with how much
+// cloud it crosses (Beer's law), and some of what the cloud scatters onwards
+// still arrives. The farther below the cloud, the softer the shadow's
+// edges, as the sun's disc and the scattered light make them, and the more
+// light from all around fills it in. Worked out for each point from the
+// cells of cloud the light crosses, so shadows move exactly as the clouds
+// do.
 fn cloud_shadow(position: vec3<f32>, toward: vec3<f32>, distance: f32) -> f32 {
-    if globals.clouds.y == 0.0 || toward.y < 0.02 {
+    let height = position.y + camera_height();
+    let density = globals.clouds.y;
+    if density == 0.0 || toward.y < 0.02 || height >= cloud_top() {
         return 1.0;
     }
-    // Where the light on its way here enters the bottom of the clouds, and
-    // how far it has come from there.
-    let rise = max(shadow_bottom() - camera_height() - position.y, 0.0);
-    let path = rise / toward.y;
-    let entry = position.xz + toward.xz * path;
-    let uv = (entry - globals.cloud_shadow.xy) / globals.cloud_shadow.z;
-    // The farther from the clouds, the blurrier their shadow: a level of the
-    // map whose texels are about as wide as its soft edge.
-    let texel = globals.cloud_shadow.z / CLOUD_SHADOW_SIZE;
-    let level = min(
-        log2(max(path * CLOUD_SHADOW_SPREAD / texel, 1.0)),
-        CLOUD_SHADOW_LEVELS - 1.0,
-    );
-    let through = textureSampleLevel(cloud_shadows, smooth_sampler, uv, level).r;
-    // Clouds let some light through, scattered. Far away, the haze and the
-    // light the clouds themselves scatter wash their shadows out; so does a
-    // long way under the clouds, as when the sun is low; and low light
-    // reaches under them from the side. Nothing is known past the map's
-    // edge.
-    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-    let strength = CLOUD_SHADOW
-        * (1.0 - smoothstep(CLOUD_SHADOW_FADE.x, CLOUD_SHADOW_FADE.y, distance))
-        * (1.0 - smoothstep(CLOUD_SHADOW_REACH.x, CLOUD_SHADOW_REACH.y, path))
-        * smoothstep(0.0, 0.02, edge)
-        * smoothstep(0.02, 0.15, toward.y);
-    return 1.0 - (1.0 - through) * strength;
-}
-
-// The cloud shadow map: for each place in it, how much light gets through
-// the clouds along the light, from where it enters their bottom.
-@fragment
-fn cloud_shadow_fragment(in: SkyVertex) -> @location(0) vec4<f32> {
-    let uv = vec2<f32>(in.screen.x * 0.5 + 0.5, 0.5 - in.screen.y * 0.5);
-    let entry = globals.cloud_shadow.xy + uv * globals.cloud_shadow.z;
-    let toward = globals.light.xyz;
-    if blocky_clouds() {
-        return vec4<f32>(blocky_shadow(entry, toward));
+    // Far away the haze washes cloud shadows out; with the sun low, light
+    // reaches under the clouds from the side.
+    let fade = (1.0 - smoothstep(CLOUD_SHADOW_FADE.x, CLOUD_SHADOW_FADE.y, distance))
+        * smoothstep(0.02, 0.1, toward.y);
+    if fade <= 0.0 {
+        return 1.0;
     }
-    let length = (cloud_top() - cloud_bottom()) / max(toward.y, 0.05);
-    let bottom = vec3<f32>(entry.x, cloud_bottom() - camera_height(), entry.y);
-    var density = 0.0;
-    for (var i = 0; i < 4; i++) {
-        density += cloud_density(bottom + toward * (length * (f32(i) + 0.5) / 4.0), 0.0, false);
-    }
-    return vec4<f32>(exp(-density * length / 4.0 * CLOUD_DENSITY));
-}
-
-// A texel of the next level of the cloud shadow map: the average of the
-// 2×2 under it in the level before.
-@fragment
-fn cloud_shadow_halve_fragment(in: SkyVertex) -> @location(0) vec4<f32> {
-    let corner = vec2<i32>(in.clip.xy) * 2;
-    var sum = 0.0;
-    for (var i = 0; i < 4; i++) {
-        sum += textureLoad(cloud_shadow_level, corner + vec2<i32>(i & 1, i >> 1u), 0).r;
-    }
-    return vec4<f32>(sum / 4.0);
-}
-
-// How much light gets through the blocky clouds from where it enters the
-// bottom of their layer at `entry` (x and z relative to the camera), on its
-// way along `toward`: none where it crosses a cloud.
-fn blocky_shadow(entry: vec2<f32>, toward: vec3<f32>) -> f32 {
-    let across = toward.xz * (globals.blocky.w / max(toward.y, 0.05));
+    // Where the light on its way here comes into the layer of clouds, how
+    // far it goes through it, and how far that is across.
+    let start = max(cloud_bottom(), height);
+    let entry = position.xz + toward.xz * ((start - height) / toward.y);
+    let way = (cloud_top() - start) / toward.y;
+    let across = toward.xz * way;
+    // How soft the shadow's edges are, from how far below the middle of the
+    // layer.
+    let below = max(0.5 * (cloud_bottom() + cloud_top()) - height, 0.0) / toward.y;
+    let soft = CLOUD_SHADOW_SOFT + (SUN_WIDTH + CLOUD_SHADOW_SPREAD) * below;
+    let level = log2(max(soft / CLOUD_CELL, 1.0));
+    // How much of the way is in cloud: boxes along it, each reaching the
+    // next, so together they cover it all.
+    let steps = clamp(ceil(max(abs(across.x), abs(across.y)) / CLOUD_CELL), 1.0, 8.0);
+    let size = clamp(max(vec2<f32>(soft), abs(across) / steps), vec2<f32>(0.5), vec2<f32>(CLOUD_CELL));
     var cloud = 0.0;
-    for (var i = 0; i < 4; i++) {
-        let along = (f32(i) + 0.5) / 4.0;
-        let xz = entry + across * along;
-        let cell = vec2<i32>(floor((globals.blocky.xy + xz) / BLOCKY_CELL));
-        if blocky_cell(cell) {
-            // Thinning out near the tops of obstacles, as the clouds do.
-            let obstacle = obstacle_top(xz);
-            let y = globals.blocky.z + globals.blocky.w * along;
-            cloud += smoothstep(obstacle + 1.0, obstacle + 8.0, y);
+    for (var i = 0; i < 8; i++) {
+        if f32(i) >= steps {
+            break;
         }
+        cloud += cloud_cover(entry + across * ((f32(i) + 0.5) / steps), size, level);
     }
-    return 1.0 - cloud / 4.0;
-}
-
-// Henyey-Greenstein's phase function: how much light scatters by an angle.
-fn henyey_greenstein(cos_theta: f32, g: f32) -> f32 {
-    let g2 = g * g;
-    return (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5));
-}
-
-// Clouds scatter light mostly onwards, which lights their edges against the
-// sun, and a little back. `spread` below 1 evens it out, for light that has
-// scattered many times.
-fn cloud_phase(cos_theta: f32, spread: f32) -> f32 {
-    return mix(
-        henyey_greenstein(cos_theta, -0.2 * spread),
-        henyey_greenstein(cos_theta, 0.75 * spread),
-        0.7,
-    );
-}
-
-// Light reaching a point in a cloud: from the clouds' light, dimmed by the
-// cloud on its way (`depth`), scattered towards the eye, as if scattered a
-// few times (after Wrenninge's approximation); and from the sky, more at the
-// top of the layer than at the bottom.
-fn cloud_lighting(depth: f32, cos_theta: f32, h: f32) -> vec3<f32> {
-    // Seen with the light behind the eye, the edges of a cloud are darker
-    // than its depths, where light has scattered back out ("powder").
-    let powder = mix(1.0 - exp(-depth * 2.0), 1.0, saturate(cos_theta * 0.5 + 0.5));
-    var direct = 0.0;
-    var strength = 1.0;
-    var reach = 1.0;
-    var spread = 1.0;
-    for (var octave = 0; octave < 4; octave++) {
-        direct += strength * exp(-depth * reach) * cloud_phase(cos_theta, spread);
-        strength *= 0.7;
-        reach *= 0.35;
-        spread *= 0.5;
+    if cloud <= 0.0 {
+        return 1.0;
     }
-    let a = globals.ambient;
-    let sky = max(a[0].rgb + a[2].rgb * mix(-0.6, 1.0, h), vec3<f32>(0.0));
-    return (globals.cloud_light_color.rgb * PI * direct * powder + sky * mix(0.25, 0.6, h))
-        * CLOUD_BRIGHTNESS;
-}
-
-// How much cloud lies between `position` and the clouds' light.
-fn cloud_depth_towards_light(position: vec3<f32>) -> f32 {
-    let toward = globals.cloud_light.xyz;
-    var depth = 0.0;
-    var t = 0.0;
-    var step = 3.0;
-    for (var i = 0; i < 4; i++) {
-        depth += cloud_density(position + toward * (t + step * 0.5), 0.0, false) * step;
-        t += step;
-        step *= 2.0;
-    }
-    return depth * CLOUD_DENSITY;
-}
-
-// A different, patternless number from 0 to 1 for each pixel, so rays don't
-// step in lockstep and band.
-fn pixel_noise(pixel: vec2<f32>) -> f32 {
-    var h = vec2<u32>(pixel);
-    var n = h.x * 1597334677u ^ h.y * 3812015801u;
-    n = (n ^ (n >> 16u)) * 2246822519u;
-    n = n ^ (n >> 13u);
-    return f32(n) / 4294967296.0;
+    // Thinning out near the tops of obstacles, as the clouds do.
+    let obstacle = obstacle_top(entry + across * 0.5);
+    let clear = smoothstep(obstacle + 1.0, obstacle + 8.0, 0.5 * (start + cloud_top()));
+    let depth = CLOUD_EXTINCTION * density * clear * way * cloud / steps;
+    let through = (exp(-depth) + CLOUD_ONWARD.x * exp(-depth * CLOUD_ONWARD.y))
+        / (1.0 + CLOUD_ONWARD.x);
+    let filled = 1.0 - exp(-below / CLOUD_SHADOW_FILL);
+    return mix(1.0, mix(through, 1.0, filled), fade);
 }
 
 fn view_direction(screen: vec2<f32>) -> vec3<f32> {
     let far = globals.inverse_view_proj * vec4<f32>(screen, 1.0, 1.0);
     return normalize(far.xyz / far.w);
-}
-
-struct CloudMarch {
-    // rgb: light scattered towards the eye; a: how much of what's behind
-    // shows through.
-    @location(0) color: vec4<f32>,
-    // How far away the clouds start along the ray.
-    @location(1) distance: f32,
-}
-
-// The depth buffer of the world just drawn, at full resolution.
-@group(1) @binding(0) var scene_depth: texture_depth_2d;
-
-// Marches a ray through the clouds for each pixel of a target a quarter of
-// the screen's width and height.
-@fragment
-fn cloud_march_fragment(in: SkyVertex) -> CloudMarch {
-    // Each frame, one pixel of every 2×2 square of the clouds is marched,
-    // drawn packed together into a target half as wide and tall; the others
-    // come from earlier frames (`cloud_resolve_fragment`).
-    let size = vec2<i32>(textureDimensions(scene_depth));
-    let clouds = (size + CLOUD_SCALE - 1) / CLOUD_SCALE;
-    let turn = i32(globals.cloud_past.w);
-    var pixel = vec2<i32>(in.clip.xy);
-    if turn >= 0 {
-        pixel = pixel * 2 + vec2<i32>(turn & 1, turn >> 1);
-    }
-    let screen = (vec2<f32>(pixel) + 0.5) / vec2<f32>(clouds) * vec2<f32>(2.0, -2.0)
-        + vec2<f32>(-1.0, 1.0);
-    let direction = view_direction(screen);
-    // How far the world lets the ray go: the farthest of the corners of the
-    // pixels this one covers, so clouds reach the edges of what's in front.
-    let corner = pixel * CLOUD_SCALE;
-    var depth = 0.0;
-    for (var i = 0; i < 4; i++) {
-        let offset = vec2<i32>(i & 1, i >> 1) * (CLOUD_SCALE - 1);
-        depth = max(depth, textureLoad(scene_depth, min(corner + offset, size - 1), 0));
-    }
-    var limit = CLOUD_REACH;
-    if depth < 1.0 {
-        let point = globals.inverse_view_proj * vec4<f32>(screen, depth, 1.0);
-        limit = min(limit, length(point.xyz / point.w));
-    }
-
-    var out: CloudMarch;
-    out.color = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-    out.distance = CLOUD_REACH;
-    // Where the ray is inside the layer.
-    let bottom = cloud_bottom() - camera_height();
-    let top = cloud_top() - camera_height();
-    var start = 0.0;
-    var end = limit;
-    if abs(direction.y) > 1e-4 {
-        let a = bottom / direction.y;
-        let b = top / direction.y;
-        start = max(min(a, b), 0.0);
-        end = min(max(a, b), limit);
-    } else if bottom > 0.0 || top < 0.0 {
-        end = 0.0;
-    }
-    if end <= start {
-        return out;
-    }
-
-    // Short steps near the eye and inside clouds, longer far away, and longer
-    // still through clear air.
-    let cos_theta = dot(direction, globals.cloud_light.xyz);
-    let jitter = pixel_noise(vec2<f32>(pixel));
-    var t = start;
-    var light = vec3<f32>(0.0);
-    var through = 1.0;
-    var entry = -1.0;
-    var clear = 0.0;
-    var towards_light = 0.0;
-    // Never shorter than a sixtieth of the way through the layer.
-    let shortest = max((end - start) / 60.0, 1.0);
-    for (var i = 0; i < 64; i++) {
-        var dt = clamp(t * 0.012, shortest, 32.0) * (1.0 + clear);
-        if entry >= 0.0 && clear == 0.0 {
-            dt = clamp(t * 0.008, shortest, 16.0);
-        }
-        let position = direction * (t + dt * jitter);
-        let density = cloud_density(position, 1.0 - smoothstep(100.0, 400.0, t), true);
-        if density > 0.001 {
-            if entry < 0.0 {
-                entry = t;
-            }
-            let h = (position.y - bottom) / (top - bottom);
-            // Deep in, little of the light gets out to the eye: the last
-            // way to the light will do.
-            if through > 0.25 {
-                towards_light = cloud_depth_towards_light(position);
-            }
-            let lit = cloud_lighting(towards_light, cos_theta, h);
-            let step_through = exp(-density * CLOUD_DENSITY * dt);
-            light += through * lit * (1.0 - step_through);
-            through *= step_through;
-            if through < 0.01 {
-                break;
-            }
-            clear = 0.0;
-        } else {
-            clear = min(clear + 1.0, 3.0);
-        }
-        t += dt;
-        if t >= end {
-            break;
-        }
-    }
-    if entry < 0.0 {
-        return out;
-    }
-    // Far clouds sink into the haze. They go on past the edge of the
-    // world, out to the horizon.
-    let hidden = haze(direction * entry, entry);
-    light = mix(light, (1.0 - through) * sky_radiance(direction), hidden);
-    out.color = vec4<f32>(light, through);
-    out.distance = entry;
-    return out;
-}
-
-// The clouds marched this frame, for some pixels, and the clouds as they
-// were last frame, for all of them.
-@group(1) @binding(3) var fresh_color: texture_2d<f32>;
-@group(1) @binding(4) var fresh_distance: texture_2d<f32>;
-@group(1) @binding(5) var past_color: texture_2d<f32>;
-@group(1) @binding(6) var past_distance: texture_2d<f32>;
-
-// The clouds for every pixel: marched this frame where they were, and
-// elsewhere where they were last frame, moved along with the camera and the
-// wind. Where that is off the screen, the pixel marched nearby will do.
-@fragment
-fn cloud_resolve_fragment(in: SkyVertex) -> CloudMarch {
-    let pixel = vec2<i32>(in.clip.xy);
-    let turn = globals.cloud_past.w;
-    var out: CloudMarch;
-    if turn < 0.0 {
-        out.color = textureLoad(fresh_color, pixel, 0);
-        out.distance = textureLoad(fresh_distance, pixel, 0).r;
-        return out;
-    }
-    // The pixel of this 2×2 square marched this frame, and where it was
-    // drawn: packed together at the start of the target.
-    let size = vec2<i32>(textureDimensions(fresh_color));
-    let marched = (pixel / 2) * 2 + vec2<i32>(i32(turn) & 1, i32(turn) >> 1);
-    let packed = min(pixel / 2, (size + 1) / 2 - 1);
-    out.color = textureLoad(fresh_color, packed, 0);
-    out.distance = textureLoad(fresh_distance, packed, 0).r;
-    if all(pixel == marched) {
-        return out;
-    }
-    let point = view_direction(in.screen) * out.distance + globals.cloud_past.xyz;
-    let clip = globals.cloud_past_view_proj * vec4<f32>(point, 1.0);
-    let uv = vec2<f32>(clip.x, -clip.y) / clip.w * 0.5 + 0.5;
-    if clip.w > 0.0 && all(uv > vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) {
-        out.color = textureSampleLevel(past_color, smooth_sampler, uv, 0.0);
-        let texel = clamp(vec2<i32>(uv * vec2<f32>(size)), vec2<i32>(0), size - 1);
-        out.distance = textureLoad(past_distance, texel, 0).r;
-    }
-    return out;
-}
-
-// The clouds for every pixel, at a quarter of the size.
-@group(1) @binding(1) var cloud_color: texture_2d<f32>;
-@group(1) @binding(2) var cloud_distance: texture_2d<f32>;
-
-struct CloudComposite {
-    @location(0) color: vec4<f32>,
-    // Where the clouds start, so the world in front of them hides them.
-    @builtin(frag_depth) depth: f32,
-}
-
-// Lays the marched clouds over the world: the target keeps `a` of what it
-// had, and gets `rgb` added.
-@fragment
-fn cloud_composite_fragment(in: SkyVertex) -> CloudComposite {
-    let size = vec2<f32>(textureDimensions(cloud_color));
-    let uv = in.clip.xy / globals.screen.xy;
-    let middle = textureSampleLevel(cloud_color, smooth_sampler, uv, 0.0);
-    // The nearest of the four texels around: where clouds are in front of
-    // the world, they show over it, up to the edges.
-    let corner = vec2<i32>(uv * size - 0.5);
-    var distance = CLOUD_REACH;
-    for (var i = 0; i < 4; i++) {
-        let texel = clamp(corner + vec2<i32>(i & 1, i >> 1), vec2<i32>(0), vec2<i32>(size) - 1);
-        distance = min(distance, textureLoad(cloud_distance, texel, 0).r);
-    }
-    let point = view_direction(in.screen) * distance;
-    let clip = globals.view_proj * vec4<f32>(point, 1.0);
-
-    var out: CloudComposite;
-    out.depth = clamp(clip.z / clip.w, 0.0, 1.0);
-    // Four more filtered taps around it smooth the grain of the marching.
-    let spread = 1.0 / size;
-    let around = textureSampleLevel(cloud_color, smooth_sampler, uv + vec2<f32>(spread.x, spread.y * 0.5), 0.0)
-        + textureSampleLevel(cloud_color, smooth_sampler, uv - vec2<f32>(spread.x, spread.y * 0.5), 0.0)
-        + textureSampleLevel(cloud_color, smooth_sampler, uv + vec2<f32>(-spread.x * 0.5, spread.y), 0.0)
-        + textureSampleLevel(cloud_color, smooth_sampler, uv + vec2<f32>(spread.x * 0.5, -spread.y), 0.0);
-    let marched = (middle + around) / 5.0;
-    let cover = 1.0 - marched.a;
-    out.color = vec4<f32>(finish(marched.rgb / max(cover, 1e-4)) * cover, marched.a);
-    return out;
 }
 
 // Clouds drawn over the screen, and how far away they are.
@@ -1354,22 +1250,13 @@ struct ScreenClouds {
     @builtin(frag_depth) depth: f32,
 }
 
-// Whether a cell of blocky clouds holds a cloud: where its middle lies in a
-// patch of cloud, the same patches the soft clouds are made of.
-fn blocky_cell(cell: vec2<i32>) -> bool {
-    let middle = (vec2<f32>(cell) + 0.5) * BLOCKY_CELL;
-    let spot = textureSampleLevel(cloud_patches, wrap_sampler, middle / PATCH_PERIOD, 0.0).r;
-    return spot > 1.0 - globals.clouds.x;
-}
-
-// Blocky clouds, as in classic block games: cells of `BLOCKY_CELL` blocks in
-// a thin layer. Drawn over the screen, each pixel walks its ray across the
+// The clouds, drawn over the screen: each pixel walks its ray across the
 // cells of the layer until it meets a cloud.
 @fragment
-fn blocky_cloud_fragment(in: SkyVertex) -> ScreenClouds {
+fn cloud_fragment(in: SkyVertex) -> ScreenClouds {
     let direction = view_direction(in.screen);
-    let bottom = globals.blocky.z - camera_height();
-    let top = bottom + globals.blocky.w;
+    let bottom = cloud_bottom() - camera_height();
+    let top = cloud_top() - camera_height();
     let reach = max(globals.fog.y, 512.0);
     var start = 0.0;
     var end = reach;
@@ -1387,12 +1274,12 @@ fn blocky_cloud_fragment(in: SkyVertex) -> ScreenClouds {
 
     // Walk across the cells, along x and z.
     let flat = direction.xz;
-    let begin = globals.blocky.xy + flat * start;
-    var cell = vec2<i32>(floor(begin / BLOCKY_CELL));
+    let begin = globals.cloud_place.xy + flat * start;
+    var cell = vec2<i32>(floor(begin / CLOUD_CELL));
     let step = vec2<i32>(select(vec2<f32>(-1.0), vec2<f32>(1.0), flat >= vec2<f32>(0.0)));
-    let across = BLOCKY_CELL / max(abs(flat), vec2<f32>(1e-6));
+    let across = CLOUD_CELL / max(abs(flat), vec2<f32>(1e-6));
     let first_edge = (vec2<f32>(cell) + select(vec2<f32>(0.0), vec2<f32>(1.0), flat >= vec2<f32>(0.0)))
-        * BLOCKY_CELL;
+        * CLOUD_CELL;
     var next = start + (first_edge - begin) / select(flat, vec2<f32>(1e-6), abs(flat) < vec2<f32>(1e-6));
     next = select(next, vec2<f32>(1e9), abs(flat) < vec2<f32>(1e-6));
     var t = start;
@@ -1400,7 +1287,7 @@ fn blocky_cloud_fragment(in: SkyVertex) -> ScreenClouds {
     var side = 0;
     var hit = false;
     for (var i = 0; i < 160; i++) {
-        if blocky_cell(cell) {
+        if cloud_cell(cell) {
             hit = true;
             break;
         }
@@ -1431,6 +1318,29 @@ fn blocky_cloud_fragment(in: SkyVertex) -> ScreenClouds {
         // Inside a cloud.
         normal = -direction;
     }
+    // How much cloud the eye looks through: on through the layer, cell by
+    // cell, until little shows through.
+    var inside = 0.0;
+    var at = t;
+    var walk = cell;
+    var edge = next;
+    for (var i = 0; i < 64; i++) {
+        let leave = min(min(edge.x, edge.y), end);
+        if cloud_cell(walk) {
+            inside += leave - at;
+        }
+        if leave >= end || inside * CLOUD_EXTINCTION * globals.clouds.y > 5.0 {
+            break;
+        }
+        at = leave;
+        if edge.x < edge.y {
+            edge.x += across.x;
+            walk.x += step.x;
+        } else {
+            edge.y += across.y;
+            walk.y += step.y;
+        }
+    }
     let position = direction * max(t, 0.05);
     // Never inside buildings and mountains: thinning out near their tops.
     let obstacle = obstacle_top(position.xz);
@@ -1439,20 +1349,30 @@ fn blocky_cloud_fragment(in: SkyVertex) -> ScreenClouds {
     if fade <= 0.0 {
         discard;
     }
+    // Denser clouds are greyer and let less of the sky through; at density
+    // 1, as in classic block games.
+    let density = globals.clouds.y;
+    let grey = 1.0 / (1.0 + 0.4 * max(density - 1.0, 0.0));
     var color: vec3<f32>;
     if classic() {
         // Lit from above, darker underneath.
         var shade = select(0.86, 1.0, normal.y > 0.5);
         shade = select(shade, 0.7, normal.y < -0.5);
         let fog = smoothstep(globals.fog.x, globals.fog.y, t);
-        color = output(mix(globals.classic[5].rgb * shade, globals.classic[3].rgb, fog));
+        color = output(mix(globals.classic[5].rgb * shade * grey, globals.classic[3].rgb, fog));
     } else {
         let facing = dot(normal, globals.cloud_light.xyz) * 0.75 + 0.25;
         let lit = globals.cloud_light_color.rgb * max(facing, 0.0) + sky_light(normal);
-        color = finish(mix(CLOUD_ALBEDO * lit, sky_radiance(direction), haze(position, t)));
+        color = finish(mix(CLOUD_ALBEDO * grey * lit, sky_radiance(direction), haze(position, t)));
+    }
+    // As much of what's behind shows through as of the sun's light gets
+    // through the same cloud; in classic light, as in classic block games.
+    var cover = 1.0 - exp(-CLOUD_EXTINCTION * density * inside);
+    if classic() {
+        cover = 1.0 - pow(0.2, density);
     }
     var out: ScreenClouds;
-    out.color = vec4<f32>(color, 0.8 * fade);
+    out.color = vec4<f32>(color, cover * fade);
     let clip = globals.view_proj * vec4<f32>(position, 1.0);
     out.depth = clamp(clip.z / clip.w, 0.0, 1.0);
     return out;

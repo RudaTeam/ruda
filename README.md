@@ -38,8 +38,8 @@ cargo run -p ruda-server   # dedicated server (a stub until network play lands)
 
 The game opens on the main menu. Settings has the view distance, how far
 simplified far terrain reaches beyond it, field of view, view bobbing, vertical sync,
-fullscreen, clouds, sun shadows (off by default: they cost a
-second drawing of the world), graphics API, language (English or
+fullscreen, clouds, sun shadows (off by default; standard ones cost a
+second drawing of the world, ray-traced ones a ray per point near the camera), graphics API, language (English or
 Russian; the system language by default) and auto-jump. They are saved to `settings.toml`
 in `~/.config/ruda` on Linux, `~/Library/Application Support/Ruda` on macOS
 and `%APPDATA%\Ruda` on Windows.
@@ -78,7 +78,7 @@ The client takes a few options:
   `--screenshot <PATH>` saves the last one. CI uses them as a smoke test.
 - `--benchmark <SECONDS>` starts a world, waits until it has loaded, then
   measures frame times for that long and prints them. Add `--no-vsync` to
-  draw as fast as possible, `--shadows` to turn sun shadows on, `--no-clouds`
+  draw as fast as possible, `--shadows off|standard|rays` to choose sun shadows, `--no-clouds`
   to turn clouds off, and `--seed` and `--camera` to measure the same view
   every time.
 

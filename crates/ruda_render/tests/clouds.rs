@@ -1,5 +1,5 @@
 //! Clouds over flat grass: they shade the ground, and they part around a
-//! tower that reaches up through them, drawn either way.
+//! tower that reaches up through them.
 //!
 //! Needs a GPU; without one the test only says so and passes. With
 //! `RUDA_TEST_IMAGES` set to a directory, the pictures are saved there.
@@ -7,8 +7,7 @@
 use glam::{DVec2, DVec3, Vec3};
 use ruda_core::{BlockId, BlockPos, ChunkPos, ContentBuilder, Light, WorldBounds};
 use ruda_render::{
-    Backdrop, Camera, CloudQuality, CloudSky, PaddedChunk, Renderer, Scene, cloud_obstacles,
-    mesh_chunk,
+    Backdrop, Camera, CloudSky, PaddedChunk, Renderer, Scene, cloud_obstacles, mesh_chunk,
 };
 use ruda_world::light::LightEngine;
 use ruda_world::{Chunk, World};
@@ -19,6 +18,7 @@ const HEIGHT: u32 = 360;
 const SKY: CloudSky = CloudSky {
     seed: 1,
     cover: 1.0,
+    density: 1.0,
     drift: DVec2::ZERO,
 };
 
@@ -38,7 +38,7 @@ fn clouds_shade_the_ground_and_part_around_a_tower() {
     let (stone, grass) = (block("stone"), block("grass"));
 
     // Grass with its top at y = 0, and a 3×3 tower from there to the top of
-    // the world, through the clouds at 204 to 244.
+    // the world, through the clouds at 221 to 227.
     let bounds = WorldBounds {
         min_y: -32,
         max_y: 255,
@@ -106,60 +106,52 @@ fn clouds_shade_the_ground_and_part_around_a_tower() {
     let brightness = |rgb: [f32; 3]| rgb.iter().sum::<f32>() / 3.0;
     let difference = |a: [f32; 3], b: [f32; 3]| (0..3).map(|i| (a[i] - b[i]).abs()).sum::<f32>();
 
-    for quality in [CloudQuality::Volumetric, CloudQuality::Blocky] {
-        let name = |what: &str| format!("clouds-{what}-{quality:?}.png").to_lowercase();
-        renderer.set_cloud_quality(quality);
-        for &pos in &positions {
-            renderer.set_cloud_obstacles(pos, None);
-        }
-        // Changed obstacles are taken into account after a moment.
-        std::thread::sleep(std::time::Duration::from_millis(600));
+    let name = |what: &str| format!("clouds-{what}.png");
 
-        // Under the clouds, looking down at the grass away from the tower.
-        let mut below = Camera::new(DVec3::new(-30.0, 30.0, -30.0));
-        below.rotate(0.0, -1.5);
-        let ground = Vec3::new(-30.0, 0.0, -35.0);
-        let clear = pixel(&mut renderer, &scene(below, None), ground, &name("none"));
-        let shaded = pixel(
-            &mut renderer,
-            &scene(below, Some(SKY)),
-            ground,
-            &name("shade"),
-        );
-        assert!(
-            brightness(shaded) < brightness(clear) * 0.85,
-            "{quality:?}: clouds darken the ground: {shaded:?} against {clear:?}"
-        );
+    // Under the clouds, looking down at the grass away from the tower.
+    let mut below = Camera::new(DVec3::new(-30.0, 30.0, -30.0));
+    below.rotate(0.0, -1.5);
+    let ground = Vec3::new(-30.0, 0.0, -35.0);
+    let clear = pixel(&mut renderer, &scene(below, None), ground, &name("none"));
+    let shaded = pixel(
+        &mut renderer,
+        &scene(below, Some(SKY)),
+        ground,
+        &name("shade"),
+    );
+    assert!(
+        brightness(shaded) < brightness(clear) * 0.85,
+        "clouds darken the ground: {shaded:?} against {clear:?}"
+    );
 
-        // Above the clouds, looking down beside the tower, and far from it.
-        let looking_down = |x, z| {
-            let mut camera = Camera::new(DVec3::new(x, 262.0, z));
-            camera.rotate(0.0, -1.5);
-            scene(camera, Some(SKY))
-        };
-        let (above, above_far) = (looking_down(12.0, 12.0), looking_down(64.0, 12.0));
-        let beside = Vec3::new(10.0, 0.0, 10.0);
-        let far = Vec3::new(64.0, 0.0, 10.0);
-        let unparted = pixel(&mut renderer, &above, beside, &name("unparted"));
-        let unparted_far = pixel(&mut renderer, &above_far, far, &name("unparted-far"));
-        for &pos in &positions {
-            let chunk = world.chunk(pos).unwrap();
-            let tops = cloud_obstacles(pos, chunk, |block| content.blocks().is_solid(block));
-            renderer.set_cloud_obstacles(pos, tops);
-        }
-        // Changed obstacles are taken into account after a moment.
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        let parted = pixel(&mut renderer, &above, beside, &name("parted"));
-        let parted_far = pixel(&mut renderer, &above_far, far, &name("parted-far"));
-        assert!(
-            difference(parted, unparted) > 60.0,
-            "{quality:?}: clouds part beside the tower: {parted:?} against {unparted:?}"
-        );
-        assert!(
-            difference(parted_far, unparted_far) < 30.0,
-            "{quality:?}: and stay away from it: {parted_far:?} against {unparted_far:?}"
-        );
+    // Above the clouds, looking down beside the tower, and far from it.
+    let looking_down = |x, z| {
+        let mut camera = Camera::new(DVec3::new(x, 262.0, z));
+        camera.rotate(0.0, -1.5);
+        scene(camera, Some(SKY))
+    };
+    let (above, above_far) = (looking_down(12.0, 12.0), looking_down(64.0, 12.0));
+    let beside = Vec3::new(10.0, 0.0, 10.0);
+    let far = Vec3::new(64.0, 0.0, 10.0);
+    let unparted = pixel(&mut renderer, &above, beside, &name("unparted"));
+    let unparted_far = pixel(&mut renderer, &above_far, far, &name("unparted-far"));
+    for &pos in &positions {
+        let chunk = world.chunk(pos).unwrap();
+        let tops = cloud_obstacles(pos, chunk, |block| content.blocks().is_solid(block));
+        renderer.set_cloud_obstacles(pos, tops);
     }
+    // Changed obstacles are taken into account after a moment.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let parted = pixel(&mut renderer, &above, beside, &name("parted"));
+    let parted_far = pixel(&mut renderer, &above_far, far, &name("parted-far"));
+    assert!(
+        difference(parted, unparted) > 60.0,
+        "clouds part beside the tower: {parted:?} against {unparted:?}"
+    );
+    assert!(
+        difference(parted_far, unparted_far) < 30.0,
+        "and stay away from it: {parted_far:?} against {unparted_far:?}"
+    );
 }
 
 fn save(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) {

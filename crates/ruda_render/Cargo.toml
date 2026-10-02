@@ -22,7 +22,7 @@ wgpu.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-naga = { version = "30.0.0", features = ["wgsl-in"] }
+naga = { version = "30.0.0", features = ["wgsl-in", "glsl-out"] }
 pollster.workspace = true
 ruda_base.workspace = true
 

@@ -31,12 +31,20 @@ const TICK: f64 = 1.0 / TICK_RATE as f64;
 const MAX_TICKS_PER_UPDATE: u32 = 5;
 /// Radians of camera turn per unit of mouse movement.
 const MOUSE_SENSITIVITY: f32 = 0.0025;
-/// How much of the sky clouds cover, until weather decides it.
+/// How much of the sky clouds cover, and how dense they are, until weather
+/// decides it.
 const CLOUD_COVER: f32 = 0.35;
+const CLOUD_DENSITY: f32 = 1.0;
 /// Far-away tiles turned into geometry per frame.
 const LOD_TILES_PER_FRAME: usize = 2;
 /// See [`Game::is_loaded`].
 const LOAD_QUIET: Duration = Duration::from_secs(1);
+/// The world is shown once the chunks this many chunks around the player are
+/// there: until then, the far-away look of the world stands in for them,
+/// coarse and stretched. See [`Game::is_ready`].
+const READY_RADIUS: i32 = 2;
+/// Or after this long, whatever is missing.
+const READY_AT_MOST: Duration = Duration::from_secs(10);
 /// The farthest the integrated server streams the world, in chunks.
 pub const MAX_VIEW_DISTANCE: u8 = 32;
 
@@ -164,6 +172,7 @@ pub struct Game {
     start: Option<CameraStart>,
     /// When chunks last arrived, left or got new geometry.
     last_change: Instant,
+    started: Instant,
     /// Seconds since the last tick.
     since_tick: f64,
     /// Jump was pressed since the last tick.
@@ -234,6 +243,7 @@ impl Game {
             joined: false,
             start: config.camera,
             last_change: Instant::now(),
+            started: Instant::now(),
             since_tick: 0.0,
             jump_pressed: false,
             auto_jump: config.auto_jump,
@@ -482,11 +492,37 @@ impl Game {
             clouds: self.clouds.then(|| CloudSky {
                 seed: self.client.sky_seed(),
                 cover: CLOUD_COVER,
+                density: CLOUD_DENSITY,
                 drift: self
                     .wind
                     .drift(self.client.time().unwrap_or(0.0) / f64::from(TICK_RATE)),
             }),
         }
+    }
+
+    /// Whether the world around the player is there to be shown: the chunks
+    /// near the player have arrived and been meshed.
+    pub fn is_ready(&self) -> bool {
+        if self.started.elapsed() > READY_AT_MOST {
+            return true;
+        }
+        let Some(bounds) = self.client.bounds().filter(|_| self.joined) else {
+            return false;
+        };
+        // Within what the server sends, which is a circle of columns.
+        let radius = READY_RADIUS.min(self.view_distance as i32 / CHUNK_SIZE - 1);
+        let center = BlockPos(self.camera.position.floor().as_ivec3()).chunk();
+        let world = self.client.world();
+        (-radius..=radius).all(|y| {
+            (-radius..=radius).all(|z| {
+                (-radius..=radius).all(|x| {
+                    let pos = ChunkPos(center.0 + IVec3::new(x, y, z));
+                    x * x + z * z > radius * radius
+                        || !bounds.contains_chunk(pos)
+                        || world.chunk(pos).is_some() && !self.mesher.is_pending(pos)
+                })
+            })
+        })
     }
 
     /// Whether the world around the player has stopped loading: nothing

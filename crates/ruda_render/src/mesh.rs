@@ -400,6 +400,9 @@ pub struct ChunkMesh {
     /// How many quads face each direction, in [`Face::ALL`] order.
     pub face_counts: [u32; 6],
     pub visibility: Visibility,
+    /// Which blocks are solid cubes, for rays towards the sun: a column of
+    /// 32 bits up y for each x and z, entry `z * 32 + x`; `None` if none is.
+    pub solids: Option<Box<[u32; SIZE * SIZE]>>,
 }
 
 impl Default for ChunkMesh {
@@ -409,6 +412,7 @@ impl Default for ChunkMesh {
             models: Vec::new(),
             face_counts: [0; 6],
             visibility: Visibility::ALL,
+            solids: None,
         }
     }
 }
@@ -514,11 +518,19 @@ pub fn mesh_chunk(chunk: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
             *row = (columns[0][(y + 1) * PADDED + z + 1] >> 1) as u32;
         }
     }
+    // And as columns up y.
+    let mut solids = Box::new([0u32; SIZE * SIZE]);
+    for (z, row) in solids.chunks_mut(SIZE).enumerate() {
+        for (x, column) in row.iter_mut().enumerate() {
+            *column = (columns[1][(z + 1) * PADDED + x + 1] >> 1) as u32;
+        }
+    }
     ChunkMesh {
         quads,
         models,
         face_counts,
         visibility: Visibility::of(&solid),
+        solids: solids.iter().any(|&column| column != 0).then_some(solids),
     }
 }
 
@@ -619,6 +631,30 @@ mod tests {
             let (block, width, height, _, layer) = unpack(quad);
             assert_eq!((block, width, height, layer), ([3, 4, 5], 1, 1, 1));
         }
+    }
+
+    #[test]
+    fn solids_mark_the_cubes_in_columns() {
+        let f = fixture();
+        assert!(
+            mesh_chunk(
+                &PaddedChunk::gather(
+                    &world_with(Chunk::filled(BlockId::AIR)),
+                    ChunkPos::new(0, 0, 0)
+                )
+                .unwrap(),
+                &f.faces
+            )
+            .solids
+            .is_none()
+        );
+        let mut chunk = Chunk::filled(BlockId::AIR);
+        chunk.set(LocalPos::new(3, 4, 5), f.stone);
+        chunk.set(LocalPos::new(3, 31, 5), f.dirt);
+        let padded = PaddedChunk::gather(&world_with(chunk), ChunkPos::new(0, 0, 0)).unwrap();
+        let solids = mesh_chunk(&padded, &f.faces).solids.unwrap();
+        assert_eq!(solids[5 * 32 + 3], 1 << 4 | 1 << 31);
+        assert_eq!(solids.iter().filter(|&&column| column != 0).count(), 1);
     }
 
     #[test]

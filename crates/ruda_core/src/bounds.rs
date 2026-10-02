@@ -11,7 +11,7 @@ pub struct WorldBounds {
 
 impl WorldBounds {
     /// From −128 to +255: 384 blocks, exactly 12 chunks tall. Sea level is
-    /// at 0; mountains reach up through the clouds at about 224.
+    /// at 0; the tallest mountains rise through the clouds at 221 to 227.
     pub const DEFAULT: Self = Self {
         min_y: -128,
         max_y: 255,

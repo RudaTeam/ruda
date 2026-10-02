@@ -1,7 +1,7 @@
 use egui::{Align2, Color32, ComboBox, RichText, Slider, TextureHandle, Ui, Vec2};
 
 use crate::settings::{
-    Clouds, FIELDS_OF_VIEW, FpsLimit, GpuApi, LOD_DISTANCES, Lighting, Preset, Settings,
+    FIELDS_OF_VIEW, FpsLimit, GpuApi, LOD_DISTANCES, Lighting, Preset, Settings, Shadows,
     VIEW_DISTANCES,
 };
 use crate::{I18n, Language};
@@ -21,6 +21,8 @@ pub enum Screen {
         /// Where "Back" leads.
         from_game: bool,
     },
+    /// While the world around the player loads.
+    Loading,
 }
 
 /// Something the menu needs the game to do.
@@ -75,13 +77,17 @@ impl Menu {
             Screen::Main => self.main(ui, context),
             Screen::Paused => self.paused(ui, context),
             Screen::Settings { .. } => self.settings(ui, context, settings),
+            Screen::Loading => {
+                loading(ui, context);
+                None
+            }
         }
     }
 
     /// What Escape does: leaves the settings or resumes the game.
     pub fn back(&mut self) -> Option<MenuAction> {
         match self.screen {
-            Screen::Main => None,
+            Screen::Main | Screen::Loading => None,
             Screen::Paused => Some(MenuAction::Resume),
             Screen::Settings { from_game } => {
                 self.screen = if from_game {
@@ -295,31 +301,30 @@ impl Menu {
                                 ui.end_row();
 
                                 ui.label(t("settings-clouds"));
-                                let clouds_name = |clouds: Clouds| {
-                                    t(match clouds {
-                                        Clouds::Off => "settings-clouds-off",
-                                        Clouds::Standard => "settings-clouds-standard",
-                                        Clouds::Volumetric => "settings-clouds-volumetric",
+                                ui.checkbox(&mut graphics.clouds, "");
+                                ui.end_row();
+
+                                ui.label(t("settings-shadows"));
+                                let shadows_name = |shadows: Shadows| {
+                                    t(match shadows {
+                                        Shadows::Off => "settings-shadows-off",
+                                        Shadows::Standard => "settings-shadows-standard",
+                                        Shadows::Rays => "settings-shadows-rays",
                                     })
                                 };
-                                ComboBox::from_id_salt("clouds")
-                                    .selected_text(clouds_name(graphics.clouds))
+                                ComboBox::from_id_salt("shadows")
+                                    .selected_text(shadows_name(graphics.shadows))
                                     .width(COMBO_WIDTH)
                                     .show_ui(ui, |ui| {
-                                        for clouds in Clouds::ALL {
+                                        for shadows in Shadows::ALL {
                                             ui.selectable_value(
-                                                &mut graphics.clouds,
-                                                clouds,
-                                                clouds_name(clouds),
+                                                &mut graphics.shadows,
+                                                shadows,
+                                                shadows_name(shadows),
                                             );
                                         }
                                     })
                                     .response
-                                    .on_hover_text(t("settings-clouds-note"));
-                                ui.end_row();
-
-                                ui.label(t("settings-shadows"));
-                                ui.checkbox(&mut graphics.shadows, "")
                                     .on_hover_text(t("settings-shadows-note"));
                                 ui.end_row();
 
@@ -416,6 +421,14 @@ fn button(ui: &mut Ui, text: &str) -> egui::Response {
 }
 
 /// Lays out `contents` in a column centred on the screen.
+fn loading(ui: &mut Ui, context: MenuContext<'_>) {
+    centered(ui, "loading", |ui| {
+        ui.heading(context.i18n.get("menu-loading"));
+        ui.add_space(16.0);
+        ui.add(egui::Spinner::new().size(32.0));
+    });
+}
+
 fn centered(ui: &mut Ui, id: &str, contents: impl FnOnce(&mut Ui)) {
     egui::Area::new(egui::Id::new(id))
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])

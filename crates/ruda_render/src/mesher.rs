@@ -100,6 +100,11 @@ impl ChunkMesher {
         meshes
     }
 
+    /// Whether the chunk waits for or is being meshed.
+    pub fn is_pending(&self, pos: ChunkPos) -> bool {
+        self.dirty.contains(&pos) || self.in_flight.contains_key(&pos)
+    }
+
     /// Chunks waiting for or being meshed.
     pub fn backlog(&self) -> usize {
         self.dirty.len() + self.in_flight.len()

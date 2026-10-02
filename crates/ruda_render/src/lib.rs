@@ -12,6 +12,7 @@ mod gpu_timer;
 mod lod;
 mod mesh;
 mod mesher;
+mod rays;
 mod shadows;
 mod sky;
 mod textures;
@@ -38,7 +39,7 @@ pub use visibility::Visibility;
 
 use gpu_timer::GpuTimer;
 use world_pass::WorldPass;
-pub use world_pass::{CloudQuality, Lighting};
+pub use world_pass::{Lighting, Shadows};
 
 /// What fills the screen behind the interface.
 #[derive(Clone, Copy, Debug)]
@@ -326,23 +327,8 @@ impl Renderer {
             "GPU ready"
         );
 
-        // Volumetric clouds draw into floating-point textures.
-        let renders = |format| {
-            adapter
-                .get_texture_format_features(format)
-                .allowed_usages
-                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
-        };
-        let volumetric_clouds =
-            renders(wgpu::TextureFormat::Rgba16Float) && renders(wgpu::TextureFormat::R32Float);
         let timer = GpuTimer::new(&device, &queue);
-        let world = WorldPass::new(
-            &device,
-            &queue,
-            config.format,
-            (width, height),
-            volumetric_clouds,
-        );
+        let world = WorldPass::new(&device, &queue, config.format, (width, height));
         let ui = egui_wgpu::Renderer::new(
             &device,
             ui_format,
@@ -408,7 +394,7 @@ impl Renderer {
     }
 
     pub fn remove_chunk(&mut self, pos: ChunkPos) {
-        self.world.remove(pos);
+        self.world.remove(&self.queue, pos);
     }
 
     /// Replaces the geometry drawn for a tile of far-away terrain.
@@ -441,17 +427,6 @@ impl Renderer {
         self.world.set_lighting(lighting);
     }
 
-    /// How clouds are drawn. Volumetric clouds need a graphics card that
-    /// can draw into floating-point textures; without one, they are drawn
-    /// blocky. Returns what was chosen.
-    pub fn set_cloud_quality(&mut self, quality: CloudQuality) -> CloudQuality {
-        let chosen = self.world.set_cloud_quality(quality);
-        if chosen != quality {
-            warn!("volumetric clouds need floating-point render targets; drawing blocky clouds");
-        }
-        chosen
-    }
-
     /// Forgets every chunk, for leaving a world.
     pub fn clear_chunks(&mut self) {
         self.world.clear();
@@ -474,10 +449,11 @@ impl Renderer {
         self.surface_wait
     }
 
-    /// Turns sun shadows on or off. They draw the world once more for each
-    /// of the shadow map's two cascades, so they are for stronger GPUs.
-    pub fn set_shadows(&mut self, enabled: bool) {
-        self.world.set_shadows(&self.device, enabled);
+    /// How the sun and the moon cast shadows. Shadows draw the world once
+    /// more from the light, and rays trace a ray for every point near the
+    /// camera: both are for stronger GPUs.
+    pub fn set_shadows(&mut self, shadows: Shadows) {
+        self.world.set_shadows(&self.device, shadows);
     }
 
     /// Turns skipping chunks hidden behind solid ground and faces turned away
@@ -754,7 +730,6 @@ impl Renderer {
         let view = &target.create_view(&wgpu::TextureViewDescriptor::default());
         match backdrop {
             Backdrop::World(scene) => self.world.draw(
-                &self.device,
                 &self.queue,
                 encoder,
                 view,

@@ -15,8 +15,9 @@ pub struct WindMap {
 }
 
 impl WindMap {
-    /// A light breeze, mostly east.
-    pub const BREEZE: Self = Self::steady(DVec2::new(1.0, 0.35));
+    /// A light breeze, mostly east: clouds and their shadows drift by
+    /// slowly.
+    pub const BREEZE: Self = Self::steady(DVec2::new(0.5, 0.175));
 
     /// The same wind everywhere, always.
     pub const fn steady(velocity: DVec2) -> Self {

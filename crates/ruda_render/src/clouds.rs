@@ -1,15 +1,15 @@
-//! Clouds: soft clouds in a layer over the world, drifting with the wind,
-//! parting around mountains and buildings, lit through the air like
-//! everything else.
+//! Clouds: blocks of cloud in a thin layer over the world, as in classic
+//! block games, drifting with the wind, thinning out around mountains and
+//! buildings, lit through the air like everything else.
 //!
-//! A cloud isn't geometry. The shader works out how much cloud there is at
-//! a point (`cloud_density` in `world.wgsl`) from three textures:
-//! - patches of cloud, made from the sky's seed and slid along by the wind;
-//! - finer, puffy detail for their edges, also from the seed;
+//! A cloud isn't geometry. The shader walks each ray across the cells of the
+//! layer (`cloud_fragment` in `world.wgsl`), and reads two textures:
+//! - which cells hold cloud, made from the sky's seed and slid along by the
+//!   wind;
 //! - how high obstacles reach into the layer around the camera, so clouds
-//!   thin out and part before they touch them.
+//!   thin out before they touch them.
 //!
-//! The patches depend only on the seed, the cover and how far the wind has
+//! The cells depend only on the seed, the cover and how far the wind has
 //! carried the air, so every player sees the same clouds without the server
 //! sending them. Nothing is rebuilt as clouds move, so they can't pop in or
 //! out.
@@ -22,23 +22,22 @@ use ruda_core::{BlockId, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LocalPos};
 use ruda_world::Chunk;
 use ruda_world::lod::{LOD_CELL, LOD_TILE_CELLS, LodTile, LodTilePos};
 
-/// The bottom of the clouds: the tallest mountains rise through them.
-pub const CLOUD_BOTTOM: f32 = 204.0;
-/// The top of the tallest clouds.
-pub const CLOUD_TOP: f32 = 244.0;
-/// Blocky clouds, as in classic block games: cells of this many blocks a
-/// side, in a layer this thick, around the middle of the soft clouds.
-pub const BLOCKY_CELL: f32 = 12.0;
-pub const BLOCKY_THICKNESS: f32 = 4.0;
-pub const BLOCKY_BOTTOM: f32 = (CLOUD_BOTTOM + CLOUD_TOP - BLOCKY_THICKNESS) / 2.0;
+/// Clouds are cells of this many blocks a side, as in classic block games.
+pub const CLOUD_CELL: f32 = 12.0;
+/// The bottom and the top of the layer of clouds: the tallest mountains
+/// rise through it.
+pub const CLOUD_BOTTOM: f32 = 221.0;
+pub const CLOUD_TOP: f32 = 227.0;
 
 /// Edge length of the patch texture, in texels, and how many blocks it
 /// spans before it repeats.
-pub(crate) const PATCH_SIZE: u32 = 512;
-pub(crate) const PATCH_PERIOD: f64 = 4096.0;
-/// The same for the detail texture, in all three directions.
-pub(crate) const DETAIL_SIZE: u32 = 32;
-pub(crate) const DETAIL_PERIOD: f64 = 96.0;
+const PATCH_SIZE: usize = 512;
+const PATCH_PERIOD: f64 = 4096.0;
+/// Cells along a side of the cell map, which repeats every three periods of
+/// the patches: a whole number of cells.
+pub(crate) const CELL_MAP_SIZE: u32 = 1024;
+pub(crate) const CELL_MAP_PERIOD: f64 = PATCH_PERIOD * 3.0;
+const _: () = assert!(CELL_MAP_SIZE as f64 * CLOUD_CELL as f64 == CELL_MAP_PERIOD);
 
 /// Edge length of the obstacle map around the camera, in cells of
 /// `OBSTACLE_CELL` blocks: about 4 km across.
@@ -64,32 +63,63 @@ pub struct CloudSky {
     pub seed: u64,
     /// How much of the sky clouds cover, 0 to 1.
     pub cover: f32,
+    /// How dense the clouds are: 1 for fair-weather clouds, more for heavy
+    /// grey ones that let less light through, less for thin ones.
+    pub density: f32,
     /// How far the wind has carried the air since the world began, in
     /// blocks along x and z; see [`ruda_core::WindMap::drift`].
     pub drift: DVec2,
 }
 
-/// The patch and detail textures for a seed.
-pub(crate) struct CloudNoise {
-    /// `PATCH_SIZE`² bytes. Every value is as common as every other, so
-    /// the patches above 1 − cover cover exactly that much of the sky.
-    pub patches: Vec<u8>,
-    /// `DETAIL_SIZE`³ bytes: puffs, high in their middles.
-    pub detail: Vec<u8>,
+/// For each cell of the layer, `CELL_MAP_SIZE`² bytes, a row after another:
+/// how deep in a patch of cloud its middle lies. Every value is about as
+/// common as every other, so the cells above 1 − cover hold cloud and cover
+/// that much of the sky.
+pub(crate) fn cloud_depths(seed: u64) -> Vec<u8> {
+    let patches = patches(seed);
+    let size = CELL_MAP_SIZE as usize;
+    (0..size * size)
+        .into_par_iter()
+        .map(|i| {
+            let middle = |c: usize| (c as f64 + 0.5) * f64::from(CLOUD_CELL);
+            sample(&patches, middle(i % size), middle(i / size))
+        })
+        .collect()
 }
 
-impl CloudNoise {
-    pub(crate) fn new(seed: u64) -> Self {
-        Self {
-            patches: patches(seed),
-            detail: detail(seed ^ 0x2545_f491_4f6c_dd1d),
-        }
-    }
+/// Which cells hold cloud under `cover`, from their `depths`: 255 for those,
+/// 0 for the rest.
+pub(crate) fn cloud_cells(depths: &[u8], cover: f32) -> Vec<u8> {
+    depths
+        .par_iter()
+        .map(|&depth| {
+            if f32::from(depth) / 255.0 > 1.0 - cover {
+                255
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// The patches at a point, in blocks, filtered between their texels.
+fn sample(patches: &[u8], x: f64, z: f64) -> u8 {
+    let texel = |c: f64| c / PATCH_PERIOD * PATCH_SIZE as f64 - 0.5;
+    let (x, z) = (texel(x), texel(z));
+    let (x0, z0) = (x.floor(), z.floor());
+    let (fx, fz) = (x - x0, z - z0);
+    let at = |dx: f64, dz: f64| {
+        let wrap = |c: f64| (c as i64).rem_euclid(PATCH_SIZE as i64) as usize;
+        f64::from(patches[wrap(z0 + dz) * PATCH_SIZE + wrap(x0 + dx)])
+    };
+    let near = at(0.0, 0.0) + (at(1.0, 0.0) - at(0.0, 0.0)) * fx;
+    let far = at(0.0, 1.0) + (at(1.0, 1.0) - at(0.0, 1.0)) * fx;
+    (near + (far - near) * fz).round() as u8
 }
 
 /// Smooth, repeating noise: big patches with smaller ones on their edges.
 fn patches(seed: u64) -> Vec<u8> {
-    let size = PATCH_SIZE as usize;
+    let size = PATCH_SIZE;
     // Lattice spacing in texels (of 8 blocks; each divides the texture, so
     // it repeats seamlessly) and weight of each layer: clouds a hundred or
     // two blocks across, about as wide as the layer is tall.
@@ -142,51 +172,6 @@ fn gradient_noise(seed: u64, x: f32, z: f32, period: i32) -> f32 {
     let near = corner(0, 0) + (corner(1, 0) - corner(0, 0)) * u;
     let far = corner(0, 1) + (corner(1, 1) - corner(0, 1)) * u;
     (near + (far - near) * v) * std::f32::consts::SQRT_2
-}
-
-/// Puffy, repeating 3-D noise: one minus the distance to the nearest of
-/// scattered points (Worley noise), in three sizes.
-fn detail(seed: u64) -> Vec<u8> {
-    let size = DETAIL_SIZE as usize;
-    // Points per edge of the texture, and weight.
-    let octaves = [(4, 0.6), (8, 0.27), (16, 0.13)];
-    (0..size * size * size)
-        .into_par_iter()
-        .map(|i| {
-            let p = [i % size, i / size % size, i / (size * size)].map(|c| c as f32 / size as f32);
-            let value: f32 = octaves
-                .iter()
-                .enumerate()
-                .map(|(octave, &(cells, weight))| {
-                    let seed =
-                        seed.wrapping_add((octave as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f));
-                    weight * (1.0 - worley(seed, p, cells))
-                })
-                .sum();
-            (value.clamp(0.0, 1.0) * 255.0) as u8
-        })
-        .collect()
-}
-
-/// Distance from `p` (in the unit cube, repeating) to the nearest of one
-/// random point per cell of a `cells`³ grid, in cell widths, at most 1.
-fn worley(seed: u64, p: [f32; 3], cells: i32) -> f32 {
-    let at = p.map(|c| c * cells as f32);
-    let cell = at.map(|c| c.floor() as i32);
-    let mut nearest = f32::MAX;
-    for dz in -1..=1 {
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let c = [cell[0] + dx, cell[1] + dy, cell[2] + dz];
-                let wrapped = c.map(|c| c.rem_euclid(cells));
-                let key = (wrapped[2] * cells + wrapped[1]) * cells + wrapped[0];
-                let point = [0, 1, 2].map(|axis| c[axis] as f32 + hash(seed, key, axis as i32, 1));
-                let distance: f32 = (0..3).map(|axis| (point[axis] - at[axis]).powi(2)).sum();
-                nearest = nearest.min(distance);
-            }
-        }
-    }
-    nearest.sqrt().min(1.0)
 }
 
 /// A number from 0 to 1 for every lattice point.
@@ -403,40 +388,30 @@ mod tests {
 
     #[test]
     fn cover_sets_how_much_of_the_sky_is_cloud() {
-        let noise = CloudNoise::new(42);
+        let depths = cloud_depths(42);
         for cover in [0.2f32, 0.35, 0.6] {
-            let threshold = ((1.0 - cover) * 256.0) as u8;
-            let clouds = noise.patches.iter().filter(|&&v| v >= threshold).count();
-            let share = clouds as f32 / noise.patches.len() as f32;
-            assert!((share - cover).abs() < 0.01, "cover {cover} gives {share}");
+            let cells = cloud_cells(&depths, cover);
+            let clouds = cells.iter().filter(|&&cell| cell == 255).count();
+            let share = clouds as f32 / cells.len() as f32;
+            assert!((share - cover).abs() < 0.02, "cover {cover} gives {share}");
         }
     }
 
     #[test]
-    fn noise_depends_only_on_the_seed() {
-        let (a, b) = (CloudNoise::new(7), CloudNoise::new(7));
-        assert_eq!(a.patches, b.patches);
-        assert_eq!(a.detail, b.detail);
-        assert_ne!(a.patches, CloudNoise::new(8).patches);
-        assert_eq!(
-            a.detail.len(),
-            (DETAIL_SIZE * DETAIL_SIZE * DETAIL_SIZE) as usize
-        );
-        // Puffy: a fair spread of values.
-        let (low, high) = a
-            .detail
-            .iter()
-            .fold((255, 0), |(low, high), &v| (v.min(low), v.max(high)));
-        assert!(low < 100 && high > 180, "{low} {high}");
+    fn cells_depend_only_on_the_seed() {
+        let depths = cloud_depths(7);
+        assert_eq!(depths, cloud_depths(7));
+        assert_ne!(depths, cloud_depths(8));
+        assert_eq!(depths.len(), (CELL_MAP_SIZE * CELL_MAP_SIZE) as usize);
     }
 
     #[test]
-    fn the_patches_repeat_seamlessly() {
-        // Opposite edges of the texture continue each other about as
-        // smoothly as neighbouring rows inside it.
-        let noise = CloudNoise::new(3);
-        let size = PATCH_SIZE as usize;
-        let row = |z: usize| &noise.patches[z * size..(z + 1) * size];
+    fn the_cells_repeat_seamlessly() {
+        // Opposite edges of the map continue each other about as smoothly
+        // as neighbouring rows inside it.
+        let cells = cloud_depths(3);
+        let size = CELL_MAP_SIZE as usize;
+        let row = |z: usize| &cells[z * size..(z + 1) * size];
         let step = |a: &[u8], b: &[u8]| {
             a.iter()
                 .zip(b)

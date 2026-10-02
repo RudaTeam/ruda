@@ -1,13 +1,13 @@
-//! A stone pillar on flat ground under the morning sun: with shadows on, the
-//! ground in its shadow is darker than the ground in the sun; with shadows
-//! off, both look the same.
+//! A stone pillar on flat ground under the morning sun: with shadows from
+//! the map or from rays, the ground in its shadow is darker than the ground
+//! in the sun; with shadows off, both look the same.
 //!
 //! Needs a GPU; without one the test only says so and passes. With
 //! `RUDA_TEST_IMAGES` set to a directory, the pictures are saved there.
 
 use glam::{DVec3, Vec3};
 use ruda_core::{BlockPos, ChunkPos, ContentBuilder, Light, WorldBounds};
-use ruda_render::{Backdrop, Camera, PaddedChunk, Renderer, Scene, mesh_chunk};
+use ruda_render::{Backdrop, Camera, PaddedChunk, Renderer, Scene, Shadows, mesh_chunk};
 use ruda_world::light::LightEngine;
 use ruda_world::{Chunk, World};
 
@@ -91,15 +91,11 @@ fn a_pillar_casts_a_shadow() {
         clouds: None,
     };
 
-    let mut brightness = |shadows: bool| {
+    let mut brightness = |shadows: Shadows| {
         renderer.set_shadows(shadows);
         let (width, height, pixels) = renderer.capture(Backdrop::World(&scene), None).unwrap();
         if let Some(dir) = std::env::var_os("RUDA_TEST_IMAGES") {
-            let name = if shadows {
-                "shadows-on.png"
-            } else {
-                "shadows-off.png"
-            };
+            let name = format!("shadows-{shadows:?}.png").to_lowercase();
             save(
                 &std::path::Path::new(&dir).join(name),
                 width,
@@ -127,8 +123,9 @@ fn a_pillar_casts_a_shadow() {
             sum as f32 / 27.0
         })
     };
-    let [shaded_off, sunny_off] = brightness(false);
-    let [shaded_on, sunny_on] = brightness(true);
+    let [shaded_off, sunny_off] = brightness(Shadows::Off);
+    let [shaded_rays, sunny_rays] = brightness(Shadows::Rays);
+    let [shaded_on, sunny_on] = brightness(Shadows::Map);
 
     // The wider cascades are drawn a part at a time over a few frames; while
     // the camera moves, the shadows still stay where they are, and the sunlit
@@ -157,6 +154,14 @@ fn a_pillar_casts_a_shadow() {
     assert!(
         shaded_on < sunny_on * 0.8,
         "with shadows the ground behind the pillar is darker: {shaded_on} and {sunny_on}"
+    );
+    assert!(
+        shaded_rays < sunny_rays * 0.8,
+        "and with rays: {shaded_rays} and {sunny_rays}"
+    );
+    assert!(
+        (shaded_rays - shaded_on).abs() < sunny_on * 0.1,
+        "as dark as with the map: {shaded_rays} and {shaded_on}"
     );
 }
 
