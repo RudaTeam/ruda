@@ -3,7 +3,9 @@
 //! that moves with it; which bricks of 8³ blocks hold any, so rays cross
 //! open air a brick at a time; and how high the solid blocks in each column
 //! of bricks reach, so rays above them skip the column (`ray_shadow` in
-//! `world.wgsl`).
+//! `world.wgsl`). Coarser levels of the same say how high blocks reach in
+//! each column of chunks and in each square of 4 × 4 of them, so a ray above
+//! a whole region crosses it in one step.
 //!
 //! The window wraps around: a column of chunks sits at its position modulo
 //! the window's size, so as the camera moves only the columns coming into
@@ -24,6 +26,12 @@ const LAYERS: u32 = 16;
 /// Blocks along each side of a brick (`RAY_BRICK` in `world.wgsl`).
 const BRICK: usize = 8;
 const BRICKS_PER_CHUNK: usize = CHUNK_SIZE as usize / BRICK;
+/// Levels of `RayTextures::tops`: 0 per column of bricks, 2 per column of
+/// chunks, 4 per square of 4 × 4 columns of chunks (`ray_region_top` in
+/// `world.wgsl`); 1 and 3 go unused.
+const TOP_LEVELS: u32 = 5;
+/// Columns of chunks along each side of the squares of the coarsest level.
+const REGION_CHUNKS: usize = 4;
 
 /// A chunk's solid cubes: a column of 32 bits up y for each x and z, entry
 /// `z * 32 + x`; see `ChunkMesh::solids`.
@@ -47,7 +55,8 @@ struct RayTextures {
     /// 1 for each brick that holds a solid block.
     bricks: wgpu::Texture,
     /// How high solid blocks reach in each column of bricks, from the
-    /// window's lowest block; 0 for none.
+    /// window's lowest block; 0 for none. Its coarser levels, see
+    /// `TOP_LEVELS`.
     tops: wgpu::Texture,
 }
 
@@ -72,7 +81,7 @@ impl RayWorld {
     /// Puts the textures on the GPU, or takes them off, and gives the views
     /// to read.
     pub(crate) fn set_enabled(&mut self, device: &wgpu::Device, enabled: bool) -> RayViews {
-        let texture = |label, size: (u32, u32, u32), format| {
+        let texture = |label, size: (u32, u32, u32), format, levels| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d {
@@ -80,7 +89,7 @@ impl RayWorld {
                     height: size.1,
                     depth_or_array_layers: size.2,
                 },
-                mip_level_count: 1,
+                mip_level_count: levels,
                 sample_count: 1,
                 dimension: if size.2 == 1 && format == wgpu::TextureFormat::R16Uint {
                     wgpu::TextureDimension::D2
@@ -99,23 +108,26 @@ impl RayWorld {
                     "ray solids",
                     (RAY_WINDOW, LAYERS, RAY_WINDOW),
                     wgpu::TextureFormat::R32Uint,
+                    1,
                 ),
                 texture(
                     "ray bricks",
                     (bricks, LAYERS * BRICKS_PER_CHUNK as u32, bricks),
                     wgpu::TextureFormat::R8Uint,
+                    1,
                 ),
                 texture(
                     "ray tops",
                     (bricks, bricks, 1),
                     wgpu::TextureFormat::R16Uint,
+                    TOP_LEVELS,
                 ),
             )
         } else {
             (
-                texture("ray solids", (1, 1, 1), wgpu::TextureFormat::R32Uint),
-                texture("ray bricks", (1, 1, 1), wgpu::TextureFormat::R8Uint),
-                texture("ray tops", (1, 1, 1), wgpu::TextureFormat::R16Uint),
+                texture("ray solids", (1, 1, 1), wgpu::TextureFormat::R32Uint, 1),
+                texture("ray bricks", (1, 1, 1), wgpu::TextureFormat::R8Uint, 1),
+                texture("ray tops", (1, 1, 1), wgpu::TextureFormat::R16Uint, 1),
             )
         };
         let views = RayViews {
@@ -297,8 +309,49 @@ impl RayWorld {
             }
         }
         let slot = |c: i32| c.rem_euclid(WINDOW_CHUNKS) as usize;
-        self.column_tops[slot(z) * WINDOW_CHUNKS as usize + slot(x)] =
-            tops.iter().copied().max().unwrap_or(0);
+        let column_top = tops.iter().copied().max().unwrap_or(0);
+        self.column_tops[slot(z) * WINDOW_CHUNKS as usize + slot(x)] = column_top;
+        // The coarser levels: the column of chunks, and its square of them.
+        // A square holds the columns of the window that wrap to it; those
+        // from beyond the window's far side only make it reach higher than it
+        // does, which a ray just doesn't skip.
+        let (sx, sz) = (
+            slot(x) / REGION_CHUNKS * REGION_CHUNKS,
+            slot(z) / REGION_CHUNKS * REGION_CHUNKS,
+        );
+        let region_top = (sz..sz + REGION_CHUNKS)
+            .flat_map(|z| (sx..sx + REGION_CHUNKS).map(move |x| (x, z)))
+            .map(|(x, z)| self.column_tops[z * WINDOW_CHUNKS as usize + x])
+            .max()
+            .unwrap_or(0);
+        for (level, texel, top) in [
+            (2, (slot(x), slot(z)), column_top),
+            (4, (sx / REGION_CHUNKS, sz / REGION_CHUNKS), region_top),
+        ] {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &textures.tops,
+                    mip_level: level,
+                    origin: wgpu::Origin3d {
+                        x: texel.0 as u32,
+                        y: texel.1 as u32,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &top.to_le_bytes(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(2),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         let per = BRICKS_PER_CHUNK as u32;
         let at = |c: i32| (c * per as i32).rem_euclid((RAY_WINDOW / BRICK as u32) as i32) as u32;
         queue.write_texture(

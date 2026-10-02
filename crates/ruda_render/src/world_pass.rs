@@ -22,7 +22,9 @@ use crate::clouds::{
 use crate::culling::visible_chunks;
 use crate::gpu_timer::GpuTimer;
 use crate::rays::{RayViews, RayWorld};
-use crate::shadows::{CASCADES, SHADOW_MAP_SIZE, cascade, margin, reach};
+use crate::shadows::{
+    CASCADES, REDRAW_DISTANCE, SHADOW_MAP_SIZE, cascade, light_step, margin, reach,
+};
 use crate::sky::{Eye, SkyLook};
 use crate::textures::{BlockTextures, MIP_LEVELS, TEXTURE_SIZE};
 use crate::{ChunkMesh, CloudSky, LodMesh, RenderStats, Scene, Visibility};
@@ -36,9 +38,19 @@ const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const HAZE: f32 = 4e-4;
 /// Edge length of the sun and moon images; smaller ones are centred.
 const SKY_TEXTURE_SIZE: u32 = 32;
-const QUAD_BYTES: u64 = 16;
-/// Quads per page: 8 MiB.
-const PAGE_QUADS: u32 = 1 << 19;
+/// Pages hold 16-byte units: each quad four times, once per corner, then
+/// model vertices.
+const UNIT_BYTES: u64 = 16;
+/// Units per page: 8 MiB.
+const PAGE_UNITS: u32 = 1 << 19;
+/// A quad's units: one per corner, so its corners are drawn as plain
+/// vertices. Drawn as instances of four vertices instead, they would cost
+/// GPUs that don't pack small instances together, like Apple's, nearly
+/// twice as much.
+const CORNERS: u32 = 4;
+/// Indices of the two triangles of a quad, from its first corner, as a
+/// strip of its corners would make them.
+const QUAD_INDICES: [u32; 6] = [0, 1, 2, 2, 1, 3];
 /// Width and height of the chunk position texture, `ORIGINS_WIDTH` in
 /// `world.wgsl`. Its texels are the chunk slots.
 const ORIGINS_WIDTH: u32 = 128;
@@ -85,6 +97,9 @@ pub(crate) struct WorldPass {
     chunks: HashMap<ChunkPos, ChunkEntry>,
     lods: HashMap<LodTilePos, GpuLod>,
     pages: Vec<Page>,
+    /// The triangles of every quad a page can hold, `QUAD_INDICES` each:
+    /// any run of quads in a page is a run of these.
+    quad_indices: wgpu::Buffer,
     slots: Slots,
     /// Sampled by the clouds as well as drawn into.
     depth: wgpu::TextureView,
@@ -108,9 +123,10 @@ struct ChunkEntry {
 struct GpuChunk {
     slot: u32,
     page: usize,
-    /// Everything allocated for the chunk: its quads, then its model
-    /// vertices, 16 bytes each.
+    /// Everything allocated for the chunk, in units: its quads, then its
+    /// model vertices.
     space: Range<u32>,
+    /// In units, `CORNERS` per quad.
     quads: Range<u32>,
     models: Range<u32>,
     face_counts: [u32; 6],
@@ -176,6 +192,9 @@ const SHADOW_LAYERS: [[usize; 2]; CASCADES] = [[0, 0], [1, 2], [3, 4], [5, 6]];
 const SHADOW_LAYER_COUNT: usize = 7;
 /// The last cascade: far-away terrain casts its shadows.
 const FAR_CASCADE: usize = CASCADES - 1;
+/// Texels along a side of the far cascade's hint (`SHADOW_HINT_SIZE` in
+/// `world.wgsl`), each for a square of `SHADOW_MAP_SIZE / SHADOW_HINT_SIZE`.
+const SHADOW_HINT_SIZE: u32 = 128;
 
 /// Sun shadows: off by default, as they draw the world once more per cascade.
 struct ShadowMap {
@@ -199,12 +218,33 @@ struct ShadowMap {
     cascades: [(wgpu::Buffer, wgpu::BindGroup); CASCADES],
     /// How each cascade was last drawn.
     drawn: [Option<Drawn>; CASCADES],
+    /// Whether geometry a cascade sees changed since it was started.
+    dirty: [bool; CASCADES],
     /// Frames drawn so far.
     frames: u64,
     /// Room of chunk geometry that was replaced or taken away while a
     /// cascade being drawn a part at a time may still draw from it. It is
     /// given out again once no such cascade does.
     retired: Vec<Retired>,
+    hint: ShadowHint,
+}
+
+/// The depth nearest the light around each part of the far cascade, so
+/// most points learn from one read that nothing there shades them
+/// (`nothing_nearer` in `world.wgsl`). Built whenever the far cascade is
+/// complete.
+struct ShadowHint {
+    /// Sampled by the world pass.
+    view: wgpu::TextureView,
+    /// The nearest depth of each square alone, on the way.
+    blocks: wgpu::TextureView,
+    blocks_pipeline: wgpu::RenderPipeline,
+    pipeline: wgpu::RenderPipeline,
+    source_layout: wgpu::BindGroupLayout,
+    /// Each of the far cascade's two layers to build it from, while the
+    /// map is on.
+    sources: Option<[wgpu::BindGroup; 2]>,
+    blocks_group: wgpu::BindGroup,
 }
 
 /// A chunk's room in a page, and its slot, kept out of use for a while.
@@ -223,8 +263,6 @@ struct Progress {
     /// those changed since keep their old geometry until it is done, see
     /// `ShadowMap::retired`.
     draws: Vec<Draw>,
-    /// Whether `draws` are far-away tiles rather than chunks.
-    far: bool,
     /// Parts drawn so far.
     part: usize,
     /// The frame it was started in.
@@ -239,22 +277,41 @@ struct Drawn {
     camera: DVec3,
     toward_light: Vec3,
     radius: f32,
+    /// Whether it draws far-away tiles rather than chunks.
+    far: bool,
+}
+
+impl Drawn {
+    /// Whether the box from `min` of `size` (in blocks) lies in its view.
+    fn sees(&self, min: DVec3, size: DVec3) -> bool {
+        let min = (min - self.camera).as_vec3();
+        Frustum::new(self.view_proj).intersects_box(min, min + size.as_vec3())
+    }
 }
 
 /// A tile of far-away terrain on the GPU.
 struct GpuLod {
     slot: u32,
     page: usize,
+    /// Its quads, in units.
     space: Range<u32>,
     /// Lowest to highest point.
     heights: Range<i32>,
 }
 
-/// A run of quads in one page.
+/// A run of quads in one page, in units.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Draw {
     page: usize,
     quads: Range<u32>,
+}
+
+impl Draw {
+    /// Its triangles in `quad_indices`.
+    fn indices(&self) -> Range<u32> {
+        let per_quad = QUAD_INDICES.len() as u32;
+        self.quads.start / CORNERS * per_quad..self.quads.end / CORNERS * per_quad
+    }
 }
 
 impl WorldPass {
@@ -429,6 +486,16 @@ impl WorldPass {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 19,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -499,6 +566,7 @@ impl WorldPass {
                 &ray_views.solids,
                 &ray_views.bricks,
                 &ray_views.tops,
+                &shadows.hint.view,
             ],
             [
                 &sampler,
@@ -553,17 +621,9 @@ impl WorldPass {
                 cache: None,
             })
         };
-        let quad_buffer = wgpu::VertexBufferLayout {
-            array_stride: QUAD_BYTES,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Uint32x4,
-                offset: 0,
-                shader_location: 0,
-            }],
-        };
-        let model_buffer = wgpu::VertexBufferLayout {
-            array_stride: QUAD_BYTES,
+        // Quad corners and model vertices alike.
+        let unit_buffer = wgpu::VertexBufferLayout {
+            array_stride: UNIT_BYTES,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[wgpu::VertexAttribute {
                 format: wgpu::VertexFormat::Uint32x4,
@@ -576,8 +636,8 @@ impl WorldPass {
             &layout,
             "lod_vertex",
             "lod_fragment",
-            &[Some(quad_buffer.clone())],
-            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(unit_buffer.clone())],
+            wgpu::PrimitiveTopology::TriangleList,
             Some(wgpu::Face::Back),
             (true, wgpu::CompareFunction::Less),
             None,
@@ -587,7 +647,7 @@ impl WorldPass {
             &layout,
             "model_vertex",
             "chunk_fragment",
-            &[Some(model_buffer)],
+            &[Some(unit_buffer.clone())],
             wgpu::PrimitiveTopology::TriangleList,
             Some(wgpu::Face::Back),
             (true, wgpu::CompareFunction::Less),
@@ -598,8 +658,8 @@ impl WorldPass {
             &layout,
             "chunk_vertex",
             "chunk_fragment",
-            &[Some(quad_buffer)],
-            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(unit_buffer)],
+            wgpu::PrimitiveTopology::TriangleList,
             Some(wgpu::Face::Back),
             (true, wgpu::CompareFunction::Less),
             None,
@@ -691,6 +751,7 @@ impl WorldPass {
             chunks: HashMap::new(),
             lods: HashMap::new(),
             pages: Vec::new(),
+            quad_indices: quad_indices(device, queue, PAGE_UNITS),
             slots: Slots::new(MAX_SLOTS),
             depth: depth_view(device, width, height),
             size: (width, height),
@@ -747,6 +808,7 @@ impl WorldPass {
                 &self.ray_views.solids,
                 &self.ray_views.bricks,
                 &self.ray_views.tops,
+                &self.shadows.hint.view,
             ],
             [
                 &self.sampler,
@@ -797,6 +859,7 @@ impl WorldPass {
         let gpu = if mesh.is_empty() {
             None
         } else {
+            self.chunk_changed(pos);
             self.place(device, queue, pos, mesh)
         };
         self.chunks.insert(
@@ -820,23 +883,26 @@ impl WorldPass {
             warn!(?pos, "too many chunks with geometry, not drawing this one");
             return None;
         };
-        let units: Vec<[u32; 4]> = mesh.quads.iter().chain(&mesh.models).copied().collect();
+        let units: Vec<[u32; 4]> = corners(&mesh.quads)
+            .chain(mesh.models.iter().copied())
+            .collect();
         let (page, space) = self.store(device, queue, slot, &units);
         self.write_origin(queue, slot, pos.origin().0);
-        let quads_end = space.start + mesh.quads.len() as u32;
+        let quads_end = space.start + mesh.quads.len() as u32 * CORNERS;
         Some(GpuChunk {
             slot,
             page,
             quads: space.start..quads_end,
-            models: quads_end..space.end,
+            models: quads_end..quads_end + mesh.models.len() as u32,
             space,
             face_counts: mesh.face_counts,
         })
     }
 
-    /// Puts 16-byte units into a page, with the slot in bits 18 to 31 of
-    /// their second word, as quads, model vertices and far-away quads all
-    /// expect.
+    /// Puts units into a page, with the slot in bits 18 to 31 of their
+    /// second word, as quads, model vertices and far-away quads all expect.
+    /// The room starts at a whole quad, as `quad_indices` count them, and
+    /// may run a little past the units.
     fn store(
         &mut self,
         device: &wgpu::Device,
@@ -844,7 +910,8 @@ impl WorldPass {
         slot: u32,
         units: &[[u32; 4]],
     ) -> (usize, Range<u32>) {
-        let len = units.len() as u32;
+        // Rooms of whole quads only ever leave room for whole quads.
+        let len = (units.len() as u32).next_multiple_of(CORNERS);
         let found = self
             .pages
             .iter_mut()
@@ -853,13 +920,19 @@ impl WorldPass {
         let (page, space) = match found {
             Some(found) => found,
             None => {
-                let size = PAGE_QUADS.max(len);
+                let size = PAGE_UNITS.max(len);
+                // Units the index buffer covers.
+                let covered =
+                    self.quad_indices.size() / 4 / QUAD_INDICES.len() as u64 * u64::from(CORNERS);
+                if u64::from(size) > covered {
+                    self.quad_indices = quad_indices(device, queue, size);
+                }
                 let mut space = RangeAllocator::new(size);
                 let units = space.allocate(len).expect("a new page fits the mesh");
                 self.pages.push(Page {
                     buffer: device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("chunk quads"),
-                        size: u64::from(size) * QUAD_BYTES,
+                        size: u64::from(size) * UNIT_BYTES,
                         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
                     }),
@@ -875,7 +948,7 @@ impl WorldPass {
             .collect();
         queue.write_buffer(
             &self.pages[page].buffer,
-            u64::from(space.start) * QUAD_BYTES,
+            u64::from(space.start) * UNIT_BYTES,
             &bytes,
         );
         (page, space)
@@ -918,11 +991,13 @@ impl WorldPass {
         if mesh.quads.is_empty() {
             return;
         }
+        self.tile_changed(pos, mesh.min_y..mesh.max_y);
         let Some(slot) = self.slots.take() else {
             warn!(?pos, "too many chunks with geometry, not drawing this tile");
             return;
         };
-        let (page, space) = self.store(device, queue, slot, &mesh.quads);
+        let units: Vec<[u32; 4]> = corners(&mesh.quads).collect();
+        let (page, space) = self.store(device, queue, slot, &units);
         let (x, z) = pos.origin();
         self.write_origin(queue, slot, glam::IVec3::new(x, 0, z));
         self.lods.insert(
@@ -938,6 +1013,7 @@ impl WorldPass {
 
     pub(crate) fn remove_lod(&mut self, pos: LodTilePos) {
         if let Some(gpu) = self.lods.remove(&pos) {
+            self.tile_changed(pos, gpu.heights.clone());
             // The far cascade of the shadow map may still draw it.
             self.shadows.retired.push(Retired {
                 page: gpu.page,
@@ -951,6 +1027,7 @@ impl WorldPass {
     pub(crate) fn remove(&mut self, queue: &wgpu::Queue, pos: ChunkPos) {
         self.rays.set(queue, pos, None);
         if let Some(gpu) = self.chunks.remove(&pos).and_then(|entry| entry.gpu) {
+            self.chunk_changed(pos);
             // A cascade of the shadow map started before may still draw it.
             self.shadows.retired.push(Retired {
                 page: gpu.page,
@@ -959,6 +1036,25 @@ impl WorldPass {
                 from: self.shadows.frames + 1,
             });
         }
+    }
+
+    /// A chunk's geometry changed: the cascades that see it are drawn again.
+    fn chunk_changed(&mut self, pos: ChunkPos) {
+        let size = DVec3::splat(f64::from(CHUNK_SIZE));
+        self.shadows
+            .geometry_changed(pos.origin().0.as_dvec3(), size, false);
+    }
+
+    /// A far-away tile's geometry changed, between `heights`.
+    fn tile_changed(&mut self, pos: LodTilePos, heights: Range<i32>) {
+        let (x, z) = pos.origin();
+        let min = DVec3::new(f64::from(x), f64::from(heights.start - 1), f64::from(z));
+        let size = DVec3::new(
+            f64::from(LOD_TILE_SIZE),
+            f64::from(heights.end - heights.start + 2),
+            f64::from(LOD_TILE_SIZE),
+        );
+        self.shadows.geometry_changed(min, size, true);
     }
 
     /// Gives out again the room of chunk geometry that no cascade being
@@ -1077,10 +1173,10 @@ impl WorldPass {
             for face in Face::ALL {
                 let count = gpu.face_counts[face.index()];
                 if count > 0 && facing[face.index()] {
-                    push_draw(&mut self.draws, gpu.page, start..start + count);
+                    push_draw(&mut self.draws, gpu.page, start..start + count * CORNERS);
                     self.stats.quads += u64::from(count);
                 }
-                start += count;
+                start += count * CORNERS;
             }
         }
         self.stats.draw_calls = self.draws.len();
@@ -1109,7 +1205,8 @@ impl WorldPass {
         let mut globals = Std140::default();
         globals.matrix(view_proj);
         globals.matrix(view_proj.inverse());
-        globals.floats([far * 0.7, far * 0.98, 0.0, HAZE]);
+        let shadows_on = if self.shadows.enabled { 1.0 } else { 0.0 };
+        globals.floats([far * 0.7, far * 0.98, shadows_on, HAZE]);
         globals.floats(selection.extend(0.0).to_array());
         let encode = if self.linear_output { 0.0 } else { 1.0 };
         globals.floats([width as f32, height as f32, sky.exposure, encode]);
@@ -1218,13 +1315,14 @@ impl WorldPass {
         pass.draw(0..12, 0..1);
 
         pass.set_pipeline(&self.chunk_pipeline);
+        pass.set_index_buffer(self.quad_indices.slice(..), wgpu::IndexFormat::Uint32);
         let mut bound = None;
         for draw in &self.draws {
             if bound != Some(draw.page) {
                 pass.set_vertex_buffer(0, self.pages[draw.page].buffer.slice(..));
                 bound = Some(draw.page);
             }
-            pass.draw(0..4, draw.quads.clone());
+            pass.draw_indexed(draw.indices(), 0, 0..1);
         }
 
         pass.set_pipeline(&self.model_pipeline);
@@ -1275,7 +1373,7 @@ impl WorldPass {
                     pass.set_vertex_buffer(0, self.pages[draw.page].buffer.slice(..));
                     bound = Some(draw.page);
                 }
-                pass.draw(0..4, draw.quads.clone());
+                pass.draw_indexed(draw.indices(), 0, 0..1);
             }
         }
 
@@ -1328,11 +1426,15 @@ impl WorldPass {
         );
     }
 
-    /// Draws the cascades of the shadow map. The nearest is drawn whole
-    /// every frame; the wider ones a part at a time, over 2 and 4 frames,
-    /// into a second layer that is shown once complete, so no frame pays for
-    /// a whole wide cascade. Cave culling doesn't apply: what the camera
-    /// can't see may still cast a shadow into view.
+    /// Draws the cascades of the shadow map. The nearest is drawn whole; the
+    /// wider ones a part at a time, over 2, 4 and 8 frames, into a second
+    /// layer that is shown once complete, so no frame pays for a whole wide
+    /// cascade. A cascade is drawn again only once what it shows could look
+    /// different: geometry it sees changed, the camera moved a twentieth of
+    /// its reach (a cascade drawn from elsewhere is used from where it was
+    /// drawn, and only its edge runs out), or the light turned by
+    /// `light_step`. Cave culling doesn't apply: what the camera can't see
+    /// may still cast a shadow into view.
     fn draw_shadows(
         &mut self,
         queue: &wgpu::Queue,
@@ -1356,33 +1458,47 @@ impl WorldPass {
                 continue;
             }
             let parts = SHADOW_PARTS[index];
+            // The last cascade draws far-away terrain, which is there near
+            // the camera too, unless there is none.
+            let far = index == FAR_CASCADE && !self.lods.is_empty();
             // Drawn for another light, another reach or too far from here:
             // drawn whole, now.
             let stale = self.shadows.drawn[index].is_none_or(|drawn| {
                 drawn.radius != radius
                     || drawn.toward_light.dot(toward_light) < 0.9999
-                    || drawn.camera.distance(camera) > f64::from(radius) * 0.1
+                    || drawn.camera.distance(camera) > f64::from(radius) * 2.0 * REDRAW_DISTANCE
             });
+            if !stale
+                && self.shadows.progress[index].is_none()
+                && self.shadows.drawn[index].is_some_and(|drawn| {
+                    !self.shadows.dirty[index]
+                        && drawn.far == far
+                        && drawn.camera.distance(camera) <= f64::from(radius) * REDRAW_DISTANCE
+                        && drawn.toward_light.cross(toward_light).length()
+                            <= light_step(toward_light)
+                })
+            {
+                // Nothing it shows would look different.
+                continue;
+            }
             let whole = stale || parts == 1;
             if whole || self.shadows.progress[index].is_none() {
                 let view_proj = cascade(camera, radius, toward_light, margin(index));
-                // The last cascade draws far-away terrain, which is there
-                // near the camera too, unless there is none.
-                let far = index == FAR_CASCADE && !self.lods.is_empty();
                 let draws = if far {
                     self.far_casters(view_proj, camera)
                 } else {
                     self.casters(view_proj, camera)
                 };
+                self.shadows.dirty[index] = false;
                 self.shadows.progress[index] = Some(Progress {
                     drawn: Drawn {
                         view_proj,
                         camera,
                         toward_light,
                         radius,
+                        far,
                     },
                     draws,
-                    far,
                     part: 0,
                     started: self.shadows.frames,
                 });
@@ -1419,20 +1535,21 @@ impl WorldPass {
                 timestamp_writes: timer.as_mut().and_then(|timer| timer.pass("shadows")),
                 ..Default::default()
             });
-            pass.set_pipeline(if progress.far {
+            pass.set_pipeline(if progress.drawn.far {
                 &self.shadows.far_pipeline
             } else {
                 &self.shadows.pipeline
             });
             pass.set_bind_group(0, &self.shadows.globals_group, &[]);
             pass.set_bind_group(1, &self.shadows.cascades[index].1, &[]);
+            pass.set_index_buffer(self.quad_indices.slice(..), wgpu::IndexFormat::Uint32);
             let mut bound = None;
             for draw in &progress.draws[range] {
                 if bound != Some(draw.page) {
                     pass.set_vertex_buffer(0, self.pages[draw.page].buffer.slice(..));
                     bound = Some(draw.page);
                 }
-                pass.draw(0..4, draw.quads.clone());
+                pass.draw_indexed(draw.indices(), 0, 0..1);
             }
             drop(pass);
 
@@ -1442,6 +1559,9 @@ impl WorldPass {
                 self.shadows.drawn[index] = Some(progress.drawn);
                 self.shadows.front[index] = 1 - self.shadows.front[index];
                 self.shadows.progress[index] = None;
+                if index == FAR_CASCADE {
+                    self.shadows.draw_hint(encoder, back);
+                }
             }
         }
     }
@@ -1511,7 +1631,8 @@ impl WorldPass {
             ray_solids,
             ray_bricks,
             ray_tops,
-        ]: [&wgpu::TextureView; 11],
+            shadow_hint,
+        ]: [&wgpu::TextureView; 12],
         [sampler, shadow_sampler, smooth_sampler, wrap_sampler]: [&wgpu::Sampler; 4],
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1585,6 +1706,10 @@ impl WorldPass {
                 wgpu::BindGroupEntry {
                     binding: 18,
                     resource: wgpu::BindingResource::TextureView(ray_tops),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 19,
+                    resource: wgpu::BindingResource::TextureView(shadow_hint),
                 },
             ],
         })
@@ -1669,6 +1794,30 @@ fn facing_camera(pos: ChunkPos, camera: DVec3) -> [bool; 6] {
             camera[axis] < max[axis]
         }
     })
+}
+
+/// Each quad once per corner.
+fn corners(quads: &[[u32; 4]]) -> impl Iterator<Item = [u32; 4]> + '_ {
+    quads
+        .iter()
+        .flat_map(|&quad| std::iter::repeat_n(quad, CORNERS as usize))
+}
+
+/// The index buffer for pages of `units`: the triangles of each quad of
+/// `CORNERS` units in turn.
+fn quad_indices(device: &wgpu::Device, queue: &wgpu::Queue, units: u32) -> wgpu::Buffer {
+    let indices: Vec<u8> = (0..units / CORNERS)
+        .flat_map(|quad| QUAD_INDICES.map(|corner| quad * CORNERS + corner))
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("quad indices"),
+        size: indices.len() as u64,
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, &indices);
+    buffer
 }
 
 /// Adds a range of quads, extending the last draw if it ends where the range
@@ -1994,8 +2143,8 @@ impl ShadowMap {
                     entry_point: Some(entry_point),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: QUAD_BYTES,
-                        step_mode: wgpu::VertexStepMode::Instance,
+                        array_stride: UNIT_BYTES,
+                        step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &[wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Uint32x4,
                             offset: 0,
@@ -2004,7 +2153,7 @@ impl ShadowMap {
                     })],
                 },
                 primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    topology: wgpu::PrimitiveTopology::TriangleList,
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -2035,7 +2184,9 @@ impl ShadowMap {
             ..Default::default()
         });
         let (view, layers) = shadow_texture(device, 1);
+        let hint = ShadowHint::new(device, shader);
         Self {
+            hint,
             enabled: false,
             rays: false,
             view,
@@ -2046,6 +2197,7 @@ impl ShadowMap {
             globals_group,
             cascades,
             drawn: [None; CASCADES],
+            dirty: [false; CASCADES],
             front: [0; CASCADES],
             progress: Default::default(),
             frames: 0,
@@ -2053,13 +2205,175 @@ impl ShadowMap {
         }
     }
 
+    /// Geometry changed in the box from `min` of `size` (in blocks): the
+    /// cascades that see it, or are being drawn where they would, are drawn
+    /// again. `far` says whether it is far-away terrain, which only cascades
+    /// drawing that see.
+    fn geometry_changed(&mut self, min: DVec3, size: DVec3, far: bool) {
+        for index in 0..CASCADES {
+            let started = self.progress[index].as_ref().map(|progress| progress.drawn);
+            if self.drawn[index]
+                .into_iter()
+                .chain(started)
+                .any(|drawn| drawn.far == far && drawn.sees(min, size))
+            {
+                self.dirty[index] = true;
+            }
+        }
+    }
+
     /// Off, the map shrinks to a texel per cascade.
     fn set_enabled(&mut self, device: &wgpu::Device, enabled: bool) {
         let size = if enabled { SHADOW_MAP_SIZE } else { 1 };
         (self.view, self.layers) = shadow_texture(device, size);
+        self.hint.sources = enabled.then(|| {
+            SHADOW_LAYERS[FAR_CASCADE].map(|layer| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("shadow hint source"),
+                    layout: &self.hint.source_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 20,
+                        resource: wgpu::BindingResource::TextureView(&self.layers[layer]),
+                    }],
+                })
+            })
+        });
         self.enabled = enabled;
         self.drawn = [None; CASCADES];
         self.progress = Default::default();
+    }
+
+    /// Builds the hint from `layer` of the far cascade, just drawn.
+    fn draw_hint(&self, encoder: &mut wgpu::CommandEncoder, layer: usize) {
+        let Some(sources) = &self.hint.sources else {
+            return;
+        };
+        let source = &sources[usize::from(layer != SHADOW_LAYERS[FAR_CASCADE][0])];
+        for (target, pipeline, group) in [
+            (&self.hint.blocks, &self.hint.blocks_pipeline, source),
+            (
+                &self.hint.view,
+                &self.hint.pipeline,
+                &self.hint.blocks_group,
+            ),
+        ] {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow hint"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+}
+
+impl ShadowHint {
+    fn new(device: &wgpu::Device, shader: &wgpu::ShaderModule) -> Self {
+        let texture = |label| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: SHADOW_HINT_SIZE,
+                        height: SHADOW_HINT_SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    // Depths as bits: integer targets are drawable everywhere,
+                    // float ones not on OpenGL ES.
+                    format: wgpu::TextureFormat::R32Uint,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let (view, blocks) = (texture("shadow hint"), texture("shadow hint blocks"));
+        let layout = |label, binding, sample_type| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(label),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                }],
+            })
+        };
+        let source_layout = layout(
+            "shadow hint source",
+            20,
+            wgpu::TextureSampleType::Float { filterable: false },
+        );
+        let blocks_layout = layout("shadow hint blocks", 21, wgpu::TextureSampleType::Uint);
+        let pipeline = |label, fragment, layout: &wgpu::BindGroupLayout| {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("hint_vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some(fragment),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R32Uint,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let blocks_pipeline =
+            pipeline("shadow hint blocks", "hint_blocks_fragment", &source_layout);
+        let hint_pipeline = pipeline("shadow hint", "hint_fragment", &blocks_layout);
+        let blocks_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow hint blocks"),
+            layout: &blocks_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 21,
+                resource: wgpu::BindingResource::TextureView(&blocks),
+            }],
+        });
+        Self {
+            view,
+            blocks,
+            blocks_pipeline,
+            pipeline: hint_pipeline,
+            source_layout,
+            sources: None,
+            blocks_group,
+        }
     }
 }
 

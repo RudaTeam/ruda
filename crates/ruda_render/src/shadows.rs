@@ -19,6 +19,33 @@ const REACH: [f32; CASCADES - 1] = [16.0, 48.0, 160.0];
 pub(crate) const CASTER_MARGIN: f32 = 256.0;
 pub(crate) const FAR_CASTER_MARGIN: f32 = 2048.0;
 
+/// How wide the sun's disc is, in radians: shadow edges are as soft as it
+/// makes them (`SUN_WIDTH` in `world.wgsl`).
+const SUN_WIDTH: f32 = 0.0093;
+/// How far the light high in the sky may turn before a cascade is drawn
+/// again, in radians. A shadow then moves by a tenth of its soft edge,
+/// whatever casts it: both grow with how far the caster is. The sun takes
+/// about a fifth of a second to turn this far.
+const LIGHT_STEP: f32 = 0.1 * SUN_WIDTH;
+/// Below this height of the light (the sine of its angle over the
+/// horizon, here 30°) the step shrinks; see [`light_step`].
+const LOW_LIGHT: f32 = 0.5;
+
+/// How far the light may turn before a cascade is drawn again, in radians,
+/// with the light `toward_light`. Low over the horizon, shadows stretch
+/// across the ground, and so does any jump in them: by 1 / sin² of the
+/// light's height. Below `LOW_LIGHT` the step shrinks the same way, and at
+/// sunset cascades are drawn again as soon as they are done.
+pub(crate) fn light_step(toward_light: Vec3) -> f32 {
+    let low = (toward_light.y / LOW_LIGHT).clamp(0.0, 1.0);
+    LIGHT_STEP * low * low
+}
+
+/// How far, as a share of its reach, the camera may move from where a
+/// cascade was drawn before it is drawn again: half of what would leave its
+/// edge uncovered (see `draw_shadows` in `world_pass.rs`).
+pub(crate) const REDRAW_DISTANCE: f64 = 0.05;
+
 /// How far each cascade reaches for a view of `view_distance` blocks, with
 /// far-away terrain out to `far_distance`. The last cascade reaches no
 /// farther than the one before when there is nothing farther to shade.
@@ -117,6 +144,14 @@ mod tests {
             wrapped(fa.x - fb.x) < 0.01 && wrapped(fa.y - fb.y) < 0.01,
             "{fa} {fb}"
         );
+    }
+
+    #[test]
+    fn a_low_sun_draws_cascades_again_sooner() {
+        let noon = light_step(Vec3::new(0.3, 0.9, 0.3).normalize());
+        let sunset = light_step(Vec3::new(0.95, 0.1, 0.3).normalize());
+        assert_eq!(noon, LIGHT_STEP);
+        assert!(sunset < noon * 0.1, "{sunset} {noon}");
     }
 
     #[test]

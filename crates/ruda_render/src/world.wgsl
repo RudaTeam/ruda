@@ -1,16 +1,18 @@
 // The sky, the block world, the outline of the targeted block and the
 // crosshair.
 //
-// Chunks are drawn as instanced quads: each instance is one packed quad (see
-// `mesh.rs`) and the vertex shader works out its four corners. Bits 18 to 31
-// of the quad's second word are its chunk's slot (see `world_pass.rs`).
+// Chunks are drawn as packed quads (see `mesh.rs`), each stored once per
+// corner: a vertex is a whole quad, and which corner it is comes from its
+// index, so the vertex shader works out where that corner lies. Bits 18 to
+// 31 of the quad's second word are its chunk's slot (see `world_pass.rs`).
 
 struct Globals {
     view_proj: mat4x4<f32>,
     // Turns screen positions back into directions, for the sky.
     inverse_view_proj: mat4x4<f32>,
     // x: distance where fog starts hiding the edge of the world, y: where it
-    // hides everything, w: haze per block at sea level; z is unused.
+    // hides everything, w: haze per block at sea level; z: 1 with shadows on,
+    // also while they fade out with the light sinking to the horizon.
     fog: vec4<f32>,
     // xyz: minimum corner of the targeted block, relative to the camera.
     selection: vec4<f32>,
@@ -89,6 +91,12 @@ const ORIGINS_WIDTH = 128u;
 // The same map read as plain numbers: OpenGL can only compare depth
 // textures, not read them.
 @group(0) @binding(11) var shadow_depths: texture_2d_array<f32>;
+// For each square of `SHADOW_HINT_BLOCK` texels of the far cascade's shown
+// layer, the depth nearest the light in it and the squares around it, as
+// bits of a float; see `hint_blocks_fragment` and `hint_fragment`.
+@group(0) @binding(19) var shadow_hint: texture_2d<u32>;
+const SHADOW_HINT_SIZE = 128;
+const SHADOW_HINT_BLOCK = 16;
 // Which cells of the layer hold cloud, 1 for those, repeating; see
 // `cloud_cells` in `clouds.rs`.
 @group(0) @binding(7) var cloud_cells: texture_2d<f32>;
@@ -111,7 +119,8 @@ const DRAWN_WIDTH = 128;
 @group(0) @binding(16) var ray_solids: texture_3d<u32>;
 @group(0) @binding(17) var ray_bricks: texture_3d<u32>;
 // How high solid blocks reach in each column of bricks, from the window's
-// lowest block.
+// lowest block; level 2 per column of chunks, level 4 per square of 4 × 4
+// of them.
 @group(0) @binding(18) var ray_tops: texture_2d<u32>;
 const RAY_WINDOW = 512;
 const RAY_BRICK = 8.0;
@@ -254,7 +263,7 @@ fn unpack_light(bits: u32) -> vec4<f32> {
 
 @vertex
 fn chunk_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) -> ChunkVertex {
-    let corner = quad_corner(quad, vertex);
+    let corner = quad_corner(quad, vertex & 3u);
     let position = camera_relative(quad.y >> 18u, corner.local);
 
     var out: ChunkVertex;
@@ -273,7 +282,7 @@ fn chunk_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>
 // Chunk quads seen from the sun, into the shadow map.
 @vertex
 fn shadow_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) -> @builtin(position) vec4<f32> {
-    let corner = quad_corner(quad, vertex);
+    let corner = quad_corner(quad, vertex & 3u);
     return shadow_pass * vec4<f32>(camera_relative(quad.y >> 18u, corner.local), 1.0);
 }
 
@@ -329,13 +338,24 @@ fn ray_top(column: vec2<i32>) -> f32 {
     return f32(textureLoad(ray_tops, vec2<i32>(at.x & (size - 1), at.y & (size - 1)), 0).r);
 }
 
+// How high solid blocks reach in the region of `8 << level` blocks across
+// holding `block` (x and z from the window's first block): a column of
+// chunks for level 2, a square of 4 × 4 of them for level 4.
+fn ray_region_top(block: vec2<i32>, level: u32) -> f32 {
+    let at = block + vec2<i32>(globals.ray_window.x, globals.ray_window.z);
+    let size = (RAY_WINDOW / 8) >> level;
+    let region = at >> vec2<u32>(3u + level);
+    return f32(textureLoad(ray_tops, region & vec2<i32>(size - 1), i32(level)).r);
+}
+
 // A ray from `position` (on a face turned towards `normal`) towards the
 // light through the solid cubes near the camera: x is 1 if it gets out of
 // the window of the world the GPU holds without meeting one, 0 if it meets
 // one; y is how far it went. The light is above the horizon, so the ray only
-// rises: it crosses columns of bricks, skipping those whose solid blocks it
-// is already above, and inside the others bricks, skipping those with none,
-// then blocks.
+// rises: above all the solid blocks of a square of chunks, or of a column of
+// them, it crosses it in one step; otherwise it crosses columns of bricks,
+// skipping those whose solid blocks it is already above, and inside the
+// others bricks, skipping those with none, then blocks.
 fn ray_shadow(position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
     let window = globals.ray_window;
     let toward = globals.light.xyz;
@@ -357,6 +377,24 @@ fn ray_shadow(position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
     var t = 0.0;
     for (var i = 0; i < 160; i++) {
         let at = start + toward * (t + 1e-3);
+        // Over a whole region: on to where the ray leaves it.
+        let block = vec2<i32>(floor(at.xz));
+        var level = 4u;
+        var over = at.y >= ray_region_top(block, level);
+        if !over {
+            level = 2u;
+            over = at.y >= ray_region_top(block, level);
+        }
+        if over {
+            let span = 8 << level;
+            let first_block = ((block + window.xz) & vec2<i32>(-span)) - window.xz;
+            let low = vec3<f32>(f32(first_block.x), -1e6, f32(first_block.y));
+            t = min(slab_exit(start, inverse, low, low + vec3<f32>(f32(span), 2e6, f32(span))), out);
+            if t >= out {
+                break;
+            }
+            continue;
+        }
         let column = vec2<i32>(floor(at.xz / RAY_BRICK));
         let corner = vec3<f32>(vec2<f32>(column).x * RAY_BRICK, -1e6, vec2<f32>(column).y * RAY_BRICK);
         let leave = min(slab_exit(start, inverse, corner, corner + vec3<f32>(RAY_BRICK, 2e6, RAY_BRICK)), out);
@@ -446,6 +484,11 @@ fn sunlit(position: vec3<f32>, normal: vec3<f32>, distance: f32, facing: f32) ->
     return lit;
 }
 
+// Room the cascades see towards the light, as `CASTER_MARGIN` and
+// `FAR_CASTER_MARGIN` in `shadows.rs`.
+const CASTER_MARGIN = 256.0;
+const FAR_CASTER_MARGIN = 2048.0;
+
 // The far cascade counts only what lies farther than this towards the
 // light: everywhere, `x`, as far-away terrain is drawn coarse and would
 // shade itself, and small things that near would only blur; near the
@@ -470,13 +513,17 @@ fn cascade_shadow(cascade: i32, position: vec3<f32>, normal: vec3<f32>, facing: 
         return 1.0;
     }
     let layer = i32(globals.shadow_layers[cascade]);
-    let slope = depth_slope(matrix, normal);
-    // Depth per block towards the light, and how much of the map a block is.
-    let per_block = abs((matrix * vec4<f32>(globals.light.xyz, 0.0)).z);
+    // How much of the map a block is.
     let across = 0.5 / globals.shadow[cascade];
     // How far what casts the shadow is: the blockers over the softest edge
     // worth looking for here, on average.
     let search = max(clamp(SUN_WIDTH * globals.shadow[cascade], 0.2, 8.0) * across, 2.0 / SHADOW_MAP_SIZE);
+    if cascade == 3 && nothing_nearer(uv, light.z, search, facing) {
+        return 1.0;
+    }
+    let slope = depth_slope(matrix, normal);
+    // Depth per block towards the light.
+    let per_block = abs((matrix * vec4<f32>(globals.light.xyz, 0.0)).z);
     var blockers = 0.0;
     var gap = 0.0;
     var around = vec2<f32>(search, 0.0);
@@ -507,6 +554,68 @@ fn cascade_shadow(cascade: i32, position: vec3<f32>, normal: vec3<f32>, facing: 
     // No sharper than a couple of texels.
     let radius = max(0.5 * width * across, 1.5 / SHADOW_MAP_SIZE);
     return soft_shadow(uv, light.z, slope, radius, layer);
+}
+
+
+// Whether the far cascade surely holds nothing that would count as a
+// blocker below: nothing nearer the light, around `uv`, than `depth` and
+// as much nearer as a face turned `facing` towards the light gets across
+// `search`. One read instead of the search, for most points.
+fn nothing_nearer(uv: vec2<f32>, depth: f32, search: f32, facing: f32) -> bool {
+    // The hint covers the squares around, so the search mustn't reach
+    // farther.
+    if search * SHADOW_MAP_SIZE >= f32(SHADOW_HINT_BLOCK) - 1.0 {
+        return false;
+    }
+    let texel = clamp(
+        vec2<i32>(uv * f32(SHADOW_HINT_SIZE)),
+        vec2<i32>(0),
+        vec2<i32>(SHADOW_HINT_SIZE - 1),
+    );
+    let nearest = bitcast<f32>(textureLoad(shadow_hint, texel, 0).r);
+    // How much depth a face gains per unit across the map at most: the
+    // tangent of its angle to the light, in the cascade's units, no more
+    // than `depth_slope` allows.
+    let radius = globals.shadow[3];
+    let tangent = sqrt(max(1.0 - facing * facing, 0.0)) / max(facing, 1e-4);
+    let slope = min(tangent * radius / (radius + FAR_CASTER_MARGIN) * 1.01, 1.0);
+    return nearest >= depth + slope * search;
+}
+
+// Builds `shadow_hint` from a layer of the shadow map, in two passes over
+// one triangle covering it: the nearest depth in each square, then of each
+// square and those around it.
+@group(0) @binding(20) var hint_source: texture_2d<f32>;
+@group(0) @binding(21) var hint_blocks: texture_2d<u32>;
+
+@vertex
+fn hint_vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(f32(index == 1u) * 4.0 - 1.0, f32(index == 2u) * 4.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn hint_blocks_fragment(@builtin(position) at: vec4<f32>) -> @location(0) u32 {
+    let first = vec2<i32>(at.xy) * SHADOW_HINT_BLOCK;
+    var nearest = 1.0;
+    for (var y = 0; y < SHADOW_HINT_BLOCK; y++) {
+        for (var x = 0; x < SHADOW_HINT_BLOCK; x++) {
+            nearest = min(nearest, textureLoad(hint_source, first + vec2<i32>(x, y), 0).r);
+        }
+    }
+    return bitcast<u32>(nearest);
+}
+
+@fragment
+fn hint_fragment(@builtin(position) at: vec4<f32>) -> @location(0) u32 {
+    let texel = vec2<i32>(at.xy);
+    var nearest = 1.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let near = clamp(texel + vec2<i32>(x, y), vec2<i32>(0), vec2<i32>(SHADOW_HINT_SIZE - 1));
+            nearest = min(nearest, bitcast<f32>(textureLoad(hint_blocks, near, 0).r));
+        }
+    }
+    return bitcast<u32>(nearest);
 }
 
 // How soft the edge of a shadow is at the least, in blocks: the air
@@ -623,7 +732,7 @@ fn box_corner(start: vec3<f32>, size: vec3<f32>, face: u32, vertex: u32) -> BoxC
 @vertex
 fn lod_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) -> ChunkVertex {
     let face = (quad.x >> 24u) & 7u;
-    let corner = lod_corner(quad, vertex);
+    let corner = lod_corner(quad, vertex & 3u);
     let local = corner.local;
     let position = camera_relative(quad.y >> 18u, local);
 
@@ -647,7 +756,7 @@ fn lod_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) 
 // Far-away terrain drawn into the far cascade of the shadow map.
 @vertex
 fn lod_shadow_vertex(@builtin(vertex_index) vertex: u32, @location(0) quad: vec4<u32>) -> @builtin(position) vec4<f32> {
-    let local = lod_corner(quad, vertex).local;
+    let local = lod_corner(quad, vertex & 3u).local;
     return shadow_pass * vec4<f32>(camera_relative(quad.y >> 18u, local), 1.0);
 }
 
@@ -746,7 +855,13 @@ fn shade(in: ChunkVertex) -> vec4<f32> {
         let direct = direct_light(in.position, in.normal, distance, in.light.x);
         color = texel * (direct + (sky + blocks + globals.light_color.w) * occlusion);
     }
-    return vec4<f32>(finish(with_fog(color, in.position, distance)), 1.0);
+    // Without a map of shadows, the air by a face out of the sky's sight is
+    // taken to be in the shade; with the light low, when shadows grow long,
+    // so is the air by a face turned away from it.
+    let low = 1.0 - smoothstep(0.1, 0.35, globals.light.y);
+    let facing_light = smoothstep(0.7, 1.0, in.light.x)
+        * mix(1.0, smoothstep(-0.2, 0.1, dot(in.normal, globals.light.xyz)), low);
+    return vec4<f32>(finish(with_fog(color, in.position, distance, in.clip.xy, facing_light)), 1.0);
 }
 
 // Light from the sun or the moon on a face, shadows and clouds included.
@@ -760,9 +875,18 @@ fn direct_light(position: vec3<f32>, normal: vec3<f32>, distance: f32, sky: f32)
     // Without shadows, sky light says where the sun can't reach: under
     // overhangs, less of it; in caves, none.
     var visible = smoothstep(0.7, 1.0, sky);
-    if globals.light.w > 0.0 {
-        let shadow = sunlit(position, normal, distance, facing) * smoothstep(0.3, 0.6, sky);
-        visible = mix(visible, shadow, globals.light.w);
+    if globals.fog.z > 0.0 {
+        // Where the sky is out of sight, as in caves, so is the light:
+        // nothing to trace.
+        let open = smoothstep(0.3, 0.6, sky);
+        var shadow = 0.0;
+        if open > 0.0 && globals.light.w > 0.0 {
+            shadow = sunlit(position, normal, distance, facing) * open;
+        }
+        // As the light sinks to the horizon its shadows fade out, and the
+        // light goes with them: it never reaches what they hid, and the
+        // valleys don't flash red at sunset.
+        visible = shadow * globals.light.w;
     }
     return globals.light_color.rgb * facing * visible * cloud_shadow(position, toward, distance);
 }
@@ -802,12 +926,84 @@ fn sky_radiance(direction: vec3<f32>) -> vec3<f32> {
 }
 
 // Distant things fade into the haze, and at the edge of the world into what
-// lies behind them.
-fn with_fog(color: vec3<f32>, position: vec3<f32>, distance: f32) -> vec3<f32> {
+// lies behind them. Where hills keep the light off the air in between, it
+// only scatters the sky's light: a mountain in front of the setting sun
+// stays dark instead of showing the glow around the sun. `pixel` is where
+// on the screen, to vary the samples of the air; `guess` how much of the
+// air is lit where no shadow map tells.
+fn with_fog(color: vec3<f32>, position: vec3<f32>, distance: f32, pixel: vec2<f32>, guess: f32) -> vec3<f32> {
     let direction = position / max(distance, 1e-4);
-    let hazy = mix(color, haze_radiance(direction), haze(position, distance));
+    let amount = haze(position, distance);
+    let lit_haze = haze_radiance(direction);
+    let shaded_haze = max(globals.ambient[0].rgb, vec3<f32>(0.0)) * globals.weather.y;
+    var air = 1.0;
+    // Only where the difference would show.
+    let glow = amount * dot(max(lit_haze - shaded_haze, vec3<f32>(0.0)), LUMINANCE);
+    if glow * globals.screen.z > AIR_SHADE_VISIBLE {
+        air = air_in_light(position, distance, pixel, guess);
+    }
+    let hazy = mix(color, mix(shaded_haze, lit_haze, air), amount);
     let edge = smoothstep(mix(globals.fog.x, globals.fog.y, 0.5), globals.fog.y, distance);
+    // Nearer than the edge, as nearly everything is, the sky behind doesn't
+    // show at all.
+    if edge <= 0.0 {
+        return hazy;
+    }
     return mix(hazy, background(direction), edge);
+}
+
+// Below this, in light after exposure, the shade on the haze wouldn't show.
+const AIR_SHADE_VISIBLE = 0.002;
+// Points along a view ray checked for light.
+const AIR_SAMPLES = 8;
+
+// How much of the haze between the camera and `position` sees the light,
+// from 0 to 1, by points along the way, each counted by how much haze is
+// there; from the far cascade of the shadow map, which holds the hills, or
+// from the widest near one without it. With no map, `guess`.
+fn air_in_light(position: vec3<f32>, distance: f32, pixel: vec2<f32>, guess: f32) -> f32 {
+    // Sinking to the horizon, the sun leaves the air by the ground as it
+    // leaves the ground, as fast as its shadows fade out (`strength` in
+    // `world_pass.rs`); the glow it leaves in the sky isn't the air's here.
+    let up = smoothstep(0.0, 0.02, globals.sun.y);
+    let reach = globals.shadow;
+    var cascade = 3;
+    if reach.w <= reach.z {
+        // Rays take the place of the near cascades.
+        if globals.ray_window.w > 0 {
+            return guess * up;
+        }
+        cascade = 2;
+    }
+    if globals.light.w <= 0.0 {
+        return guess * up;
+    }
+    let matrix = globals.shadow_view_proj[cascade];
+    let layer = i32(globals.shadow_layers[cascade]);
+    let radius = reach[cascade];
+    let margin = select(CASTER_MARGIN, FAR_CASTER_MARGIN, cascade == 3);
+    // A block towards the light, in depth: air right by a lit face is lit.
+    let lift = 1.0 / (2.0 * (radius + margin));
+    let along = min(distance, radius) / max(distance, 1e-4);
+    // Where along the way differs from pixel to pixel, so the few points
+    // don't show as bands (interleaved gradient noise, after Jimenez).
+    let jitter = fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))));
+    let eye = max(camera_height(), 0.0);
+    var lit = 0.0;
+    var total = 0.0;
+    for (var i = 0; i < AIR_SAMPLES; i++) {
+        let point = position * ((f32(i) + jitter) / f32(AIR_SAMPLES) * along);
+        let density = exp(-max(eye + point.y, 0.0) / HAZE_HEIGHT);
+        let light = matrix * vec4<f32>(point, 1.0);
+        let uv = vec2<f32>(light.x * 0.5 + 0.5, 0.5 - light.y * 0.5);
+        var seen = 1.0;
+        if all(uv > vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) && light.z < 1.0 {
+            seen = textureSampleCompareLevel(shadow_map, shadow_sampler, uv, layer, light.z - lift);
+        }
+        lit += seen * density;
+        total += density;
+    }
+    return lit / total * up;
 }
 
 // What the sky shows in `direction`: below the horizon, haze over land too
