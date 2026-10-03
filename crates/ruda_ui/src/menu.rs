@@ -1,15 +1,17 @@
-use egui::{Align2, Color32, ComboBox, RichText, Slider, TextureHandle, Ui, Vec2};
+use egui::emath::GuiRounding;
+use egui::{Align2, Color32, RichText, Ui};
 
-use crate::settings::{
-    FIELDS_OF_VIEW, FpsLimit, GpuApi, LOD_DISTANCES, Lighting, Preset, Settings, Shadows,
-    VIEW_DISTANCES,
-};
+use crate::hud::HotbarSlot;
+use crate::settings::{ControlAction, Settings};
+use crate::settings_menu::Tab;
+use crate::style::{BACKGROUND, TEXT};
+use crate::widgets::{self, BUTTON_SIZE, Images, PANEL_MARGIN, stone_button};
 use crate::{I18n, Language};
 
-const BUTTON_SIZE: Vec2 = Vec2::new(340.0, 48.0);
-/// Fits the longest label and value in either language.
-const SETTINGS_WIDTH: f32 = 800.0;
-const COMBO_WIDTH: f32 = 300.0;
+/// Seconds the startup screen takes to give way to the menu.
+const SPLASH_FADE: f32 = 0.8;
+/// Seconds the title picture takes to give way to the world.
+const PICTURE_FADE: f32 = 1.2;
 
 /// Which menu is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +25,10 @@ pub enum Screen {
     },
     /// While the world around the player loads.
     Loading,
+    /// At startup, while the world behind the title menu loads.
+    Splash,
+    /// Over a running game: every block, to put in the hotbar.
+    Inventory,
 }
 
 /// Something the menu needs the game to do.
@@ -34,13 +40,37 @@ pub enum MenuAction {
     Exit,
     /// The settings screen closed; a good moment to save them.
     SettingsClosed,
+    /// Put a block of the catalog in a hotbar cell, or empty the cell.
+    SetHotbar {
+        slot: usize,
+        block: Option<usize>,
+    },
+    /// Swap two hotbar cells.
+    SwapHotbar(usize, usize),
+}
+
+/// The blocks the inventory shows and where they go.
+#[derive(Clone, Copy, Debug)]
+pub struct InventoryContext<'a> {
+    /// Every block that can be put in the hotbar.
+    pub catalog: &'a [HotbarSlot],
+    /// What each cell of the hotbar holds; `None` for an empty one.
+    pub hotbar: &'a [Option<HotbarSlot>],
+    /// The hotbar cell in hand.
+    pub selected: usize,
 }
 
 /// Things the menu shows but does not own.
 #[derive(Clone, Copy)]
 pub struct MenuContext<'a> {
     pub i18n: &'a I18n,
-    pub logo: Option<&'a TextureHandle>,
+    pub images: &'a Images,
+    pub inventory: InventoryContext<'a>,
+    /// The largest interface size that fits the window, in percent.
+    pub max_scale: u8,
+    /// The world is drawn behind the menu, so the title picture gives way
+    /// to it.
+    pub world_visible: bool,
     pub version: &'a str,
     /// Language used when the settings leave it to the system.
     pub system_language: Language,
@@ -58,11 +88,37 @@ impl std::fmt::Debug for MenuContext<'_> {
 #[derive(Clone, Copy, Debug)]
 pub struct Menu {
     pub screen: Screen,
+    /// The page of the settings that is open.
+    pub(crate) tab: Tab,
+    /// The action whose button the player is picking: the next one pressed
+    /// is it.
+    pub(crate) listening: Option<ControlAction>,
+    /// The block of the catalog held on the pointer in the inventory.
+    pub(crate) carried: Option<usize>,
 }
 
 impl Menu {
     pub fn new(screen: Screen) -> Self {
-        Self { screen }
+        Self {
+            screen,
+            tab: Tab::default(),
+            listening: None,
+            carried: None,
+        }
+    }
+
+    /// Whether the player is picking a button for an action: the next
+    /// button pressed is for [`Menu::offer_button`].
+    pub fn is_listening(&self) -> bool {
+        self.listening.is_some()
+    }
+
+    /// Binds the button named `button` (see the input's names) to the action
+    /// being picked for, if there is one.
+    pub fn offer_button(&mut self, settings: &mut Settings, button: &str) {
+        if let Some(action) = self.listening.take() {
+            settings.controls.set_key(action, button);
+        }
     }
 
     /// Draws the open screen. Settings change in place as the player edits
@@ -76,19 +132,31 @@ impl Menu {
         match self.screen {
             Screen::Main => self.main(ui, context),
             Screen::Paused => self.paused(ui, context),
-            Screen::Settings { .. } => self.settings(ui, context, settings),
+            Screen::Settings { .. } => self.settings_screen(ui, context, settings),
             Screen::Loading => {
-                loading(ui, context);
+                // Under another name, so leaving the loading screen does not
+                // show the title menu the startup screen fading away.
+                let caption = context.i18n.get("menu-loading");
+                splash(ui, context.images, "loading", true, Some(&caption));
                 None
             }
+            Screen::Splash => {
+                splash(ui, context.images, "splash", true, None);
+                None
+            }
+            Screen::Inventory => self.inventory_screen(ui, context),
         }
     }
 
     /// What Escape does: leaves the settings or resumes the game.
     pub fn back(&mut self) -> Option<MenuAction> {
+        // Escape gives up picking a button before it leaves the settings.
+        if self.listening.take().is_some() {
+            return None;
+        }
         match self.screen {
-            Screen::Main | Screen::Loading => None,
-            Screen::Paused => Some(MenuAction::Resume),
+            Screen::Main | Screen::Loading | Screen::Splash => None,
+            Screen::Paused | Screen::Inventory => Some(MenuAction::Resume),
             Screen::Settings { from_game } => {
                 self.screen = if from_game {
                     Screen::Paused
@@ -102,25 +170,25 @@ impl Menu {
 
     fn main(&mut self, ui: &mut Ui, context: MenuContext<'_>) -> Option<MenuAction> {
         let t = |id| context.i18n.get(id);
+        let images = context.images;
         let mut action = None;
+        background(ui, images, context.world_visible);
         centered(ui, "main menu", |ui| {
-            if let Some(logo) = context.logo {
-                let width = (ui.ctx().content_rect().width() * 0.5).clamp(320.0, 640.0);
+            if let Some(logo) = &images.logo {
+                let width = (ui.ctx().content_rect().width() * 0.42).clamp(360.0, 720.0);
                 ui.add(egui::Image::new(logo).max_width(width));
-                ui.add_space(24.0);
+                ui.add_space(20.0);
             }
-            if button(ui, &t("menu-singleplayer")).clicked() {
+            ui.spacing_mut().item_spacing.y = 16.0;
+            if stone_button(ui, images, &t("menu-singleplayer"), true).clicked() {
                 action = Some(MenuAction::StartSingleplayer);
             }
-            ui.add_enabled(
-                false,
-                egui::Button::new(t("menu-multiplayer")).min_size(BUTTON_SIZE),
-            )
-            .on_disabled_hover_text(t("menu-coming-soon"));
-            if button(ui, &t("menu-settings")).clicked() {
+            stone_button(ui, images, &t("menu-multiplayer"), false)
+                .on_hover_text(t("menu-coming-soon"));
+            if stone_button(ui, images, &t("menu-settings"), true).clicked() {
                 self.screen = Screen::Settings { from_game: false };
             }
-            if button(ui, &t("menu-exit")).clicked() {
+            if stone_button(ui, images, &t("menu-exit"), true).clicked() {
                 action = Some(MenuAction::Exit);
             }
         });
@@ -130,306 +198,120 @@ impl Menu {
                 ui.label(
                     RichText::new(format!("Ruda {}", context.version))
                         .small()
-                        .weak(),
+                        .color(Color32::from_white_alpha(140)),
                 );
             });
+        // The startup screen leaves over the menu instead of cutting to it.
+        splash(ui, images, "splash", false, None);
         action
     }
 
     fn paused(&mut self, ui: &mut Ui, context: MenuContext<'_>) -> Option<MenuAction> {
-        let t = |id| context.i18n.get(id);
+        let (images, i18n) = (context.images, context.i18n);
         dim(ui);
         let mut action = None;
-        centered(ui, "pause menu", |ui| {
-            ui.heading(t("menu-paused"));
-            ui.add_space(12.0);
-            if button(ui, &t("menu-resume")).clicked() {
-                action = Some(MenuAction::Resume);
-            }
-            if button(ui, &t("menu-settings")).clicked() {
-                self.screen = Screen::Settings { from_game: true };
-            }
-            if button(ui, &t("menu-quit-to-title")).clicked() {
-                action = Some(MenuAction::QuitToTitle);
-            }
-        });
-        action
-    }
-
-    fn settings(
-        &mut self,
-        ui: &mut Ui,
-        context: MenuContext<'_>,
-        settings: &mut Settings,
-    ) -> Option<MenuAction> {
-        let i18n = context.i18n;
-        let t = |id| i18n.get(id);
-        if matches!(self.screen, Screen::Settings { from_game: true }) {
-            dim(ui);
-        }
-        let mut action = None;
-        centered(ui, "settings", |ui| {
-            egui::Frame::window(ui.style())
-                .inner_margin(24.0)
-                .show(ui, |ui| {
-                    ui.set_width(SETTINGS_WIDTH);
-                    ui.vertical_centered(|ui| ui.heading(t("settings-title")));
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                        ui.add_space(8.0);
-
-                        let heading = |ui: &mut Ui, id| {
-                            ui.label(
-                                RichText::new(t(id))
-                                    .strong()
-                                    .color(Color32::from_rgb(232, 128, 48)),
-                            )
-                        };
-                        let graphics = &mut settings.graphics;
-                        heading(ui, "settings-graphics");
-                        egui::Grid::new("graphics")
-                            .num_columns(2)
-                            .spacing([24.0, 14.0])
-                            .show(ui, |ui| {
-                                ui.label(t("settings-preset"));
-                                let preset_name = |preset: Option<Preset>| {
-                                    t(match preset {
-                                        Some(Preset::Standard) => "settings-preset-standard",
-                                        Some(Preset::High) => "settings-preset-high",
-                                        Some(Preset::Ultra) => "settings-preset-ultra",
-                                        None => "settings-preset-custom",
-                                    })
-                                };
-                                let current = Preset::of(graphics);
-                                ComboBox::from_id_salt("preset")
-                                    .selected_text(preset_name(current))
-                                    .width(COMBO_WIDTH)
-                                    .show_ui(ui, |ui| {
-                                        for preset in Preset::ALL {
-                                            let chosen = ui.selectable_label(
-                                                current == Some(preset),
-                                                preset_name(Some(preset)),
-                                            );
-                                            if chosen.clicked() {
-                                                preset.apply(graphics);
-                                            }
-                                        }
-                                    });
-                                ui.end_row();
-
-                                ui.label(t("settings-lighting"));
-                                let lighting_name = |lighting: Lighting| {
-                                    t(match lighting {
-                                        Lighting::Classic => "settings-lighting-classic",
-                                        Lighting::Atmospheric => "settings-lighting-atmospheric",
-                                    })
-                                };
-                                ComboBox::from_id_salt("lighting")
-                                    .selected_text(lighting_name(graphics.lighting))
-                                    .width(COMBO_WIDTH)
-                                    .show_ui(ui, |ui| {
-                                        for lighting in Lighting::ALL {
-                                            ui.selectable_value(
-                                                &mut graphics.lighting,
-                                                lighting,
-                                                lighting_name(lighting),
-                                            );
-                                        }
-                                    });
-                                ui.end_row();
-
-                                ui.label(t("settings-view-distance"));
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        Slider::new(&mut graphics.view_distance, VIEW_DISTANCES)
-                                            .show_value(false),
-                                    );
-                                    let chunks = i64::from(graphics.view_distance);
-                                    ui.label(i18n.get_with(
-                                        "settings-view-distance-value",
-                                        &[("chunks", chunks), ("blocks", chunks * 32)],
-                                    ));
-                                });
-                                ui.end_row();
-
-                                ui.label(t("settings-fov"));
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        Slider::new(&mut graphics.fov, FIELDS_OF_VIEW)
-                                            .show_value(false),
-                                    );
-                                    let degrees = i64::from(graphics.fov);
-                                    ui.label(
-                                        i18n.get_with(
-                                            "settings-fov-value",
-                                            &[("degrees", degrees)],
-                                        ),
-                                    );
-                                });
-                                ui.end_row();
-
-                                ui.label(t("settings-view-bobbing"));
-                                ui.checkbox(&mut graphics.view_bobbing, "");
-                                ui.end_row();
-
-                                ui.label(t("settings-fps-limit"));
-                                let limit_name = |limit: FpsLimit| match limit.fps() {
-                                    Some(fps) => i18n.get_with(
-                                        "settings-fps-limit-value",
-                                        &[("fps", i64::from(fps))],
-                                    ),
-                                    None if limit == FpsLimit::Display => {
-                                        t("settings-fps-limit-display")
-                                    }
-                                    None => t("settings-fps-limit-off"),
-                                };
-                                ComboBox::from_id_salt("fps limit")
-                                    .selected_text(limit_name(graphics.fps_limit))
-                                    .width(COMBO_WIDTH)
-                                    .show_ui(ui, |ui| {
-                                        for limit in FpsLimit::ALL {
-                                            ui.selectable_value(
-                                                &mut graphics.fps_limit,
-                                                limit,
-                                                limit_name(limit),
-                                            );
-                                        }
-                                    });
-                                ui.end_row();
-
-                                ui.label(t("settings-fullscreen"));
-                                ui.checkbox(&mut graphics.fullscreen, "");
-                                ui.end_row();
-
-                                ui.label(t("settings-clouds"));
-                                ui.checkbox(&mut graphics.clouds, "");
-                                ui.end_row();
-
-                                ui.label(t("settings-shadows"));
-                                let shadows_name = |shadows: Shadows| {
-                                    t(match shadows {
-                                        Shadows::Off => "settings-shadows-off",
-                                        Shadows::Standard => "settings-shadows-standard",
-                                        Shadows::Rays => "settings-shadows-rays",
-                                    })
-                                };
-                                ComboBox::from_id_salt("shadows")
-                                    .selected_text(shadows_name(graphics.shadows))
-                                    .width(COMBO_WIDTH)
-                                    .show_ui(ui, |ui| {
-                                        for shadows in Shadows::ALL {
-                                            ui.selectable_value(
-                                                &mut graphics.shadows,
-                                                shadows,
-                                                shadows_name(shadows),
-                                            );
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text(t("settings-shadows-note"));
-                                ui.end_row();
-
-                                ui.label(t("settings-lod"));
-                                let lod_name = |blocks: u16| {
-                                    if blocks == 0 {
-                                        t("settings-lod-off")
-                                    } else {
-                                        i18n.get_with(
-                                            "settings-lod-value",
-                                            &[("blocks", i64::from(blocks))],
-                                        )
-                                    }
-                                };
-                                ComboBox::from_id_salt("lod")
-                                    .selected_text(lod_name(graphics.lod_distance))
-                                    .width(COMBO_WIDTH)
-                                    .show_ui(ui, |ui| {
-                                        for blocks in LOD_DISTANCES {
-                                            ui.selectable_value(
-                                                &mut graphics.lod_distance,
-                                                blocks,
-                                                lod_name(blocks),
-                                            );
-                                        }
-                                    });
-                                ui.end_row();
-
-                                ui.label(t("settings-gpu-api"));
-                                let api_name = |api: GpuApi| {
-                                    api.name()
-                                        .map_or_else(|| t("settings-gpu-api-auto"), str::to_owned)
-                                };
-                                ComboBox::from_id_salt("gpu api")
-                                    .selected_text(api_name(graphics.gpu_api))
-                                    .width(COMBO_WIDTH)
-                                    .show_ui(ui, |ui| {
-                                        for &api in GpuApi::available() {
-                                            ui.selectable_value(
-                                                &mut graphics.gpu_api,
-                                                api,
-                                                api_name(api),
-                                            );
-                                        }
-                                    });
-                                ui.end_row();
-                                ui.label("");
-                                ui.label(RichText::new(t("settings-restart-note")).small().weak());
-                                ui.end_row();
-
-                                ui.label(t("settings-language"));
-                                let current = settings.language.unwrap_or(context.system_language);
-                                ComboBox::from_id_salt("language")
-                                    .selected_text(current.native_name())
-                                    .width(COMBO_WIDTH)
-                                    .show_ui(ui, |ui| {
-                                        for language in Language::ALL {
-                                            if ui
-                                                .selectable_label(
-                                                    current == language,
-                                                    language.native_name(),
-                                                )
-                                                .clicked()
-                                            {
-                                                settings.language = Some(language);
-                                            }
-                                        }
-                                    });
-                                ui.end_row();
-
-                                heading(ui, "settings-controls");
-                                ui.end_row();
-                                ui.label(t("settings-auto-jump"));
-                                ui.checkbox(&mut settings.controls.auto_jump, "")
-                                    .on_hover_text(t("settings-auto-jump-note"));
-                                ui.end_row();
-                            });
-                    });
-
-                    ui.add_space(12.0);
-                    ui.vertical_centered(|ui| {
-                        if button(ui, &t("settings-back")).clicked() {
-                            action = self.back();
-                        }
-                    });
+        egui::Area::new("pause menu".into())
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                // The title, then the three buttons.
+                let height = 56.0 + 3.0 * BUTTON_SIZE.y + 3.0 * 16.0;
+                let size = egui::vec2(
+                    BUTTON_SIZE.x + 2.0 * PANEL_MARGIN,
+                    height + 2.0 * PANEL_MARGIN,
+                );
+                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                let rect = rect.round_to_pixels(ui.pixels_per_point());
+                widgets::panel(ui.painter(), images, rect);
+                let inner = rect.shrink(PANEL_MARGIN);
+                widgets::heading(
+                    ui.painter(),
+                    egui::pos2(inner.center().x, inner.min.y + 24.0),
+                    &i18n.get("menu-paused"),
+                );
+                let buttons = egui::Rect::from_min_max(
+                    egui::pos2(inner.min.x, inner.min.y + 56.0 + 16.0),
+                    inner.max,
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(buttons), |ui| {
+                    ui.spacing_mut().item_spacing.y = 16.0;
+                    if stone_button(ui, images, &i18n.get("menu-resume"), true).clicked() {
+                        action = Some(MenuAction::Resume);
+                    }
+                    if stone_button(ui, images, &i18n.get("menu-settings"), true).clicked() {
+                        self.screen = Screen::Settings { from_game: true };
+                    }
+                    if stone_button(ui, images, &i18n.get("menu-quit-to-title"), true).clicked() {
+                        action = Some(MenuAction::QuitToTitle);
+                    }
                 });
-        });
+            });
         action
     }
 }
 
-fn button(ui: &mut Ui, text: &str) -> egui::Response {
-    ui.add(egui::Button::new(text).min_size(BUTTON_SIZE))
+/// What the main menu stands in front of: the live world, the picture of it
+/// until the world is there, or the plain colour without either.
+pub(crate) fn background(ui: &mut Ui, images: &Images, world_visible: bool) {
+    // The picture fades out once the world takes its place, and back in
+    // when the world goes. After being away, say in a game, it starts afresh
+    // rather than carrying on from where the last visit left it.
+    let ctx = ui.ctx();
+    let seen = egui::Id::new("title picture seen");
+    let pass = ctx.cumulative_pass_nr();
+    let (visit, last): (u64, u64) = ctx.data(|data| data.get_temp(seen)).unwrap_or_default();
+    let visit = if pass > last + 2 { visit + 1 } else { visit };
+    ctx.data_mut(|data| data.insert_temp(seen, (visit, pass)));
+    let picture = ctx.animate_bool_with_time(
+        egui::Id::new(("title picture", visit)),
+        !world_visible,
+        PICTURE_FADE,
+    );
+    let picture = images.background.as_ref().map(|texture| (texture, picture));
+    if picture.is_some() || world_visible {
+        widgets::backdrop(ui, picture, ui.ctx().content_rect());
+    }
+}
+
+/// The startup screen, over everything: the logo and a bar to wait by. Once
+/// `shown` is false it fades away, and then it is not drawn at all.
+fn splash(ui: &Ui, images: &Images, id: &'static str, shown: bool, caption: Option<&str>) {
+    let opacity = ui
+        .ctx()
+        .animate_bool_with_time(egui::Id::new(id), shown, SPLASH_FADE);
+    if opacity <= 0.0 {
+        return;
+    }
+    let screen = ui.ctx().content_rect();
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new(id),
+    ));
+    painter.rect_filled(screen, 0.0, BACKGROUND.gamma_multiply(opacity));
+    let mut bottom = screen.center().y;
+    if let Some(logo) = &images.logo {
+        let width = (screen.width() * 0.42).clamp(360.0, 720.0);
+        let size = logo.size_vec2() * (width / logo.size_vec2().x);
+        let center = egui::pos2(screen.center().x, screen.center().y - 30.0);
+        let rect = egui::Rect::from_center_size(center, size);
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(logo.id(), rect, uv, Color32::WHITE.gamma_multiply(opacity));
+        bottom = rect.max.y;
+    }
+    let middle = screen.center().x;
+    let mut bar = bottom + 48.0;
+    if let Some(caption) = caption {
+        let at = egui::pos2(middle, bottom + 36.0);
+        widgets::pixel_text(&painter, at, caption, 24.0, TEXT, true, opacity);
+        bar += 40.0;
+    }
+    if shown {
+        let time = ui.input(|input| input.time);
+        widgets::loading_bar(&painter, egui::pos2(middle, bar), time);
+    }
 }
 
 /// Lays out `contents` in a column centred on the screen.
-fn loading(ui: &mut Ui, context: MenuContext<'_>) {
-    centered(ui, "loading", |ui| {
-        ui.heading(context.i18n.get("menu-loading"));
-        ui.add_space(16.0);
-        ui.add(egui::Spinner::new().size(32.0));
-    });
-}
-
-fn centered(ui: &mut Ui, id: &str, contents: impl FnOnce(&mut Ui)) {
+pub(crate) fn centered(ui: &mut Ui, id: &str, contents: impl FnOnce(&mut Ui)) {
     egui::Area::new(egui::Id::new(id))
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ui.ctx(), |ui| {
@@ -438,7 +320,7 @@ fn centered(ui: &mut Ui, id: &str, contents: impl FnOnce(&mut Ui)) {
 }
 
 /// Darkens the game behind a menu.
-fn dim(ui: &mut Ui) {
+pub(crate) fn dim(ui: &mut Ui) {
     let screen = ui.ctx().content_rect();
     ui.painter()
         .rect_filled(screen, 0.0, Color32::from_black_alpha(150));

@@ -83,6 +83,7 @@ fn a_pillar_casts_a_shadow() {
     let scene = Scene {
         camera,
         target: None,
+        crosshair: true,
         view_distance: 256.0,
         bounds: Some(bounds),
         time_of_day: TIME_OF_DAY,

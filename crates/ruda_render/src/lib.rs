@@ -72,6 +72,9 @@ pub struct Scene {
     pub camera: Camera,
     /// The block under the crosshair, outlined.
     pub target: Option<BlockPos>,
+    /// Whether to draw the crosshair: not while a menu or a title scene is
+    /// shown.
+    pub crosshair: bool,
     /// How far the world is drawn, in blocks; fog hides the edge.
     pub view_distance: f32,
     /// The heights the world spans; above it there is only sky.

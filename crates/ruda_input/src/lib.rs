@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use glam::Vec2;
+use serde::Deserialize;
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -25,6 +26,8 @@ pub enum Action {
     Hotbar(u8),
     /// Open the pause menu.
     Pause,
+    /// Open the inventory.
+    Inventory,
 }
 
 /// A physical button that can be bound to an action.
@@ -34,8 +37,63 @@ pub enum Button {
     Mouse(MouseButton),
 }
 
+impl Button {
+    /// A name to keep the button under in the settings, such as `KeyW` or
+    /// `mouse:Right`; `None` for buttons that have no stable one.
+    pub fn name(self) -> Option<String> {
+        match self {
+            Button::Key(key) => {
+                let name = format!("{key:?}");
+                (!name.contains('(')).then_some(name)
+            }
+            Button::Mouse(button) => {
+                let name = format!("{button:?}");
+                (!name.contains('(')).then(|| format!("mouse:{name}"))
+            }
+        }
+    }
+
+    /// The button a name from [`Button::name`] stands for.
+    pub fn from_name(name: &str) -> Option<Self> {
+        if let Some(button) = name.strip_prefix("mouse:") {
+            return Some(Button::Mouse(match button {
+                "Left" => MouseButton::Left,
+                "Right" => MouseButton::Right,
+                "Middle" => MouseButton::Middle,
+                "Back" => MouseButton::Back,
+                "Forward" => MouseButton::Forward,
+                _ => return None,
+            }));
+        }
+        let name = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(name);
+        let key = KeyCode::deserialize(name).ok()?;
+        Some(Button::Key(key))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Bindings(HashMap<Button, Action>);
+
+impl Bindings {
+    /// What `button` does, if anything.
+    pub fn action(&self, button: Button) -> Option<Action> {
+        self.0.get(&button).copied()
+    }
+
+    /// The button `action` is bound to, if any.
+    pub fn button(&self, action: Action) -> Option<Button> {
+        self.0
+            .iter()
+            .find_map(|(&button, &bound)| (bound == action).then_some(button))
+    }
+
+    /// Binds `action` to `button` alone: its other buttons let go of it, and
+    /// whatever the button did before it no longer does.
+    pub fn rebind(&mut self, action: Action, button: Button) {
+        self.0.retain(|_, bound| *bound != action);
+        self.0.insert(button, action);
+    }
+}
 
 impl Default for Bindings {
     fn default() -> Self {
@@ -50,6 +108,7 @@ impl Default for Bindings {
             (ShiftLeft, Sneak),
             (ControlLeft, Sprint),
             (Escape, Action::Pause),
+            (KeyE, Inventory),
         ]
         .into_iter()
         .map(|(key, action)| (Button::Key(key), action))
@@ -83,6 +142,12 @@ impl Input {
             bindings,
             ..Default::default()
         }
+    }
+
+    /// Switches to other bindings, forgetting what was held under the old.
+    pub fn set_bindings(&mut self, bindings: Bindings) {
+        self.bindings = bindings;
+        self.clear();
     }
 
     pub fn window_event(&mut self, event: &WindowEvent) {
@@ -177,6 +242,53 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buttons_keep_their_names() {
+        let bindings = Bindings::default();
+        for button in bindings.0.keys() {
+            let name = button.name().expect("default buttons have names");
+            assert_eq!(Button::from_name(&name), Some(*button), "{name}");
+        }
+        assert_eq!(Button::from_name("KeyW"), Some(Button::Key(KeyCode::KeyW)));
+        assert_eq!(
+            Button::from_name("mouse:Right"),
+            Some(Button::Mouse(MouseButton::Right))
+        );
+        assert_eq!(Button::from_name("Nonsense"), None);
+        assert_eq!(Button::from_name("mouse:Other"), None);
+        assert_eq!(Button::from_name("Unidentified"), None);
+        assert_eq!(Button::Mouse(MouseButton::Other(7)).name(), None);
+    }
+
+    #[test]
+    fn buttons_know_their_actions() {
+        let bindings = Bindings::default();
+        assert_eq!(
+            bindings.action(Button::Key(KeyCode::Digit3)),
+            Some(Action::Hotbar(2))
+        );
+        assert_eq!(
+            bindings.action(Button::Key(KeyCode::Escape)),
+            Some(Action::Pause)
+        );
+        assert_eq!(bindings.action(Button::Key(KeyCode::KeyJ)), None);
+    }
+
+    #[test]
+    fn rebinding_moves_an_action_to_one_button() {
+        let mut bindings = Bindings::default();
+        let space = Button::Key(KeyCode::Space);
+        let f = Button::Key(KeyCode::KeyF);
+        assert_eq!(bindings.button(Action::Jump), Some(space));
+        bindings.rebind(Action::Jump, f);
+        assert_eq!(bindings.button(Action::Jump), Some(f));
+        assert!(!bindings.0.contains_key(&space));
+        // Taking over a button leaves its old action without one.
+        bindings.rebind(Action::Sprint, f);
+        assert_eq!(bindings.button(Action::Jump), None);
+        assert_eq!(bindings.button(Action::Sprint), Some(f));
+    }
 
     #[test]
     fn tracks_held_and_pressed_actions() {

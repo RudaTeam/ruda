@@ -77,6 +77,7 @@ fn clouds_shade_the_ground_and_part_around_a_tower() {
     let scene = |camera: Camera, clouds: Option<CloudSky>| Scene {
         camera,
         target: None,
+        crosshair: true,
         view_distance: 512.0,
         bounds: Some(bounds),
         time_of_day: 0.25,

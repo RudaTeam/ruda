@@ -96,6 +96,7 @@ fn coloured_lamps_light_their_side_of_a_room() {
     let scene = Scene {
         camera,
         target: None,
+        crosshair: true,
         view_distance: 64.0,
         bounds: Some(bounds),
         time_of_day: 0.75,

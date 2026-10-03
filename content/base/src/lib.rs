@@ -10,21 +10,6 @@ use ruda_worldgen::{Ore, TerrainGenerator, TerrainSettings};
 
 pub const NAMESPACE: &str = "base";
 
-/// Blocks a player can place, in hotbar order.
-pub const HOTBAR: [&str; 11] = [
-    "stone",
-    "cobblestone",
-    "dirt",
-    "grass",
-    "sand",
-    "gravel",
-    "planks",
-    "copper_ore",
-    "iron_ore",
-    "lamp",
-    "torch",
-];
-
 /// The sun and the moon, for the renderer's sky.
 pub const SUN: &[u8] = include_bytes!("../sky/sun.png");
 pub const MOON: &[u8] = include_bytes!("../sky/moon.png");
@@ -186,11 +171,8 @@ mod tests {
     }
 
     #[test]
-    fn hotbar_blocks_exist_and_terrain_builds() {
+    fn terrain_builds_and_the_blocks_have_their_properties() {
         let content = content();
-        for name in HOTBAR {
-            assert!(content.blocks().id(&id(name).unwrap()).is_some(), "{name}");
-        }
         terrain(content.blocks(), 1, WorldBounds::DEFAULT).unwrap();
         let bedrock = content.blocks().id(&id("bedrock").unwrap()).unwrap();
         assert!(!content.blocks().is_breakable(bedrock));

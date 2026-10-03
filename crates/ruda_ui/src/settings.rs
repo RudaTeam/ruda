@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -10,6 +11,12 @@ pub const VIEW_DISTANCES: RangeInclusive<u8> = 2..=16;
 pub const LOD_DISTANCES: [u16; 4] = [0, 512, 1024, 2048];
 /// Vertical fields of view offered in the settings, in degrees.
 pub const FIELDS_OF_VIEW: RangeInclusive<u8> = 50..=110;
+/// How fast the mouse turns the camera, in percent of the normal speed.
+pub const MOUSE_SENSITIVITIES: RangeInclusive<u8> = 20..=200;
+/// How large the interface is drawn, in percent, in steps of
+/// [`UI_SCALE_STEP`].
+pub const UI_SCALES: RangeInclusive<u8> = 75..=200;
+pub const UI_SCALE_STEP: u8 = 25;
 
 /// The player's preferences, kept between runs.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -19,14 +26,152 @@ pub struct Settings {
     pub language: Option<Language>,
     pub graphics: Graphics,
     pub controls: Controls,
+    pub appearance: Appearance,
+}
+
+/// How the menus look.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Appearance {
+    /// How large the interface is drawn, in percent.
+    pub scale: u8,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self { scale: 100 }
+    }
 }
 
 /// How the game handles.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Controls {
     /// Jump onto a block the player walks into without pressing jump.
     pub auto_jump: bool,
+    /// How fast the mouse turns the camera, in percent of the normal speed.
+    pub mouse_sensitivity: u8,
+    /// The buttons picked for actions, by [`ControlAction::id`]; the actions
+    /// left out keep their usual ones.
+    keys: BTreeMap<String, String>,
+}
+
+impl Default for Controls {
+    fn default() -> Self {
+        Self {
+            auto_jump: false,
+            mouse_sensitivity: 100,
+            keys: BTreeMap::new(),
+        }
+    }
+}
+
+impl Controls {
+    /// The name of the button `action` is bound to.
+    pub fn key(&self, action: ControlAction) -> &str {
+        self.keys
+            .get(action.id())
+            .map_or(action.default_key(), String::as_str)
+    }
+
+    /// Binds `button` to `action`. Another action that had it takes the
+    /// button `action` had, so no two share one.
+    pub fn set_key(&mut self, action: ControlAction, button: &str) {
+        let before = self.key(action).to_owned();
+        for other in ControlAction::ALL {
+            if other != action && self.key(other) == button {
+                self.keys.insert(other.id().to_owned(), before.clone());
+            }
+        }
+        self.keys.insert(action.id().to_owned(), button.to_owned());
+    }
+
+    /// Gives every action its usual button back.
+    pub fn reset_keys(&mut self) {
+        self.keys.clear();
+    }
+
+    /// Keeps only the picked buttons `usable` accepts: the rest, such as a
+    /// name from a file edited by hand, go back to the usual ones. If two
+    /// actions end up on one button, which no one can have picked, all go
+    /// back.
+    pub fn retain_keys(&mut self, usable: impl Fn(&str) -> bool) {
+        self.keys.retain(|_, button| usable(button));
+        let mut seen = std::collections::HashSet::new();
+        if !self.keys().all(|(_, button)| seen.insert(button)) {
+            self.keys.clear();
+        }
+    }
+
+    /// The buttons of all actions, for those that have changed.
+    pub fn keys(&self) -> impl Iterator<Item = (ControlAction, &str)> {
+        ControlAction::ALL
+            .into_iter()
+            .map(|action| (action, self.key(action)))
+    }
+}
+
+/// What a player can choose the button for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlAction {
+    MoveForward,
+    MoveBack,
+    MoveLeft,
+    MoveRight,
+    Jump,
+    Sneak,
+    Sprint,
+    Break,
+    Place,
+    Inventory,
+}
+
+impl ControlAction {
+    pub const ALL: [ControlAction; 10] = [
+        ControlAction::MoveForward,
+        ControlAction::MoveBack,
+        ControlAction::MoveLeft,
+        ControlAction::MoveRight,
+        ControlAction::Jump,
+        ControlAction::Sneak,
+        ControlAction::Sprint,
+        ControlAction::Break,
+        ControlAction::Place,
+        ControlAction::Inventory,
+    ];
+
+    /// What the action is called in the settings file.
+    pub fn id(self) -> &'static str {
+        match self {
+            ControlAction::MoveForward => "move_forward",
+            ControlAction::MoveBack => "move_back",
+            ControlAction::MoveLeft => "move_left",
+            ControlAction::MoveRight => "move_right",
+            ControlAction::Jump => "jump",
+            ControlAction::Sneak => "sneak",
+            ControlAction::Sprint => "sprint",
+            ControlAction::Break => "break",
+            ControlAction::Place => "place",
+            ControlAction::Inventory => "inventory",
+        }
+    }
+
+    /// The button it is bound to until the player picks another, as a name
+    /// the input understands.
+    pub fn default_key(self) -> &'static str {
+        match self {
+            ControlAction::MoveForward => "KeyW",
+            ControlAction::MoveBack => "KeyS",
+            ControlAction::MoveLeft => "KeyA",
+            ControlAction::MoveRight => "KeyD",
+            ControlAction::Jump => "Space",
+            ControlAction::Sneak => "ShiftLeft",
+            ControlAction::Sprint => "ControlLeft",
+            ControlAction::Break => "mouse:Left",
+            ControlAction::Place => "mouse:Right",
+            ControlAction::Inventory => "KeyE",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -43,6 +188,8 @@ pub struct Graphics {
     pub view_bobbing: bool,
     pub fps_limit: FpsLimit,
     pub fullscreen: bool,
+    /// A world drifts behind the title menu instead of a picture of it.
+    pub menu_world: bool,
     /// Shadows cast by the sun and moon; costly.
     #[serde(deserialize_with = "shadows_cast")]
     pub shadows: Shadows,
@@ -64,6 +211,7 @@ impl Default for Graphics {
             view_bobbing: true,
             fps_limit: FpsLimit::default(),
             fullscreen: false,
+            menu_world: true,
             shadows: Shadows::Off,
             clouds: true,
             lighting: Lighting::default(),
@@ -247,6 +395,22 @@ impl Settings {
     /// hand-edited files still load.
     pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
         let mut settings: Self = toml::from_str(text)?;
+        let controls = &mut settings.controls;
+        controls.mouse_sensitivity = controls
+            .mouse_sensitivity
+            .clamp(*MOUSE_SENSITIVITIES.start(), *MOUSE_SENSITIVITIES.end());
+        // Only the actions there are; the rest of what a newer or edited
+        // file says is forgotten.
+        controls
+            .keys
+            .retain(|id, _| ControlAction::ALL.iter().any(|action| action.id() == id));
+        settings.controls.retain_keys(|_| true);
+        let scale = &mut settings.appearance.scale;
+        // The nearest of the offered scales.
+        *scale = UI_SCALES
+            .step_by(usize::from(UI_SCALE_STEP))
+            .min_by_key(|&offered| offered.abs_diff(*scale))
+            .expect("there are scales");
         let graphics = &mut settings.graphics;
         graphics.view_distance = graphics
             .view_distance
@@ -280,8 +444,72 @@ mod tests {
         settings.graphics.fps_limit = FpsLimit::HundredTwenty;
         settings.graphics.gpu_api = GpuApi::Gl;
         settings.graphics.clouds = false;
+        settings.graphics.menu_world = false;
         settings.controls.auto_jump = true;
+        settings.controls.mouse_sensitivity = 140;
+        settings.controls.set_key(ControlAction::Jump, "KeyF");
+        settings.appearance.scale = 150;
         assert_eq!(Settings::from_toml(&settings.to_toml()).unwrap(), settings);
+    }
+
+    #[test]
+    fn buttons_default_until_changed_and_never_repeat() {
+        let mut controls = Controls::default();
+        assert_eq!(controls.key(ControlAction::Jump), "Space");
+        controls.set_key(ControlAction::Jump, "KeyF");
+        assert_eq!(controls.key(ControlAction::Jump), "KeyF");
+        // Taking a button swaps it with its owner.
+        controls.set_key(ControlAction::Sprint, "KeyF");
+        assert_eq!(controls.key(ControlAction::Sprint), "KeyF");
+        assert_eq!(controls.key(ControlAction::Jump), "ControlLeft");
+        let buttons: Vec<_> = controls.keys().map(|(_, button)| button).collect();
+        for button in &buttons {
+            assert_eq!(buttons.iter().filter(|other| *other == button).count(), 1);
+        }
+        controls.reset_keys();
+        assert_eq!(controls.key(ControlAction::Sprint), "ControlLeft");
+    }
+
+    #[test]
+    fn picked_buttons_that_clash_or_are_unusable_are_dropped() {
+        let from = |text| Settings::from_toml(text).unwrap().controls;
+        // Two actions on one button: back to the usual ones.
+        let clash = from("[controls.keys]\njump = \"KeyW\"\n");
+        assert_eq!(clash.key(ControlAction::Jump), "Space");
+        assert_eq!(clash.key(ControlAction::MoveForward), "KeyW");
+        // A name the input does not know is let go by the caller.
+        let mut controls = from("[controls.keys]\njump = \"Garbage\"\nsneak = \"KeyQ\"\n");
+        controls.retain_keys(|name| name != "Garbage");
+        assert_eq!(controls.key(ControlAction::Jump), "Space");
+        assert_eq!(controls.key(ControlAction::Sneak), "KeyQ");
+        // A swap that the player made is a fine file.
+        let mut swapped = Controls::default();
+        swapped.set_key(ControlAction::Jump, "KeyW");
+        let swapped = from(
+            &Settings {
+                controls: swapped,
+                ..Default::default()
+            }
+            .to_toml(),
+        );
+        assert_eq!(swapped.key(ControlAction::Jump), "KeyW");
+        assert_eq!(swapped.key(ControlAction::MoveForward), "Space");
+    }
+
+    #[test]
+    fn reads_the_new_settings_from_odd_files() {
+        let settings = Settings::from_toml(
+            "[controls]\nmouse_sensitivity = 250\n[controls.keys]\njump = \"KeyF\"\nfly = \"KeyG\"\n\
+             [appearance]\nscale = 130\n",
+        )
+        .unwrap();
+        assert_eq!(settings.controls.mouse_sensitivity, 200);
+        assert_eq!(settings.controls.key(ControlAction::Jump), "KeyF");
+        assert_eq!(settings.controls.keys.len(), 1);
+        assert_eq!(settings.appearance.scale, 125);
+        let settings = Settings::from_toml("").unwrap();
+        assert_eq!(settings.controls.mouse_sensitivity, 100);
+        assert_eq!(settings.appearance.scale, 100);
     }
 
     #[test]
@@ -292,6 +520,7 @@ mod tests {
         assert_eq!(settings.language, None);
         assert!(!settings.controls.auto_jump);
         assert!(settings.graphics.view_bobbing);
+        assert!(settings.graphics.menu_world);
     }
 
     #[test]

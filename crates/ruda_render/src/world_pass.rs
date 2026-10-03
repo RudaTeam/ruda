@@ -1087,6 +1087,7 @@ impl WorldPass {
         self.shadows.progress = Default::default();
         self.shadows.drawn = [None; CASCADES];
         self.rays.clear();
+        self.clouds.obstacles.clear();
     }
 
     /// Chunks with geometry on the GPU.
@@ -1386,8 +1387,10 @@ impl WorldPass {
             pass.set_pipeline(&self.outline_pipeline);
             pass.draw(0..24, 0..1);
         }
-        pass.set_pipeline(&self.crosshair_pipeline);
-        pass.draw(0..12, 0..1);
+        if scene.crosshair {
+            pass.set_pipeline(&self.crosshair_pipeline);
+            pass.draw(0..12, 0..1);
+        }
     }
 
     /// Tells far-away terrain which chunks are drawn this frame: it gives

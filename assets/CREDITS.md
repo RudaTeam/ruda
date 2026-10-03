@@ -22,12 +22,8 @@ Changes made for Ruda:
   `sky/moon.png` are its `misc/sun.png` and `misc/moon.png`, unchanged;
 - files are renamed to Ruda's block names.
 
-## Font — Pixelify Sans
+## Font — Tiny5
 
-`assets/fonts/PixelifySans.ttf` is the Regular weight of
-[Pixelify Sans](https://github.com/eifetx/Pixelify-Sans) by **The Pixelify Sans
-Project Authors**, licensed under the SIL Open Font License 1.1
-(`assets/fonts/OFL.txt`). It is taken from
-[pull request #5](https://github.com/eifetx/Pixelify-Sans/pull/5) (commit
-`296814deb225`), which adds the Cyrillic capitals О and П missing from the
-released font and fixes К.
+`assets/fonts/Tiny5-Regular.ttf` is [Tiny5](https://github.com/Gissio/font_tiny5)
+by **The Tiny5 Project Authors**, used for all text in the interface. It is
+licensed under the SIL Open Font License 1.1 (`assets/fonts/OFL-Tiny5.txt`).

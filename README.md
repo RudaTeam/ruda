@@ -36,13 +36,18 @@ cargo run -p ruda          # client
 cargo run -p ruda-server   # dedicated server (a stub until network play lands)
 ```
 
-The game opens on the main menu. Settings has the view distance, how far
-simplified far terrain reaches beyond it, field of view, view bobbing, vertical sync,
-fullscreen, clouds, sun shadows (off by default; standard ones cost a
-second drawing of the world, ray-traced ones a ray per point near the camera), graphics API, language (English or
-Russian; the system language by default) and auto-jump. They are saved to `settings.toml`
-in `~/.config/ruda` on Linux, `~/Library/Application Support/Ruda` on macOS
-and `%APPDATA%\Ruda` on Windows.
+The game opens on the main menu, over a world that slowly turns behind it
+(a plain picture of it instead if you turn that off to spare a weak computer).
+Settings have three pages. Graphics: a preset, lighting, view distance, how far
+simplified far terrain reaches beyond it, field of view, view bobbing, a frame
+rate limit, fullscreen, clouds, sun shadows (off by default; standard ones cost
+a second drawing of the world, ray-traced ones a ray per point near the
+camera), the animated menu background and the graphics API. Controls: mouse
+sensitivity, auto-jump and the key of every action. Interface: language
+(English or Russian; the system language by default) and the size of the
+menus. They are saved to
+`settings.toml` in `~/.config/ruda` on Linux, `~/Library/Application Support/Ruda`
+on macOS and `%APPDATA%\Ruda` on Windows.
 
 In the game:
 
@@ -55,8 +60,12 @@ In the game:
 | Space / Left Shift while flying | Up / down |
 | Left Ctrl | Sprint, or fly faster |
 | Left / right click | Break / place a block |
-| 1–9, 0, mouse wheel | Pick the block to place |
+| 1–9, 0, mouse wheel | Pick the hotbar cell in hand (the hotbar starts empty: fill it from the inventory) |
+| E | Inventory: click a block to pick it up, click a hotbar cell to put it down |
 | Esc | Pause menu |
+
+Walking, jumping, sneaking, sprinting, breaking, placing and the inventory
+can be bound to other keys in Settings, under Controls.
 
 The client takes a few options:
 
@@ -65,7 +74,7 @@ The client takes a few options:
 - `--time <TICKS>` starts at a time of day: 0 is sunrise, 6000 noon, 12000
   sunset and 18000 midnight.
 - `--view-distance <CHUNKS>` overrides how far the world loads, in chunks of 32
-  blocks, up to 32 (6 by default; try 2 or 3 on weak hardware).
+  blocks, up to 32 (12 by default; try 2 or 3 on weak hardware).
 - `--lod-distance <BLOCKS>` overrides how far simplified far terrain
   reaches past the chunks drawn in full; 0 turns it off.
 - `--gpu-backend <auto|vulkan|metal|dx12|gl>` overrides the graphics API. You
@@ -102,5 +111,5 @@ from [NOTICE](NOTICE).
 
 Block textures are from [Isabella II](https://github.com/minetest-texture-packs/Isabella-II)
 by Bonemouse, licensed under CC BY 3.0, and the interface font is
-[Pixelify Sans](https://github.com/eifetx/Pixelify-Sans), licensed under the SIL
-Open Font License 1.1; see [assets/CREDITS.md](assets/CREDITS.md).
+[Tiny5](https://github.com/Gissio/font_tiny5), licensed under the SIL Open Font
+License 1.1; see [assets/CREDITS.md](assets/CREDITS.md).

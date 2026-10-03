@@ -10,7 +10,8 @@ publish.workspace = true
 
 [dependencies]
 glam.workspace = true
-winit.workspace = true
+serde.workspace = true
+winit = { workspace = true, features = ["serde"] }
 
 [lints]
 workspace = true

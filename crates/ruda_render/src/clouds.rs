@@ -266,6 +266,14 @@ impl ObstacleMap {
         };
     }
 
+    /// Forgets every obstacle, for leaving a world.
+    pub(crate) fn clear(&mut self) {
+        self.chunks.clear();
+        self.tiles.clear();
+        self.changed = true;
+        self.built = None;
+    }
+
     pub(crate) fn set_tile(&mut self, pos: LodTilePos, tops: Option<Box<[i16]>>) {
         self.changed |= match tops {
             Some(tops) => self.tiles.insert(pos, tops.clone()).as_ref() != Some(&tops),

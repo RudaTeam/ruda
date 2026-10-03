@@ -61,6 +61,7 @@ fn culling_hides_nothing_that_can_be_seen() {
         let scene = Scene {
             camera,
             target: None,
+            crosshair: true,
             view_distance: (RADIUS * 32) as f32,
             bounds: Some(bounds),
             time_of_day: 0.25,

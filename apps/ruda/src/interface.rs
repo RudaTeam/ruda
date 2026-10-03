@@ -3,20 +3,36 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
-use egui::{ClippedPrimitive, TextureHandle, TexturesDelta, ViewportId};
+use egui::{ClippedPrimitive, TextureHandle, TextureOptions, TexturesDelta, ViewportId};
+use ruda_core::BlockId;
 use ruda_render::UiFrame;
+use ruda_ui::{HotbarSlot, Images, PICTURE_TEXTURE, TILING_TEXTURE, UI_SCALE_STEP, UI_SCALES};
 use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::decode_png;
+use crate::game::Game;
+use crate::icons::block_icon;
 
-pub const LOGO_PNG: &[u8] = include_bytes!("../../../assets/branding/logo-dark.png");
+pub const LOGO_PNG: &[u8] = include_bytes!("../../../assets/branding/menu-logo.png");
+pub const BACKGROUND_PNG: &[u8] = include_bytes!("../../../assets/branding/menu-background.png");
+pub const COBBLESTONE_PNG: &[u8] = include_bytes!("../../../content/base/textures/cobblestone.png");
+
+/// The area, in points, that menus are laid out to fit at least.
+const MENU_AREA: egui::Vec2 = egui::vec2(960.0, 600.0);
+
+/// How many times larger than normal menus could be drawn and still fit the
+/// window.
+fn fit(window: &Window) -> f32 {
+    let size = window.inner_size();
+    let native = window.scale_factor() as f32;
+    (size.width as f32 / native / MENU_AREA.x).min(size.height as f32 / native / MENU_AREA.y)
+}
 
 pub struct Interface {
     ctx: egui::Context,
     state: egui_winit::State,
-    pub logo: Option<TextureHandle>,
+    pub images: Images,
 }
 
 /// One frame of the interface, ready to draw.
@@ -40,10 +56,30 @@ impl Interface {
             None,
             Some(max_texture_side),
         );
-        let logo = load_logo(&ctx)
-            .inspect_err(|error| tracing::warn!("no logo: {error:#}"))
-            .ok();
-        Self { ctx, state, logo }
+        let images = Images {
+            logo: load_image(&ctx, "logo", LOGO_PNG, PICTURE_TEXTURE),
+            background: load_image(&ctx, "background", BACKGROUND_PNG, PICTURE_TEXTURE),
+            cobblestone: load_image(&ctx, "cobblestone", COBBLESTONE_PNG, TILING_TEXTURE),
+        };
+        Self { ctx, state, images }
+    }
+
+    /// How large menus are drawn, in percent, but no larger than lets them
+    /// fit the window: a panel that sticks out of a small window can't be
+    /// used. Call it again when the window changes size.
+    pub fn set_scale(&mut self, window: &Window, percent: u8) {
+        // Never below half, however small the window.
+        let zoom = (f32::from(percent) / 100.0).min(fit(window).max(0.5));
+        self.ctx.set_zoom_factor(zoom);
+    }
+
+    /// The largest size menus can be offered at for this window, in percent,
+    /// a whole step of the sizes there are.
+    pub fn max_scale(window: &Window) -> u8 {
+        let step = u32::from(UI_SCALE_STEP);
+        let steps = (fit(window) * 100.0 / step as f32).floor() as u32;
+        let (smallest, largest) = (*UI_SCALES.start(), *UI_SCALES.end());
+        (steps * step).clamp(u32::from(smallest), u32::from(largest)) as u8
     }
 
     /// Returns whether the interface needs drawing again.
@@ -51,12 +87,43 @@ impl Interface {
         self.state.on_window_event(window, event).repaint
     }
 
-    /// Lays out and paints a frame.
-    pub fn run(&mut self, window: &Window, ui: impl FnMut(&mut egui::Ui)) -> Painted {
+    /// Pictures of `blocks`, for the HUD and the inventory.
+    pub fn block_slots(&self, game: &Game, blocks: &[BlockId]) -> Vec<HotbarSlot> {
+        let content = game.content();
+        blocks
+            .iter()
+            .map(|&block| {
+                let id = content.blocks().get(block).id.as_str().to_owned();
+                let icon = block_icon(content, block).map(|image| {
+                    self.ctx
+                        .load_texture(format!("icon {id}"), image, PICTURE_TEXTURE)
+                });
+                HotbarSlot { block: id, icon }
+            })
+            .collect()
+    }
+
+    /// Whether the interface has a text field to type in: keys then belong
+    /// to it.
+    pub fn wants_keyboard_input(&self) -> bool {
+        self.ctx.egui_wants_keyboard_input()
+    }
+
+    /// Lays out and paints a frame. Unless `platform_output` is false, what
+    /// the interface asks of the window, such as the shape of the cursor,
+    /// is done: not while playing, when the game has hidden the cursor.
+    pub fn run(
+        &mut self,
+        window: &Window,
+        platform_output: bool,
+        ui: impl FnMut(&mut egui::Ui),
+    ) -> Painted {
         let input = self.state.take_egui_input(window);
         let output = self.ctx.run_ui(input, ui);
-        self.state
-            .handle_platform_output(window, output.platform_output);
+        if platform_output {
+            self.state
+                .handle_platform_output(window, output.platform_output);
+        }
         let repaint_after = output
             .viewport_output
             .get(&ViewportId::ROOT)
@@ -94,8 +161,21 @@ impl Drop for Painted {
     }
 }
 
-fn load_logo(ctx: &egui::Context) -> Result<TextureHandle> {
-    let (width, height, rgba) = decode_png(LOGO_PNG)?;
-    let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
-    Ok(ctx.load_texture("logo", image, egui::TextureOptions::LINEAR))
+/// Menus manage without an image that fails to load, so this only warns.
+fn load_image(
+    ctx: &egui::Context,
+    name: &str,
+    png: &[u8],
+    options: TextureOptions,
+) -> Option<TextureHandle> {
+    let image = decode_png(png).map(|(width, height, rgba)| {
+        egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba)
+    });
+    match image {
+        Ok(image) => Some(ctx.load_texture(name, image, options)),
+        Err(error) => {
+            tracing::warn!("no {name} image: {error:#}");
+            None
+        }
+    }
 }
