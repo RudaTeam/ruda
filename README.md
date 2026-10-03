@@ -36,16 +36,17 @@ cargo run -p ruda          # client
 cargo run -p ruda-server   # dedicated server (a stub until network play lands)
 ```
 
-The game opens on the main menu, over a world that slowly turns behind it
-(a plain picture of it instead if you turn that off to spare a weak computer).
+The game opens on the main menu, over a pixel-art sunset that moves a step at
+a time. A real world can turn behind it instead (Settings, Graphics), which
+costs more on a weak computer.
 Settings have three pages. Graphics: a preset, lighting, view distance, how far
 simplified far terrain reaches beyond it, field of view, view bobbing, a frame
 rate limit, fullscreen, clouds, sun shadows (off by default; standard ones cost
 a second drawing of the world, ray-traced ones a ray per point near the
-camera), the animated menu background and the graphics API. Controls: mouse
+camera), the live world behind the menu and the graphics API. Controls: mouse
 sensitivity, auto-jump and the key of every action. Interface: language
-(English or Russian; the system language by default) and the size of the
-menus. They are saved to
+(English or Russian; the system language by default, also on the globe
+button of the main menu) and the size of the menus. They are saved to
 `settings.toml` in `~/.config/ruda` on Linux, `~/Library/Application Support/Ruda`
 on macOS and `%APPDATA%\Ruda` on Windows.
 

@@ -51,8 +51,8 @@ pub const HOTBAR_SLOTS: usize = 10;
 /// The farthest the integrated server streams the world, in chunks.
 pub const MAX_VIEW_DISTANCE: u8 = 32;
 
-/// The world behind the title menu: the one the title picture was taken in,
-/// from the same spot, at sunset.
+/// The world behind the title menu when it is switched on: one picked for its
+/// looks, seen from a high spot at sunset.
 const PANORAMA_SEED: u64 = 7;
 const PANORAMA_TIME: u64 = 11_500;
 const PANORAMA_CAMERA: CameraStart = CameraStart {
@@ -281,8 +281,7 @@ pub struct Game {
     /// See [`GameConfig::panorama`].
     panorama: bool,
     /// When the panorama's world had loaded and became worth showing; its
-    /// motion counts from here, so it starts as the title picture was
-    /// taken.
+    /// motion counts from here, so it always starts from the same view.
     shown_at: Option<Instant>,
 }
 

@@ -17,6 +17,8 @@ const TILE: f32 = 16.0 * TEXEL;
 pub(crate) const EDGE: f32 = 2.0 * TEXEL;
 
 pub const BUTTON_SIZE: Vec2 = Vec2::new(360.0, 56.0);
+/// Between buttons that are laid out together.
+pub(crate) const BUTTON_GAP: f32 = 16.0;
 /// Between the edge of a panel and what is on it.
 pub(crate) const PANEL_MARGIN: f32 = 24.0;
 
@@ -35,17 +37,24 @@ pub const TILING_TEXTURE: TextureOptions = TextureOptions {
 #[derive(Clone, Default)]
 pub struct Images {
     pub logo: Option<TextureHandle>,
-    /// The world behind the main menu.
-    pub background: Option<TextureHandle>,
     pub cobblestone: Option<TextureHandle>,
+    /// What the sunset behind the main menu is made of: the sun, and the
+    /// blocks of the ground.
+    pub sun: Option<TextureHandle>,
+    pub grass: Option<TextureHandle>,
+    pub dirt: Option<TextureHandle>,
+    pub stone: Option<TextureHandle>,
 }
 
 impl std::fmt::Debug for Images {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Images")
             .field("logo", &self.logo.is_some())
-            .field("background", &self.background.is_some())
             .field("cobblestone", &self.cobblestone.is_some())
+            .field("sun", &self.sun.is_some())
+            .field("grass", &self.grass.is_some())
+            .field("dirt", &self.dirt.is_some())
+            .field("stone", &self.stone.is_some())
             .finish()
     }
 }
@@ -225,6 +234,19 @@ pub fn stone_button_sized(
     size: Vec2,
     enabled: bool,
 ) -> Response {
+    stone_button_lit(ui, images, text, size, enabled, false)
+}
+
+/// A stone button that stays lit up, to show it is the one chosen among a
+/// few, as well as when the pointer or the keyboard is on it.
+pub fn stone_button_lit(
+    ui: &mut Ui,
+    images: &Images,
+    text: &str,
+    size: Vec2,
+    enabled: bool,
+    lit: bool,
+) -> Response {
     let sense = if enabled {
         Sense::click()
     } else {
@@ -236,7 +258,7 @@ pub fn stone_button_sized(
         return response;
     }
     let rect = rect.round_to_pixels(ui.pixels_per_point());
-    let glow = glow(ui, &response, enabled);
+    let glow = glow(ui, &response, enabled).max(if lit { 1.0 } else { 0.0 });
     let pressed = enabled && response.is_pointer_button_down_on();
     stone_piece(ui.painter(), images, rect, glow, pressed, enabled);
 
@@ -252,6 +274,88 @@ pub fn stone_button_sized(
     };
     pixel_label(ui.painter(), rect.center() + press, text, color, enabled);
     response
+}
+
+/// A square stone button with a picture on it, drawn by `icon` around the
+/// middle of the button, given how lit the button is.
+pub fn stone_icon_button(
+    ui: &mut Ui,
+    images: &Images,
+    size: Vec2,
+    label: &str,
+    icon: impl FnOnce(&Painter, Pos2, f32),
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+    if ui.is_rect_visible(rect) {
+        let rect = rect.round_to_pixels(ui.pixels_per_point());
+        let glow = glow(ui, &response, true);
+        let pressed = response.is_pointer_button_down_on();
+        stone_piece(ui.painter(), images, rect, glow, pressed, true);
+        let press = if pressed {
+            vec2(0.0, TEXEL)
+        } else {
+            Vec2::ZERO
+        };
+        icon(ui.painter(), rect.center() + press, glow);
+    }
+    response
+}
+
+/// The globe on the language button, row by row: `o` the outline, `b` and
+/// `B` the sea in light and in shade, `l` a glint, `g` and `G` land.
+const GLOBE: [&str; 14] = [
+    "....oooooo....",
+    "..oolhbbbboo..",
+    ".olhhbbggbbbo.",
+    ".olhbbgggbbbo.",
+    "olbbbggggbbggo",
+    "obbbbgggbbgggo",
+    "obbbbbggbbgGgo",
+    "obbbbbbbbbbGBo",
+    "obbggbbbbbbBBo",
+    "obgggbbbbggBBo",
+    ".obggbbbbggBo.",
+    ".obbbbbbbbBBo.",
+    "..ooBBBBBBoo..",
+    "....oooooo....",
+];
+
+/// Draws the globe, each of its pixels this many points a side.
+pub(crate) fn paint_globe(painter: &Painter, center: Pos2, pixel: f32) {
+    let colour = |c: char| match c {
+        'o' => Color32::from_rgb(16, 22, 48),
+        'b' => Color32::from_rgb(52, 112, 200),
+        'B' => Color32::from_rgb(34, 78, 152),
+        'l' => Color32::from_rgb(150, 196, 244),
+        'h' => Color32::from_rgb(200, 226, 255),
+        'g' => Color32::from_rgb(92, 170, 78),
+        _ => Color32::from_rgb(54, 122, 58),
+    };
+    let size = GLOBE.len() as f32 * pixel;
+    let origin = center - Vec2::splat(size / 2.0);
+    for (row, line) in GLOBE.iter().enumerate() {
+        // Runs of one colour are drawn as one piece.
+        let cells: Vec<char> = line.chars().collect();
+        let mut start = 0;
+        while start < cells.len() {
+            let c = cells[start];
+            let mut end = start;
+            while end < cells.len() && cells[end] == c {
+                end += 1;
+            }
+            if c != '.' {
+                let at = origin + vec2(start as f32, row as f32) * pixel;
+                let rect = Rect::from_min_size(at, vec2((end - start) as f32 * pixel, pixel));
+                painter.rect_filled(
+                    rect.round_to_pixels(painter.pixels_per_point()),
+                    0.0,
+                    colour(c),
+                );
+            }
+            start = end;
+        }
+    }
 }
 
 /// A bar with a lit piece sliding along it, for waiting without knowing how
@@ -289,34 +393,16 @@ pub fn tiled(painter: &egui::Painter, texture: Option<&TextureHandle>, rect: Rec
     }
 }
 
-/// Darkens `screen` towards the edges so menus on top stay readable, over
-/// `picture` if there is one, cropped to fit and shown that opaquely
-/// (from 0 to 1), and over whatever is drawn behind otherwise.
-pub fn backdrop(ui: &Ui, picture: Option<(&TextureHandle, f32)>, screen: Rect) {
-    let painter = ui.painter();
-    if let Some((picture, opacity)) = picture.filter(|&(_, opacity)| opacity > 0.0) {
-        let image = picture.size_vec2();
-        let (screen_ratio, image_ratio) = (screen.aspect_ratio(), image.x / image.y);
-        let uv = if screen_ratio > image_ratio {
-            let shown = image_ratio / screen_ratio;
-            Rect::from_min_max(
-                pos2(0.0, (1.0 - shown) / 2.0),
-                pos2(1.0, (1.0 + shown) / 2.0),
-            )
-        } else {
-            let shown = screen_ratio / image_ratio;
-            Rect::from_min_max(
-                pos2((1.0 - shown) / 2.0, 0.0),
-                pos2((1.0 + shown) / 2.0, 1.0),
-            )
-        };
-        painter.image(
-            picture.id(),
-            screen,
-            uv,
-            Color32::WHITE.gamma_multiply(opacity),
-        );
+/// Paints the sunset scene over `screen`, `scene` showing from 0 to 1, then
+/// darkens `screen` towards the edges so menus on top stay readable, over
+/// the scene or over whatever else is drawn behind.
+pub fn backdrop(ui: &Ui, images: &Images, screen: Rect, scene: f32) {
+    if scene > 0.0 {
+        crate::scene::paint(ui, images, screen, scene);
     }
+    let painter = ui.painter();
+    // The scene is brighter than a world at dusk, so it needs less.
+    let (centre, edge) = (0.3 - 0.18 * scene, 0.85 - 0.30 * scene);
 
     // A grid of vertices whose darkness grows with the distance from the
     // middle, smoothed out by the interpolation between them.
@@ -328,7 +414,7 @@ pub fn backdrop(ui: &Ui, picture: Option<(&TextureHandle, f32)>, screen: Rect) {
             let (x, y) = (column as f32 / COLUMNS as f32, row as f32 / ROWS as f32);
             let from_middle = vec2(x - 0.5, y - 0.5) * 2.0;
             let distance = (from_middle.length() / std::f32::consts::SQRT_2).clamp(0.0, 1.0);
-            let alpha = 0.3 + 0.55 * distance * distance;
+            let alpha = centre + (edge - centre) * distance * distance;
             let at = pos2(
                 screen.min.x + x * screen.width(),
                 screen.min.y + y * screen.height(),

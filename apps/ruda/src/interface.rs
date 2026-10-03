@@ -15,7 +15,9 @@ use crate::game::Game;
 use crate::icons::block_icon;
 
 pub const LOGO_PNG: &[u8] = include_bytes!("../../../assets/branding/menu-logo.png");
-pub const BACKGROUND_PNG: &[u8] = include_bytes!("../../../assets/branding/menu-background.png");
+pub const GRASS_PNG: &[u8] = include_bytes!("../../../content/base/textures/grass_side.png");
+pub const DIRT_PNG: &[u8] = include_bytes!("../../../content/base/textures/dirt.png");
+pub const STONE_PNG: &[u8] = include_bytes!("../../../content/base/textures/stone.png");
 pub const COBBLESTONE_PNG: &[u8] = include_bytes!("../../../content/base/textures/cobblestone.png");
 
 /// The area, in points, that menus are laid out to fit at least.
@@ -58,8 +60,11 @@ impl Interface {
         );
         let images = Images {
             logo: load_image(&ctx, "logo", LOGO_PNG, PICTURE_TEXTURE),
-            background: load_image(&ctx, "background", BACKGROUND_PNG, PICTURE_TEXTURE),
             cobblestone: load_image(&ctx, "cobblestone", COBBLESTONE_PNG, TILING_TEXTURE),
+            sun: load_image(&ctx, "sun", ruda_base::SUN, TextureOptions::NEAREST),
+            grass: load_image(&ctx, "grass", GRASS_PNG, TILING_TEXTURE),
+            dirt: load_image(&ctx, "dirt", DIRT_PNG, TILING_TEXTURE),
+            stone: load_image(&ctx, "stone", STONE_PNG, TILING_TEXTURE),
         };
         Self { ctx, state, images }
     }

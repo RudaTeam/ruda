@@ -538,21 +538,20 @@ impl App {
     /// Whether a world should drift behind the menu: when the settings want
     /// one and the title menu is up with no game running.
     fn title_world_wanted(&self) -> bool {
-        self.settings.graphics.menu_world
+        self.settings.graphics.live_menu_world
             && !self.args.singleplayer
             && self.benchmark.is_none()
             && self.game.is_none()
             && self.menu.is_some_and(|menu| {
                 matches!(
                     menu.screen,
-                    Screen::Main | Screen::Settings { from_game: false }
+                    Screen::Main | Screen::Language | Screen::Settings { from_game: false }
                 )
             })
     }
 
-    /// Starts the world behind the title menu. Without it the menu shows a
-    /// picture of the same world, so failing to start it only costs the
-    /// motion.
+    /// Starts the world behind the title menu. Without it the menu shows the
+    /// pixel sunset, so failing to start it costs only the world.
     fn start_title_world(&mut self) {
         if !self.title_world_wanted() {
             return;
@@ -709,7 +708,8 @@ impl App {
             return;
         }
         let (new, old) = (&self.settings.graphics, &self.applied.graphics);
-        let menu_world = (new.menu_world != old.menu_world).then_some(new.menu_world);
+        let menu_world =
+            (new.live_menu_world != old.live_menu_world).then_some(new.live_menu_world);
         let vsync = self.vsync();
         if new.fps_limit != old.fps_limit
             && let Some(renderer) = &mut self.renderer
@@ -796,7 +796,7 @@ impl App {
                 Ok(Control::Inventory) => self.open_inventory(),
                 Ok(Control::Continue) => {}
                 // The world behind the menu is not worth ending the program
-                // for: the menu goes on with its picture.
+                // for: the menu goes on with the sunset.
                 Err(error) if game.is_panorama() => {
                     warn!("the world behind the menu stopped: {error:#}");
                     self.stop_title_world();
@@ -1392,8 +1392,11 @@ mod tests {
         super::window_icon().unwrap();
         for png in [
             super::interface::LOGO_PNG,
-            super::interface::BACKGROUND_PNG,
             super::interface::COBBLESTONE_PNG,
+            super::interface::GRASS_PNG,
+            super::interface::DIRT_PNG,
+            super::interface::STONE_PNG,
+            ruda_base::SUN,
         ] {
             super::decode_png(png).unwrap();
         }

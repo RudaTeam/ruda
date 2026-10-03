@@ -188,8 +188,8 @@ pub struct Graphics {
     pub view_bobbing: bool,
     pub fps_limit: FpsLimit,
     pub fullscreen: bool,
-    /// A world drifts behind the title menu instead of a picture of it.
-    pub menu_world: bool,
+    /// A real world turns behind the title menu instead of the pixel sunset.
+    pub live_menu_world: bool,
     /// Shadows cast by the sun and moon; costly.
     #[serde(deserialize_with = "shadows_cast")]
     pub shadows: Shadows,
@@ -211,7 +211,7 @@ impl Default for Graphics {
             view_bobbing: true,
             fps_limit: FpsLimit::default(),
             fullscreen: false,
-            menu_world: true,
+            live_menu_world: false,
             shadows: Shadows::Off,
             clouds: true,
             lighting: Lighting::default(),
@@ -444,7 +444,7 @@ mod tests {
         settings.graphics.fps_limit = FpsLimit::HundredTwenty;
         settings.graphics.gpu_api = GpuApi::Gl;
         settings.graphics.clouds = false;
-        settings.graphics.menu_world = false;
+        settings.graphics.live_menu_world = true;
         settings.controls.auto_jump = true;
         settings.controls.mouse_sensitivity = 140;
         settings.controls.set_key(ControlAction::Jump, "KeyF");
@@ -520,7 +520,11 @@ mod tests {
         assert_eq!(settings.language, None);
         assert!(!settings.controls.auto_jump);
         assert!(settings.graphics.view_bobbing);
-        assert!(settings.graphics.menu_world);
+        // The sunset is what the menu shows until the player asks for a world,
+        // and a file from when the world was the default says nothing about it.
+        assert!(!settings.graphics.live_menu_world);
+        let old = Settings::from_toml("[graphics]\nmenu_world = true\n").unwrap();
+        assert!(!old.graphics.live_menu_world);
     }
 
     #[test]

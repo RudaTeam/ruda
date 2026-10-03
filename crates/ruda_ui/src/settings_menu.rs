@@ -423,7 +423,7 @@ fn graphics_page(ui: &mut Ui, page: &mut Page<'_>, graphics: &mut Graphics) {
         pick(ui, images, &Shadows::ALL, &mut graphics.shadows, name)
     });
     page.row(ui, "settings-menu-world", |ui, images, t| {
-        toggle(ui, images, t, &mut graphics.menu_world)
+        toggle(ui, images, t, &mut graphics.live_menu_world)
     });
     page.row(ui, "settings-gpu-api", |ui, images, t| {
         let name = |api: GpuApi| {
